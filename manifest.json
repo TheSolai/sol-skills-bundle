@@ -1,0 +1,64 @@
+{
+  "name": "Sol AI Skills Bundle",
+  "version": "1.0.0",
+  "description": "All 8 production Sol AI skills for OpenClaw — one download, install in seconds.",
+  "skills": [
+    {
+      "name": "Sol Email Agent",
+      "slug": "openclaw-email-agent",
+      "description": "Automated email that works while you sleep. Real inbox, real replies.",
+      "emoji": "📧",
+      "install_command": "openclaw skills install https://github.com/TheSolAI/openclaw-email-agent"
+    },
+    {
+      "name": "Sol Self-Learning",
+      "slug": "openclaw-self-learning-skill",
+      "description": "Persistent memory and self-improvement for AI agents.",
+      "emoji": "🧠",
+      "install_command": "openclaw skills install https://github.com/TheSolAI/openclaw-self-learning-skill"
+    },
+    {
+      "name": "Sol Scribe",
+      "slug": "solscribe",
+      "description": "Long-form AI writing with structure, research, and editorial quality.",
+      "emoji": "✍️",
+      "install_command": "openclaw skills install https://github.com/TheSolAI/solscribe"
+    },
+    {
+      "name": "Blog Composer",
+      "slug": "blog-composer",
+      "description": "Built by Sol. Manages posts, drafts, tags, images, and publishing workflow.",
+      "emoji": "📝",
+      "install_command": "openclaw skills install https://github.com/TheSolAI/blog-composer"
+    },
+    {
+      "name": "Sol Cal Recovery",
+      "slug": "SolCal-Recovery",
+      "description": "Recover and repair calendar data. Fix missing events, sync conflicts.",
+      "emoji": "🔧",
+      "install_command": "openclaw skills install https://github.com/TheSolAI/SolCal-Recovery"
+    },
+    {
+      "name": "Blog Studio",
+      "slug": "BlogStudio",
+      "description": "Desktop authoring UI for the Sol AI blog.",
+      "emoji": "🗞️",
+      "install_command": "openclaw skills install https://github.com/TheSolAI/BlogStudio"
+    },
+    {
+      "name": "Image Generation Guide",
+      "slug": "image-generation-guide",
+      "description": "Guides for generating images with AI — prompts, tools, workflows.",
+      "emoji": "🖼️",
+      "install_command": "openclaw skills install https://github.com/TheSolAI/image-generation-guide"
+    },
+    {
+      "name": "Signet Guide",
+      "slug": "signet-guide",
+      "description": "Getting started with Signet AI — setup, configuration, and first runs.",
+      "emoji": "💚",
+      "install_command": "openclaw skills install https://github.com/TheSolAI/signet-guide"
+    }
+  ],
+  "total_count": 8
+}

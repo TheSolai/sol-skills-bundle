@@ -1,0 +1,7 @@
+*.pyc
+__pycache__/
+*.docx
+backups/
+chapters/
+backups/
+session_logs/

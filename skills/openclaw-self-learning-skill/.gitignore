@@ -1,0 +1,16 @@
+# Learning data (local only — don't commit)
+context_log.json
+patterns.json
+learned_fixes.json
+success_log.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+*.swp

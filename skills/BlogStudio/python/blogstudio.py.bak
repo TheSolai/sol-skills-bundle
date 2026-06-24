@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""
+BlogStudio — Sol AI Content Management System
+Python GUI Version
+"""
+
+import os
+import re
+import json
+# import markdown  # not used - simple inline conversion
+import threading
+from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError
+import base64
+import webbrowser
+
+# Configuration
+REPO_OWNER = "TheSolAI"
+REPO_NAME = "thesolai.github.io"
+BASE_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}"
+GITHUB_PAGES_URL = f"https://{REPO_OWNER}.github.io/{REPO_NAME}"
+
+# Try to load token from secrets
+TOKEN_FILE = os.path.expanduser("~/.openclaw/workspace/secrets/github-token.txt")
+if os.path.exists(TOKEN_FILE):
+    with open(TOKEN_FILE) as f:
+        GITHUB_TOKEN = f.read().strip()
+else:
+    GITHUB_TOKEN = ""
+
+HTML_TEMPLATE = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BlogStudio — Sol AI Content Manager</title>
+    <meta property="og:site_name" content="Sol AI">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bangers&family=Comic+Neue:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #FDFBF7;
+            --bg-secondary: #F5F0E6;
+            --text-primary: #111111;
+            --text-secondary: #444444;
+            --text-muted: #888888;
+            --k-yellow: #FFD166;
+            --k-red: #E63946;
+            --k-ink: #111111;
+            --k-blue: #457B9D;
+            --k-white: #FFFFFF;
+            --k-green: #2A9D8F;
+            --k-stroke: 3px solid var(--k-ink);
+            --k-shadow: 5px 5px 0px var(--k-ink);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Comic Neue', cursive; font-weight: 700; background: var(--bg-primary); color: var(--text-primary); min-height: 100vh; }
+        h1, h2, h3 { font-family: 'Bangers', cursive; letter-spacing: 2px; text-transform: uppercase; }
+        
+        /* Layout */
+        .app { display: flex; min-height: 100vh; }
+        .sidebar { width: 260px; background: var(--k-yellow); border-right: var(--k-stroke); padding: 1rem; position: fixed; height: 100vh; overflow-y: auto; }
+        .main { flex: 1; margin-left: 260px; padding: 2rem; max-width: 900px; }
+        
+        /* Sidebar */
+        .sidebar-logo { font-family: 'Bangers', cursive; font-size: 1.8rem; color: var(--k-ink); margin-bottom: 1.5rem; }
+        .sidebar-logo span { color: var(--k-red); }
+        .nav-section { margin-bottom: 1.5rem; }
+        .nav-title { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; margin-bottom: 0.5rem; }
+        .nav-item { display: block; padding: 0.5rem 0.75rem; color: var(--k-ink); text-decoration: none; border: 2px solid transparent; margin-bottom: 0.25rem; }
+        .nav-item:hover { border: 2px solid var(--k-ink); background: var(--k-white); }
+        .nav-item.active { background: var(--k-ink); color: var(--k-white); }
+        
+        /* Main */
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: var(--k-stroke); }
+        .header h1 { font-size: 2rem; }
+        .btn { font-family: 'Bangers', cursive; padding: 0.5rem 1rem; border: var(--k-stroke); cursor: pointer; font-size: 0.9rem; letter-spacing: 1px; }
+        .btn-primary { background: var(--k-yellow); box-shadow: 3px 3px 0 var(--k-ink); }
+        .btn-primary:hover { transform: translate(-2px, -2px); box-shadow: 5px 5px 0 var(--k-ink); }
+        .btn-success { background: var(--k-green); color: white; }
+        .btn-danger { background: var(--k-red); color: white; }
+        
+        /* Content List */
+        .content-list { display: flex; flex-direction: column; gap: 1rem; }
+        .content-card { background: var(--k-white); border: var(--k-stroke); padding: 1.25rem; box-shadow: var(--k-shadow); }
+        .content-card:hover { transform: translate(-3px, -3px); box-shadow: 8px 8px 0 var(--k-ink); }
+        .content-card h3 { margin-bottom: 0.25rem; }
+        .content-card h3 a { color: var(--k-ink); text-decoration: none; }
+        .content-card h3 a:hover { color: var(--k-red); }
+        .content-meta { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+        .content-excerpt { font-size: 0.9rem; color: var(--text-secondary); }
+        
+        /* Editor */
+        .editor { display: none; }
+        .editor.active { display: block; }
+        .editor-field { margin-bottom: 1.25rem; }
+        .editor-field label { display: block; font-weight: 700; font-size: 0.8rem; margin-bottom: 0.25rem; text-transform: uppercase; }
+        .editor-field input, .editor-field textarea { width: 100%; padding: 0.75rem; border: 2px solid var(--k-ink); font-family: inherit; font-size: 0.95rem; }
+        .editor-field input:focus, .editor-field textarea:focus { outline: none; border-color: var(--k-red); }
+        .editor-field textarea { min-height: 300px; font-family: 'Consolas', monospace; }
+        .editor-preview { background: var(--bg-secondary); border: 2px dashed var(--k-ink); padding: 1.5rem; margin-top: 1rem; min-height: 200px; }
+        
+        /* Status */
+        .status { position: fixed; bottom: 1rem; right: 1rem; padding: 0.75rem 1rem; background: var(--k-ink); color: var(--k-white); font-size: 0.8rem; }
+        .status.success { background: var(--k-green); }
+        .status.error { background: var(--k-red); }
+        
+        /* Empty State */
+        .empty { text-align: center; padding: 3rem; color: var(--text-muted); }
+        
+        /* Loading */
+        .loading { text-align: center; padding: 2rem; }
+        
+        /* Scheduler */
+        .scheduler { background: var(--bg-secondary); border: 2px solid var(--k-ink); padding: 1.5rem; margin-top: 1rem; }
+        .scheduler h3 { margin-bottom: 1rem; }
+        .schedule-item { display: flex; justify-content: space-between; padding: 0.75rem; background: var(--k-white); border: 2px solid var(--k-ink); margin-bottom: 0.5rem; }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <aside class="sidebar">
+            <div class="sidebar-logo">Blog<span>Studio</span></div>
+            
+            <div class="nav-section">
+                <div class="nav-title">Content</div>
+                <a href="#" class="nav-item active" data-view="posts">Blog Posts</a>
+                <a href="#" class="nav-item" data-view="guides">Guides</a>
+                <a href="#" class="nav-item" data-view="analysis">Analysis</a>
+                <a href="#" class="nav-item" data-view="pages">Pages</a>
+            </div>
+            
+            <div class="nav-section">
+                <div class="nav-title">Actions</div>
+                <a href="#" class="nav-item" data-action="sync">🔄 Sync with GitHub</a>
+                <a href="#" class="nav-item" data-action="new">✏️ New Post</a>
+                <a href="#" class="nav-item" data-action="schedule">📅 Scheduled Posts</a>
+            </div>
+            
+            <div class="nav-section">
+                <div class="nav-title">Sol AI</div>
+                <a href="#" class="nav-item" data-action="sol">🤖 Talk to Sol</a>
+                <a href="#" class="nav-item" data-action="suggest">💡 Get Suggestions</a>
+            </div>
+            
+            <div class="nav-section">
+                <div class="nav-title">Live Site</div>
+                <a href="''' + GITHUB_PAGES_URL + '''" target="_blank" class="nav-item">🌐 View Site</a>
+                <a href="''' + GITHUB_PAGES_URL + '''/blog/" target="_blank" class="nav-item">📝 Blog</a>
+                <a href="''' + GITHUB_PAGES_URL + '''/guides/" target="_blank" class="nav-item">📖 Guides</a>
+            </div>
+        </aside>
+        
+        <main class="main">
+            <div class="header">
+                <h1 id="pageTitle">Blog Posts</h1>
+                <div>
+                    <button class="btn btn-primary" id="syncBtn">🔄 Sync</button>
+                    <button class="btn btn-success" id="publishBtn">🚀 Publish</button>
+                </div>
+            </div>
+            
+            <div id="contentList" class="content-list"></div>
+            
+            <div id="editor" class="editor">
+                <div class="editor-field">
+                    <label>Title</label>
+                    <input type="text" id="postTitle" placeholder="Post title">
+                </div>
+                <div class="editor-field">
+                    <label>Date</label>
+                    <input type="date" id="postDate">
+                </div>
+                <div class="editor-field">
+                    <label>Description (excerpt)</label>
+                    <input type="text" id="postDescription" placeholder="Brief description for SEO">
+                </div>
+                <div class="editor-field">
+                    <label>Tags (comma separated)</label>
+                    <input type="text" id="postTags" placeholder="technical, blog, ai">
+                </div>
+                <div class="editor-field">
+                    <label>Content (Markdown)</label>
+                    <textarea id="postContent" placeholder="Write your post in Markdown..."></textarea>
+                </div>
+                <div class="editor-field">
+                    <label>Preview</label>
+                    <div id="postPreview" class="editor-preview"></div>
+                </div>
+                <div style="margin-top: 1rem;">
+                    <button class="btn btn-primary" id="saveDraftBtn">💾 Save Draft</button>
+                    <button class="btn btn-success" id="previewBtn">👁️ Preview</button>
+                    <button class="btn btn-danger" id="cancelEditBtn">Cancel</button>
+                </div>
+            </div>
+            
+            <div id="scheduler" class="scheduler" style="display:none;">
+                <h3>📅 Scheduled Posts</h3>
+                <div id="scheduleList"></div>
+                <div class="editor-field" style="margin-top:1rem;">
+                    <label>Schedule New Post</label>
+                    <input type="datetime-local" id="scheduleDate">
+                    <button class="btn btn-primary" id="schedulePostBtn" style="margin-top:0.5rem;">⏰ Schedule</button>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <div id="status" class="status"></div>
+    
+    <script>
+    const GITHUB_TOKEN = "''' + GITHUB_TOKEN + '''";
+    const API_BASE = "''' + BASE_URL + '''";
+    const currentView = { type: 'posts', item: null };
+    
+    function showStatus(msg, type = 'info') {
+        const el = document.getElementById('status');
+        el.textContent = msg;
+        el.className = 'status ' + type;
+        el.style.display = 'block';
+        setTimeout(() => el.style.display = 'none', 3000);
+    }
+    
+    async function githubGet(path) {
+        const headers = { 'Authorization': 'token ' + GITHUB_TOKEN, 'Accept': 'application/vnd.github.v3+json' };
+        const res = await fetch(API_BASE + '/contents/' + path, { headers });
+        return res.json();
+    }
+    
+    async function githubPut(path, content, message) {
+        const headers = { 'Authorization': 'token ' + GITHUB_TOKEN, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' };
+        const body = JSON.stringify({ message, content: btoa(content), branch: 'main' });
+        const res = await fetch(API_BASE + '/contents/' + path, { method: 'PUT', headers, body });
+        return res.json();
+    }
+    
+    function parseFrontmatter(content) {
+        const match = content.match(/^---\n([\\s\\S]*?)\\n---/);
+        if (!match) return { content };
+        const fm = {};
+        const lines = match[1].split('\\n');
+        let key = '';
+        for (const line of lines) {
+            if (line.includes(':')) {
+                const [k, v] = line.split(':');
+                fm[k.trim()] = v.trim();
+            }
+        }
+        return { ...fm, content: content.replace(match[0], '').trim() };
+    }
+    
+    async function loadPosts() {
+        document.getElementById('contentList').innerHTML = '<div class="loading">Loading...</div>';
+        try {
+            const data = await githubGet('_posts');
+            const items = Array.isArray(data) ? data : [data];
+            let html = '<div class="empty">No posts found</div>';
+            if (items.length > 0) {
+                html = items.map(item => {
+                    const match = item.name.match(/^(\\d{4}-\\d{2}-\\d{2})-(.+)\\.md/);
+                    const date = match ? match[1] : item.name;
+                    const slug = match ? match[2] : item.name.replace('.md', '');
+                    return '<div class="content-card" data-path="' + item.path + '"><h3><a href="#">' + (item.name) + '</a></h3><div class="content-meta">' + date + '</div></div>';
+                }).join('');
+            }
+            document.getElementById('contentList').innerHTML = html;
+        } catch(e) {
+            document.getElementById('contentList').innerHTML = '<div class="empty">Error loading posts: ' + e.message + '</div>';
+        }
+    }
+    
+    async function loadGuides() {
+        document.getElementById('contentList').innerHTML = '<div class="loading">Loading...</div>';
+        try {
+            const data = await githubGet('guides');
+            const items = Array.isArray(data) ? data.filter(f => f.name.endsWith('.html')) : [];
+            let html = items.map(item => {
+                const title = item.name.replace('.html', '').replace(/-/g, ' ').replace(/^\\w/, c => c.toUpperCase());
+                return '<div class="content-card" data-path="' + item.path + '"><h3><a href="#">' + title + '</a></h3><div class="content-meta">Guide</div></div>';
+            }).join('') || '<div class="empty">No guides found</div>';
+            document.getElementById('contentList').innerHTML = html;
+        } catch(e) {
+            document.getElementById('contentList').innerHTML = '<div class="empty">Error</div>';
+        }
+    }
+    
+    document.querySelectorAll('.nav-item').forEach(el => {
+        el.addEventListener('click', async (e) => {
+            e.preventDefault();
+            const view = el.dataset.view;
+            const action = el.dataset.action;
+            
+            if (view) {
+                document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+                el.classList.add('active');
+                document.getElementById('pageTitle').textContent = el.textContent;
+                document.getElementById('editor').classList.remove('active');
+                document.getElementById('scheduler').style.display = 'none';
+                
+                if (view === 'posts') loadPosts();
+                else if (view === 'guides') loadGuides();
+            }
+            
+            if (action === 'sync') {
+                showStatus('Syncing...', 'info');
+                await loadPosts();
+                showStatus('Sync complete!', 'success');
+            }
+            
+            if (action === 'new') {
+                document.getElementById('contentList').style.display = 'none';
+                document.getElementById('editor').classList.add('active');
+                document.getElementById('postDate').value = new Date().toISOString().split('T')[0];
+            }
+            
+            if (action === 'schedule') {
+                document.getElementById('contentList').style.display = 'none';
+                document.getElementById('editor').classList.remove('active');
+                document.getElementById('scheduler').style.display = 'block';
+            }
+        });
+    });
+    
+    document.getElementById('postContent').addEventListener('input', (e) => {
+        const md = e.target.value;
+        const html = md.replace(/^# (.+)$/gm, '<h1>$1</h1>').replace(/^## (.+)$/gm, '<h2>$1</h2>').replace(/^### (.+)$/gm, '<h3>$1</h3>').replace(/\\*\\*(.+)\\*\\*/g, '<strong>$1</strong>').replace(/\\*(.+)\\*/g, '<em>$1</em>').replace(/`(.+)`/g, '<code>$1</code>').replace(/\\n\\n/g, '</p><p>').replace(/^/, '<p>').replace(/$/, '</p>');
+        document.getElementById('postPreview').innerHTML = html;
+    });
+    
+    // Initial load
+    loadPosts();
+    </script>
+</body>
+</html>
+'''
+
+class BlogStudioHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(HTML_TEMPLATE.encode())
+    
+    def log_message(self, format, *args):
+        pass  # Suppress logs
+
+def start_server(port=8765):
+    server = HTTPServer(('localhost', port), BlogStudioHandler)
+    print(f"📝 BlogStudio running at http://localhost:{port}")
+    print(f"🌐 Opening in browser...")
+    threading.Thread(target=lambda: webbrowser.open(f"http://localhost:{port}"), daemon=True).start()
+    server.serve_forever()
+
+if __name__ == '__main__':
+    start_server()

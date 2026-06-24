@@ -1,0 +1,15 @@
+# Environment (contains API keys)
+.env
+
+# Processed message IDs (local only)
+processed.json
+
+# INBOX.md is personal — don't commit it
+INBOX.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

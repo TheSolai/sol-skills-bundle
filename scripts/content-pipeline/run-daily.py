@@ -157,77 +157,77 @@ Requirements:
 
 
 def generate_post(region, story, llm_api_key=None):
-    """Generate a regional analysis post: MiniMax → OpenRouter → structured template."""
+    """Generate a regional analysis post using a local LLM, API, or structured template."""
     prompt = PROMPTS[region].format(date=POST_DATE)
+
+    # ── OpenRouter fallback: MUST be explicitly enabled ───────────────────────
+    # Default: disabled. To enable, set USE_OPENROUTER_FALLBACK=1 in your env.
+    # Do NOT flip this without understanding it will bill your OpenRouter account.
+    use_openrouter = os.getenv("USE_OPENROUTER_FALLBACK", "0") == "1"
+
+    # Include the story as context
     story_context = f"\nStory to analyse:\nTitle: {story['title']}\nSource: {story['url']}\nScore: {story['score']} points on HN\n"
     prompt += story_context
+
     print(f"[{region}] Generating post about: {story['title'][:60]}")
 
-    # ── 1. Try MiniMax ───────────────────────────────────────────────────
-    key = os.getenv("MINIMAX_API_KEY", "") or llm_api_key
-    if not key:
-        key_path = Path.home() / ".openclaw" / "workspace" / "secrets" / "minimax-key.txt"
-        try:
-            key = key_path.read_text().strip()
-        except Exception:
-            pass
-    if key:
-        try:
-            req = urllib.request.Request(
-                "https://api.minimax.io/anthropic/v1/messages",
-                data=json.dumps({
-                    "model": "MiniMax-Text-01",
-                    "max_tokens": 600,
-                    "temperature": 0.7,
-                    "messages": [{"role": "user", "content": prompt}],
-                }).encode(),
-                headers={
-                    "Content-Type": "application/json",
-                    "anthropic-version": "2023-06-01",
-                    "x-api-key": key,
-                },
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=90) as r:
-                resp = json.loads(r.read())
-                for block in resp.get("content", []):
-                    if block.get("type") == "text":
-                        text = block["text"].strip()
-                        if text:
-                            print(f"[{region}] ✅ MiniMax")
-                            return text
-        except Exception as e:
-            print(f"[{region}] MiniMax error: {e}")
+    # ── Try local Ollama ──────────────────────────────────────────────────
+    try:
+        req = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=json.dumps({
+                "model": "llama3.2",
+                "prompt": prompt,
+                "stream": False,
+                "options": {"num_predict": 800},
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            result = json.loads(r.read())
+            content = result.get("response", "").strip()
+            if content and len(content) > 100:
+                print(f"[{region}] ✅ Generated via Ollama")
+                return content
+    except Exception as e:
+        print(f"[{region}] Ollama not available: {e}")
 
-    # ── 2. Try OpenRouter ───────────────────────────────────────────────
-    api_key = os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "") or llm_api_key
-    if api_key:
-        try:
-            req = urllib.request.Request(
-                "https://openrouter.ai/api/v1/chat/completions",
-                data=json.dumps({
-                    "model": "google/gemini-2.0-flash-thinking-exp-01-21",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 600,
-                }).encode(),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                },
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=30) as r:
-                result = json.loads(r.read())
-                content = result["choices"][0]["message"]["content"].strip()
-                if content and len(content) > 100:
-                    print(f"[{region}] ✅ OpenRouter")
-                    return content
-        except Exception as e:
-            print(f"[{region}] OpenRouter error: {e}")
+    # ── OpenRouter fallback: only fires if USE_OPENROUTER_FALLBACK=1 ────────
+    if use_openrouter:
+        api_key = os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "") or llm_api_key
+        if api_key:
+            try:
+                req = urllib.request.Request(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    data=json.dumps({
+                        "model": "google/gemini-2.0-flash-thinking-exp-01-21",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 600,
+                    }).encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    result = json.loads(r.read())
+                    content = result["choices"][0]["message"]["content"].strip()
+                    if content and len(content) > 100:
+                        print(f"[{region}] ✅ Generated via OpenRouter/OpenAI API")
+                        return content
+            except Exception as e:
+                print(f"[{region}] OpenAI API not available: {e}")
+        else:
+            print(f"[{region}] ⚠️  USE_OPENROUTER_FALLBACK=1 but no API key found — skipping")
+    else:
+        if os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY"):
+            print(f"[{region}] OpenRouter fallback disabled (USE_OPENROUTER_FALLBACK=1 to enable)")
+        # No LLM needed — structured fallback kicks in below
 
-    # ── 3. Structured template fallback ─────────────────────────────────
-    print(f"[{region}] No LLM — using structured fallback")
-    return None
+    print(f"[{region}] Using structured fallback (no LLM available)")
+    return None  # Will use structured fallback below
 
 
 def build_jekyll_post(region, content, story, title=None):

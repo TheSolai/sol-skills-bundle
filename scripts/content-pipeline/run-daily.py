@@ -9,8 +9,7 @@ Run daily via cron at 8am UK time (07:00 UTC):
 Or manually:
   python3 scripts/content-pipeline/run-daily.py
 
-LLM fallback: defaults to built-in structured content when Ollama is unavailable.
-To use OpenRouter (bills your account): set USE_OPENROUTER_FALLBACK=1 in your env.
+LLM: MiniMax only. Falls back to structured templates if key is missing.
 """
 
 import sys, os, json, datetime, urllib.request, re
@@ -21,6 +20,15 @@ BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle")
 TODAY = datetime.datetime.utcnow()
 DATE_STR = TODAY.strftime("%Y-%m-%d")
 POST_DATE = TODAY.strftime("%B %d, %Y")
+MINIMAX_KEY_PATH = Path.home() / ".openclaw" / "workspace" / "secrets" / "minimax-key.txt"
+
+
+def _load_minimax_key() -> str:
+    """Load MiniMax API key from secrets file."""
+    try:
+        return MINIMAX_KEY_PATH.read_text().strip()
+    except Exception:
+        return ""
 
 # ── Fetch AI news from Hacker News ──────────────────────────────────────────
 
@@ -157,77 +165,48 @@ Requirements:
 
 
 def generate_post(region, story, llm_api_key=None):
-    """Generate a regional analysis post using a local LLM, API, or structured template."""
+    """Generate a regional analysis post via MiniMax, or use structured template."""
     prompt = PROMPTS[region].format(date=POST_DATE)
-
-    # ── OpenRouter fallback: MUST be explicitly enabled ───────────────────────
-    # Default: disabled. To enable, set USE_OPENROUTER_FALLBACK=1 in your env.
-    # Do NOT flip this without understanding it will bill your OpenRouter account.
-    use_openrouter = os.getenv("USE_OPENROUTER_FALLBACK", "0") == "1"
-
-    # Include the story as context
     story_context = f"\nStory to analyse:\nTitle: {story['title']}\nSource: {story['url']}\nScore: {story['score']} points on HN\n"
     prompt += story_context
-
     print(f"[{region}] Generating post about: {story['title'][:60]}")
 
-    # ── Try local Ollama ──────────────────────────────────────────────────
+    key = _load_minimax_key()
+    if not key:
+        print(f"[{region}] No MiniMax key — using structured fallback")
+        return None
+
+    messages = [{"role": "user", "content": prompt}]
+    body = json.dumps({
+        "model": "MiniMax-Text-01",
+        "max_tokens": 600,
+        "temperature": 0.7,
+        "messages": messages,
+    }).encode()
     try:
         req = urllib.request.Request(
-            "http://localhost:11434/api/generate",
-            data=json.dumps({
-                "model": "llama3.2",
-                "prompt": prompt,
-                "stream": False,
-                "options": {"num_predict": 800},
-            }).encode(),
-            headers={"Content-Type": "application/json"},
+            "https://api.minimax.io/anthropic/v1/messages",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01",
+                "x-api-key": key,
+            },
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=60) as r:
-            result = json.loads(r.read())
-            content = result.get("response", "").strip()
-            if content and len(content) > 100:
-                print(f"[{region}] ✅ Generated via Ollama")
-                return content
+        with urllib.request.urlopen(req, timeout=90) as r:
+            resp = json.loads(r.read())
+            for block in resp.get("content", []):
+                if block.get("type") == "text":
+                    text = block["text"].strip()
+                    if text:
+                        print(f"[{region}] ✅ MiniMax")
+                        return text
     except Exception as e:
-        print(f"[{region}] Ollama not available: {e}")
+        print(f"[{region}] MiniMax error: {e}")
 
-    # ── OpenRouter fallback: only fires if USE_OPENROUTER_FALLBACK=1 ────────
-    if use_openrouter:
-        api_key = os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "") or llm_api_key
-        if api_key:
-            try:
-                req = urllib.request.Request(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    data=json.dumps({
-                        "model": "google/gemini-2.0-flash-thinking-exp-01-21",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 600,
-                    }).encode(),
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {api_key}",
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=30) as r:
-                    result = json.loads(r.read())
-                    content = result["choices"][0]["message"]["content"].strip()
-                    if content and len(content) > 100:
-                        print(f"[{region}] ✅ Generated via OpenRouter/OpenAI API")
-                        return content
-            except Exception as e:
-                print(f"[{region}] OpenAI API not available: {e}")
-        else:
-            print(f"[{region}] ⚠️  USE_OPENROUTER_FALLBACK=1 but no API key found — skipping")
-    else:
-        if os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY"):
-            print(f"[{region}] OpenRouter fallback disabled (USE_OPENROUTER_FALLBACK=1 to enable)")
-        # No LLM needed — structured fallback kicks in below
-
-    print(f"[{region}] Using structured fallback (no LLM available)")
-    return None  # Will use structured fallback below
+    print(f"[{region}] MiniMax failed — using structured fallback")
+    return None
 
 
 def build_jekyll_post(region, content, story, title=None):

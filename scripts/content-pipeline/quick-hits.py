@@ -30,21 +30,11 @@ def _load_minimax_key() -> str:
         return ""
 
 
-def llm_generate(prompt: str, system: str = "", max_tokens: int = 800) -> str:
+def llm_generate(prompt: str, system: str = "", max_tokens: int = 800) -> str | None:
     """Generate text via MiniMax, or return None for template fallback."""
-    # ── MiniMax fallback: MUST be explicitly enabled ─────────────────────────
-    # Default: disabled. Set USE_MINIMAX_FALLBACK=1 to enable.
-    # Do NOT flip this without understanding it will bill your MiniMax account.
-    if os.getenv("USE_MINIMAX_FALLBACK", "0") != "1":
-        if MINIMAX_KEY_PATH.exists():
-            print("[llm] MiniMax key found but USE_MINIMAX_FALLBACK=1 not set — using template fallback")
-        return None
-
     key = _load_minimax_key()
     if not key:
-        print("[llm] USE_MINIMAX_FALLBACK=1 but MiniMax key not found — using template fallback")
         return None
-
     messages = [{"role": "user", "content": system + "\n\n" + prompt}] if system else [{"role": "user", "content": prompt}]
     body = json.dumps({
         "model": "MiniMax-Text-01",
@@ -52,7 +42,6 @@ def llm_generate(prompt: str, system: str = "", max_tokens: int = 800) -> str:
         "temperature": 0.7,
         "messages": messages,
     }).encode()
-
     try:
         req = urllib.request.Request(
             "https://api.minimax.io/anthropic/v1/messages",
@@ -70,12 +59,10 @@ def llm_generate(prompt: str, system: str = "", max_tokens: int = 800) -> str:
                 if block.get("type") == "text":
                     text = block["text"].strip()
                     if text:
-                        print("[llm] ✅ Generated via MiniMax")
+                        print("[llm] ✅ MiniMax")
                         return text
     except Exception as e:
         print(f"[llm] MiniMax error: {e}")
-
-    print("[llm] No LLM available — using template fallback")
     return None
 
 

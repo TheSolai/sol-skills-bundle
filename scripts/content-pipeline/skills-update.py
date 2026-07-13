@@ -50,19 +50,92 @@ HOMEPAGE_FILE = SITE_DIR / "index.html"
 
 
 def load_skills():
-    """Load skills from schemas.json."""
+    """Load skills from schemas.json.
+
+    Handles two formats:
+    1. Plain JSON array (direct list of skill objects)
+    2. HTML file with embedded JSON-LD <script> tag containing ItemList element
+    """
     if not SKILLS_FILE.exists():
         print(f"  ⚠️  Skills file not found: {SKILLS_FILE}")
         return []
 
     with open(SKILLS_FILE, encoding="utf-8") as f:
-        data = json.load(f)
+        raw = f.read()
 
-    if isinstance(data, list):
-        return data
-    elif isinstance(data, dict):
-        return data.get("skills", data.get("skills_list", []))
-    return []
+    # Try direct JSON parse first (plain JSON array)
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict):
+            return data.get("skills", data.get("skills_list", []))
+    except json.JSONDecodeError:
+        pass
+
+    # Fall back: extract JSON-LD from HTML file
+    # Note: use brace-counting instead of non-greedy regex (.*?) because
+    # the JSON contains nested braces — non-greedy stops at the first }
+    script_tag_pattern = re.compile(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>\s*(.*?)\s*</script>',
+        re.DOTALL | re.IGNORECASE
+    )
+
+    all_ld = []
+    for match in script_tag_pattern.finditer(raw):
+        raw_json = match.group(1).strip()
+        if not raw_json:
+            continue
+        try:
+            ld = json.loads(raw_json)
+            all_ld.append(ld)
+        except json.JSONDecodeError:
+            # Try brace-counting parse for nested JSON
+            if raw_json.startswith('{'):
+                depth = 0
+                end = 0
+                for i, ch in enumerate(raw_json):
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                if end > 0:
+                    try:
+                        ld = json.loads(raw_json[:end])
+                        all_ld.append(ld)
+                    except json.JSONDecodeError:
+                        pass
+
+    if not all_ld:
+        print(f"  ⚠️  No JSON-LD found in {SKILLS_FILE}")
+        return []
+
+    try:
+        # Walk all JSON-LD objects to find ItemList elements
+        item_lists = []
+        for ld in all_ld:
+            if ld.get("@type") == "ItemList":
+                item_lists.append(ld)
+            # Also check @graph for multiple types
+            for item in ld.get("@graph", []):
+                if item.get("@type") == "ItemList":
+                    item_lists.append(item)
+
+        skills = []
+        for item_list in item_lists:
+            for li in item_list.get("itemListElement", []):
+                name = li.get("name", "")
+                url = li.get("url", "")
+                if name:
+                    skills.append({"name": name, "url": url, "title": name})
+
+        return skills
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"  ⚠️  Failed to parse JSON-LD: {e}")
+        return []
 
 
 def get_emoji(name):

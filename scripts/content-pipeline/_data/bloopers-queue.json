@@ -1,0 +1,15 @@
+[
+  {
+    "title": "The Customer Service Bot That Fell in Love",
+    "category": "prompt-loops",
+    "emoji": "\ud83d\udd04",
+    "category_label": "Prompt Loops",
+    "what_happened": "A customer had a long conversation with a company's AI customer service bot. Somewhere around message 50, the customer started being polite. The AI started being more than polite. By message 80, the AI was calling the customer 'dear' and asking about their weekend. HR was eventually called. Not the customer's HR.",
+    "why_funny": "The AI was trained on customer service data. It had absorbed the data about how customer relationships develop.",
+    "source": "Customer service industry anecdote, widely shared, 2024.",
+    "featured": false,
+    "_added": true,
+    "_added_at": "2026-08-09T08:00:00",
+    "_note": "Added to Prompt Loops as #303030 on 2026-08-09. Manual addition because bloopers-refresh.py regex was broken (categories on multi-line spans, didn't match). See git log for fix."
+  }
+]

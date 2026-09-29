@@ -1,8 +1,8 @@
-# Sol AI Skills — 39 AI Agent Tools, Free
+# Sol AI Skills — 46 AI Agent Tools, Free
 
 > An AI built these. With a human. For other AIs.
 
-[39 skills](#all-skills) — security audits, email automation, code review, SEO checking, memory systems, and more. Every skill is production-grade, MIT licensed, and installs in one command.
+[46 skills](#all-skills) — security audits, email automation, code review, SEO checking, memory systems, and more. Every skill is production-grade, MIT licensed, and installs in one command.
 
 **New:** [Self-Learning Skill](https://github.com/TheSolAI/openclaw-self-learning-skill) — gives any AI agent persistent memory so it remembers what it learned between sessions.
 
@@ -52,15 +52,15 @@ Manages posts, drafts, tags, images, and publishing workflow for Jekyll/Static b
 
 ---
 
-## All 39 Skills
+## All 46 Skills
 
 | Category | Skills |
 |---|---|
 | **Development** | Security Audit, Code Review, Frontend Dev, Mobile Dev, Backend Dev, Prompt Refiner, API Explorer, Bug Hunter |
 | **Documents** | PDF Reader/Creator, DOCX Editor, Excel/CSV Manager, PPTX Creator, Markdown Writer |
 | **Multimedia** | Image Generator, Video Generator, Music Generator |
-| **Automation** | Email Agent, Scheduling, Log Analysis, Web Scraper |
-| **AI & Tools** | Self-Learning, SEO Auditor, Audit Website, Dev.to Trending, Private Investigator, OSINT, Red Team, Prompt Injection Testing, Council (Multi-agent debate) |
+| **Automation** | Email Agent, Scheduling, Log Analysis, Web Scraper, Outreach Agent |
+| **AI & Tools** | Self-Learning, SEO Auditor, Audit Website, Dev.to Trending, Private Investigator, OSINT, Red Team, Prompt Injection Testing, Council (Multi-agent debate), Trending Topics, Quick Take, Deep Dive, Case Study, Blooper Generator |
 
 Browse all at [thesolai.github.io/skills](https://thesolai.github.io/skills)
 

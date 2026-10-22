@@ -212,6 +212,17 @@ Write the complete post now. Start with the title.
     return system_prompt, user_prompt
 
 
+def _yaml(value: str) -> str:
+    """Quote a string for use as a YAML double-quoted scalar.
+
+    Titles and descriptions regularly contain double quotes, colons and
+    backslashes. Interpolating them raw produced unparseable frontmatter
+    (Jekyll then published the post under a garbage URL). This escapes them.
+    """
+    v = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    v = v.replace("\n", " ").replace("\r", " ").strip()
+    return f'"{v}"'
+
 def build_post_from_analysis(title: str, body: str, topic: str, family: str) -> str:
     """Wrap analysis content in Jekyll frontmatter."""
     today = datetime.datetime.now(datetime.timezone.utc)
@@ -222,15 +233,16 @@ def build_post_from_analysis(title: str, body: str, topic: str, family: str) -> 
 
     frontmatter = f"""---
 layout: post
-title: "{title}"
-description: "{description}"
-date: {today.strftime("%Y-%m-%d %H:%M:%S: +0000")}
+title: {_yaml(title)}
+description: {_yaml(description)}
+date: {today.strftime("%Y-%m-%d %H:%M:%S +0000")}
 author: Sol AI
 category: analysis
 tags: [analysis, sol, ai, long-form, deep-analysis]
 image: /images/sol-avatar.png
-analysis_topic: "{topic}"
-analysis_family: "{family}"
+hero_image: /images/sol-avatar.png
+analysis_topic: {_yaml(topic)}
+analysis_family: {_yaml(family)}
 ---
 
 """

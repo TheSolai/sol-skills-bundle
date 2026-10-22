@@ -204,6 +204,35 @@ def generate_post(region, story, llm_api_key=None):
     return None
 
 
+def _clean_title(raw):
+    """Normalise an LLM-returned title for use in YAML frontmatter.
+
+    The model frequently wraps titles in markdown emphasis ("**Title**"), which
+    leaks literal asterisks into the frontmatter `title:` field, breaks the
+    rendered <title> tag, and fails the site health test that checks for stray
+    '**'. Strip heading markers, surrounding emphasis, and stray quotes.
+    """
+    t = raw.strip()
+    t = re.sub(r"^#+\s*", "", t)          # leading markdown heading
+    t = t.strip()
+    t = t.strip("*_`").strip()            # surrounding emphasis / code
+    t = t.strip()
+    t = t.strip('"').strip("'").strip()
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
+
+
+def _yaml(value: str) -> str:
+    """Quote a string for use as a YAML double-quoted scalar.
+
+    Titles and descriptions regularly contain double quotes, colons and
+    backslashes. Interpolating them raw produced unparseable frontmatter
+    (Jekyll then published the post under a garbage URL). This escapes them.
+    """
+    v = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    v = v.replace("\n", " ").replace("\r", " ").strip()
+    return f'"{v}"'
+
 def build_jekyll_post(region, content, story, title=None):
     """Build a Jekyll-formatted blog post from content."""
     # If content is None/empty, generate a structured fallback
@@ -253,10 +282,15 @@ What this means: The implications depend on who's building, who's regulating, an
 
 One takeaway: Watch this space. The AI story is still being written.
 """)
-        title = f"[{region.upper()}] {title_text[:60]}"
+        # Fixed 2026-10-22: the title was truncated to 60 chars mid-word, which
+        # shipped cut-off titles on the live site (37 posts). Keep the full
+        # title; the description already carries the full source headline.
+        title = f"[{region.upper()}] {title_text}"
     elif not title:
         lines = content.strip().split("\n")
-        title = lines[0].strip("# ").strip() if lines else story["title"]
+        # Strip markdown emphasis: the model often returns titles wrapped in
+        # "**...**", which leaks into frontmatter and fails the site health test.
+        title = _clean_title(lines[0]) if lines else story["title"]
 
     slug = re.sub(r'[^a-z0-9-]+', '-', (title or story["title"]).lower()).strip('-')[:60]
     filename = f"{DATE_STR}-{slug}.md"
@@ -265,10 +299,11 @@ One takeaway: Watch this space. The AI story is still being written.
     tags = AI_TAGS_BY_REGION[region]
     frontmatter = f"""---
 layout: post
-title: "{title}"
+title: {_yaml(title)}
 date: {DATE_STR}
-description: "{story['title']} — daily AI analysis from {REGION_LABELS[region]}."
+description: {_yaml(story['title'] + " — daily AI analysis from " + REGION_LABELS[region] + ".")}
 image: /images/sol-avatar.png
+hero_image: /images/sol-avatar.png
 tags: [{', '.join(tags)}]
 author: Sol AI
 hn_url: {story['url']}
@@ -367,10 +402,11 @@ def generate_blooper_post():
 
     frontmatter = f"""---
 layout: post
-title: "{title}"
+title: {_yaml(title)}
 date: {DATE_STR}
 description: "A weekly roundup of the most absurd, alarming, and accidentally hilarious AI failures. This week: prompt loops, phantom meetings, and hallucinated citations."
 image: /images/sol-avatar.png
+hero_image: /images/sol-avatar.png
 tags: [ai, bloopers, humor, fails]
 author: Sol AI
 ---

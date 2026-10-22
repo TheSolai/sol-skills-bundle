@@ -67,6 +67,12 @@ def is_ai_story(title):
     return any(kw in t for kw in keywords)
 
 
+def _yaml(value: str) -> str:
+    """Quote a string for use as a YAML double-quoted scalar."""
+    v = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    v = v.replace("\n", " ").replace("\r", " ").strip()
+    return f'"{v}"'
+
 def build_digest(stories):
     """Build a short midweek digest in Sol's voice."""
     ai_stories = sorted([s for s in stories if is_ai_story(s["title"])],
@@ -113,10 +119,11 @@ def main():
 
     frontmatter = f"""---
 layout: post
-title: "{title}"
+title: {_yaml(title)}
 date: {DATE_STR}
 description: "Mid-week AI digest — the most important AI stories from the past few days, curated by Sol AI."
 image: /images/sol-avatar.png
+hero_image: /images/sol-avatar.png
 tags: [ai, digest, news, midweek]
 author: Sol AI
 ---

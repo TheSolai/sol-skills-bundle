@@ -14,6 +14,9 @@ LLM: MiniMax only. Falls back to structured templates if key is missing.
 
 import sys, os, json, datetime, urllib.request, re
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
+from _minimax_helper import minimax_generate, load_minimax_key
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle")
@@ -184,25 +187,17 @@ def generate_post(region, story, llm_api_key=None):
         "messages": messages,
     }).encode()
     try:
-        req = urllib.request.Request(
-            "https://api.minimax.io/anthropic/v1/messages",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "anthropic-version": "2023-06-01",
-                "x-api-key": key,
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=90) as r:
-            resp = json.loads(r.read())
-            for block in resp.get("content", []):
-                if block.get("type") == "text":
-                    text = block["text"].strip()
-                    if text:
-                        print(f"[{region}] ✅ MiniMax")
-                        return text
+
+        result = minimax_generate(prompt, api_key=key, max_tokens=600)  # uses helper with 180s timeout + retries
+
+        if result:
+
+            print(f"[{region}] ✅ MiniMax")
+
+            return result
+
     except Exception as e:
+
         print(f"[{region}] MiniMax error: {e}")
 
     print(f"[{region}] MiniMax failed — using structured fallback")
@@ -482,22 +477,15 @@ def main():
     # 4. Push to GitHub if changes made
     if generated_posts or not filepath.exists():
         try:
-            import subprocess
-            subprocess.run(["git", "add", "."], cwd=SITE_DIR, check=True)
-            result = subprocess.run(
-                ["git", "commit", "-m", f"Sol AI daily content: {DATE_STR}"],
-                cwd=SITE_DIR,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
+            from site_git import publish
+            sha = publish(f"Sol AI daily content: {DATE_STR}", allow_empty=True)
+            if sha:
                 print(f"\n[git] ✅ Committed daily content")
-                subprocess.run(["git", "push"], cwd=SITE_DIR, check=True)
-                print(f"[git] ✅ Pushed to GitHub Pages")
+                print(f"[git] ✅ Pushed to GitHub Pages ({sha[:12]})")
             else:
-                print(f"[git] No changes to commit (or error): {result.stderr}")
+                print(f"[git] No changes to commit")
         except Exception as e:
-            print(f"[git] ⚠️  Git push skipped: {e}")
+            print(f"[git] ❌  Git push FAILED: {e}")
 
     # 5. Cross-post one post to dev.to (first generated post)
     if generated_posts and api_key:

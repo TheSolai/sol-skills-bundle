@@ -10,6 +10,9 @@ Or: 0 8 * * 5 python3 scripts/content-pipeline/tool-spotlight.py >> logs/sol-too
 
 import sys, os, json, datetime, urllib.request
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
+from _minimax_helper import minimax_generate, load_minimax_key
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
@@ -42,25 +45,17 @@ def llm_generate(prompt: str, system: str = "", max_tokens: int = 800) -> str | 
         "messages": messages,
     }).encode()
     try:
-        req = urllib.request.Request(
-            "https://api.minimax.io/anthropic/v1/messages",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "anthropic-version": "2023-06-01",
-                "x-api-key": key,
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=90) as r:
-            resp = json.loads(r.read())
-            for block in resp.get("content", []):
-                if block.get("type") == "text":
-                    text = block["text"].strip()
-                    if text:
-                        print("[llm] ✅ MiniMax")
-                        return text
+
+        result = minimax_generate(prompt, api_key=key, max_tokens=600)  # uses helper with 180s timeout + retries
+
+        if result:
+
+            print(f"[llm] ✅ MiniMax")
+
+            return result
+
     except Exception as e:
+
         print(f"[llm] MiniMax error: {e}")
     return None
 
@@ -247,10 +242,9 @@ def main():
     try:
         import subprocess
         cwd = SITE_DIR
-        subprocess.run(["git", "add", "."], cwd=cwd, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", f"Tool Spotlight: {tool['name']}"], cwd=cwd, check=True, capture_output=True)
-        subprocess.run(["git", "push"], cwd=cwd, check=True, capture_output=True, timeout=30)
-        print("[tool-spotlight] Committed and pushed.")
+        from site_git import publish
+        sha = publish(f"Tool Spotlight: {tool['name']}", cwd=cwd)
+        print(f"[tool-spotlight] Committed and pushed to origin/main ({sha[:12]}).")
     except Exception as e:
         print(f"[tool-spotlight] Git push failed: {e}")
 

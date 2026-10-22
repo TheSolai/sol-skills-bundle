@@ -282,58 +282,15 @@ def commit_and_push(message):
         return False
 
     try:
-        # Pull first to avoid divergence (per past lessons)
-        pull = subprocess.run(
-            ["git", "pull", "--rebase", "--autostash"],
-            cwd=SITE_DIR,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if pull.returncode != 0:
-            print(f"  ⚠️  git pull failed (non-fatal, continuing): {pull.stderr.strip()[:200]}")
-
-        add = subprocess.run(
-            ["git", "add", "bloopers.html"],
-            cwd=SITE_DIR,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if add.returncode != 0:
-            print(f"  ❌ git add failed: {add.stderr.strip()}")
-            return False
-
-        commit = subprocess.run(
-            ["git", "commit", "-m", message],
-            cwd=SITE_DIR,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if commit.returncode != 0:
-            # "nothing to commit" is OK
-            if "nothing to commit" in (commit.stdout + commit.stderr).lower():
-                print(f"  ℹ️  Nothing to commit (file already committed)")
-                return True
-            print(f"  ❌ git commit failed: {commit.stderr.strip()}")
-            return False
-
-        push = subprocess.run(
-            ["git", "push"],
-            cwd=SITE_DIR,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if push.returncode != 0:
-            print(f"  ❌ git push failed: {push.stderr.strip()[:300]}")
-            return False
-
-        print(f"  ✅ Committed and pushed to origin/main")
+        from site_git import publish
+        sha = publish(message, paths=["bloopers.html"], cwd=SITE_DIR)
+        if sha is None:
+            print(f"  ℹ️  Nothing to commit (file already committed)")
+            return True
+        print(f"  ✅ Committed and pushed to origin/main ({sha[:12]})")
         return True
-    except subprocess.TimeoutExpired as e:
-        print(f"  ❌ git operation timed out: {e}")
+    except Exception as e:
+        print(f"  ❌ git publish failed: {e}")
         return False
 
 

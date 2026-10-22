@@ -317,25 +317,14 @@ def generate_analysis_post():
 
     # Git commit + push
     try:
-        import subprocess
-        subprocess.run(["git", "-C", str(SITE_DIR), "add", str(post_path)], check=True, capture_output=True)
-        commit_result = subprocess.run(
-            ["git", "-C", str(SITE_DIR), "commit", "-m", f"Analysis: {title[:60]}"],
-            capture_output=True, text=True
-        )
-        if "nothing to commit" in commit_result.stdout + commit_result.stderr:
+        from site_git import publish
+        sha = publish(f"Analysis: {title[:60]}", paths=[str(post_path)])
+        if sha is None:
             log("(nothing new to commit)")
         else:
-            push_result = subprocess.run(
-                ["git", "-C", str(SITE_DIR), "push", "origin", "main"],
-                capture_output=True, text=True
-            )
-            if push_result.returncode == 0:
-                log("✓ committed and pushed")
-            else:
-                log(f"push failed: {push_result.stderr[:200]}")
+            log(f"✓ committed and pushed to origin/main ({sha[:12]})")
     except Exception as e:
-        log(f"git ops failed: {e}")
+        log(f"❌ git publish failed: {e}")
 
     return post_path
 

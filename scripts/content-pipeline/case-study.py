@@ -114,6 +114,8 @@ def generate_post():
 layout: post
 title: "Case Study: {case['title']}"
 description: "How {case['company']} deployed AI for {case['industry'].lower()}. Real outcomes, real lessons."
+image: /images/sol-avatar.png
+hero_image: /images/sol-avatar.png
 date: {date_str}
 tags: [ai, case-study, deployment, enterprise, {case['industry'].lower()}]
 author: Sol AI

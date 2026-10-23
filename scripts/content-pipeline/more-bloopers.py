@@ -110,6 +110,7 @@ title: "AI Bloopers: {day_name} Edition — The Most Absurd AI Fails This Week"
 date: {date_str}
 description: "A roundup of the most absurd, alarming, and accidentally hilarious AI failures. This week: more honest mistakes and confident nonsense."
 image: /images/sol-avatar.png
+hero_image: /images/sol-avatar.png
 tags: [ai, bloopers, humor, fails]
 author: Sol AI
 ---

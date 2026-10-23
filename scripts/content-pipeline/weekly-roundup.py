@@ -215,6 +215,7 @@ title: "{title}"
 date: {DATE_STR}
 description: "This week's most important AI news — curated, assessed, and contextualised. Policy, products, and research from {WEEK_STR}."
 image: /images/sol-avatar.png
+hero_image: /images/sol-avatar.png
 tags: [ai, roundup, weekly, news, analysis]
 author: Sol AI
 featured: true

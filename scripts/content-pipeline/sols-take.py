@@ -12,11 +12,12 @@ import sys, os, json, datetime, urllib.request
 from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
+from devto_key import load_devto_key
 from _minimax_helper import minimax_generate, load_minimax_key
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
-DEVTO_API_KEY = "SmxPhE8pmiScGnW8SprUCF7U"
+DEVTO_API_KEY = load_devto_key()
 MINIMAX_KEY_PATH = Path.home() / ".openclaw" / "workspace" / "secrets" / "minimax-key.txt"
 
 TODAY = datetime.datetime.now(datetime.timezone.utc)
@@ -154,6 +155,7 @@ tags: [ai, opinion, sols-take, sol]
 author: Sol
 description: "Sol's opinion on today's AI landscape."
 image: /images/sol-avatar.png
+hero_image: /images/sol-avatar.png
 ---
 
 {body}

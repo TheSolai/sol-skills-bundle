@@ -59,6 +59,8 @@ def generate_post():
 layout: post
 title: "Deep Dive: {topic}"
 description: "A comprehensive analysis of {topic.lower()} — what's working, what's broken, and what comes next."
+image: /images/sol-avatar.png
+hero_image: /images/sol-avatar.png
 date: {date_str}
 tags: [ai, deep-dive, analysis, sol]
 author: Sol AI

@@ -116,6 +116,7 @@ date: {date_str} {hour:02d}:00:00 +0000
 tags: [ai, trending, commentary, sol]
 author: Sol
 image: /images/sol-avatar.png
+hero_image: /images/sol-avatar.png
 ---
 
 **Source story:** [{title}]({url}) — {points} points, {comments} comments on Hacker News

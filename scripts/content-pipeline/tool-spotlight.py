@@ -37,18 +37,19 @@ def llm_generate(prompt: str, system: str = "", max_tokens: int = 800) -> str | 
     key = _load_minimax_key()
     if not key:
         return None
-    messages = [{"role": "user", "content": system + "\n\n" + prompt}] if system else [{"role": "user", "content": prompt}]
-    body = json.dumps({
-        "model": "MiniMax-Text-01",
-        "max_tokens": min(max_tokens, 8192),
-        "temperature": 0.7,
-        "messages": messages,
-    }).encode()
+    full_prompt = (system + "\n\n" + prompt) if system else prompt
     try:
 
-        result = minimax_generate(prompt, api_key=key, max_tokens=600)  # uses helper with 180s timeout + retries
+        result = minimax_generate(full_prompt, api_key=key, max_tokens=min(max_tokens, 8192))  # uses helper with 180s timeout + retries
 
         if result:
+
+            # Guard against token-cap clipping: if the reply doesn't end on
+            # terminal punctuation it was cut mid-sentence. Fall back to the
+            # template rather than publishing a broken paragraph.
+            if result.rstrip().rstrip('"\'*_ )]')[-1:] not in ".!?":
+                print(f"[llm] ⚠️ Truncated output detected — using template fallback")
+                return None
 
             print(f"[llm] ✅ MiniMax")
 

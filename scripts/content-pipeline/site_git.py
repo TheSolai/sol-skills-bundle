@@ -87,7 +87,11 @@ def ensure_main(cwd=SITE_DIR):
     r = _git(["pull", "--ff-only", "origin", "main"], cwd=cwd)
     if r.returncode != 0:
         # Local main diverged — rebase our commits on top of origin/main.
-        r = _git(["pull", "--rebase", "origin", "main"], cwd=cwd)
+        # --autostash is essential: a freshly generated post is still an
+        # untracked/modified file in _posts/ at this point, and without the
+        # autostash the rebase aborts with "You have unstaged changes",
+        # blocking every publish until the tree is cleaned by hand.
+        r = _git(["pull", "--rebase", "--autostash", "origin", "main"], cwd=cwd)
         if r.returncode != 0:
             raise PublishError(f"git pull failed: {r.stderr.strip()[:300]}")
 
@@ -128,7 +132,7 @@ def publish(message, paths=None, cwd=SITE_DIR, allow_empty=False):
             # Backup cron) pushed to origin/main between our pull and our push.
             # Rebase onto the new origin/main and retry.
             for attempt in range(2):
-                r = _git(["pull", "--rebase", "origin", "main"], cwd=cwd, timeout=120)
+                r = _git(["pull", "--rebase", "--autostash", "origin", "main"], cwd=cwd, timeout=120)
                 if r.returncode != 0:
                     raise PublishError(
                         f"git pull --rebase failed: {r.stderr.strip()[:300]}"

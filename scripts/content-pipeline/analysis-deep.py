@@ -269,6 +269,29 @@ def log(msg):
     print(msg)
 
 
+def published_topics() -> set:
+    """Topics already used by a published post, so we never regenerate one.
+
+    The topic rotation below is derived from the day of year, which repeats:
+    with four topics per family and an index that advances by two per day,
+    the same topic is chosen again within the same week. That produced a
+    near-duplicate post on 2026-10-23 of the 2026-10-21 analysis.
+    """
+    used = set()
+    posts_dir = SITE_DIR / "_posts"
+    if not posts_dir.exists():
+        return used
+    for post in posts_dir.glob("*.md"):
+        try:
+            text = post.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        m = re.search(r'^analysis_topic:\s*"(.*)"\s*$', text, re.M)
+        if m:
+            used.add(m.group(1).strip())
+    return used
+
+
 def generate_analysis_post():
     """Generate one deep analysis post."""
     today = datetime.datetime.now(datetime.timezone.utc)
@@ -282,6 +305,20 @@ def generate_analysis_post():
     family = subject["family"]
     topic_idx = (day_of_year + weekday) % len(subject["topics"])
     topic = subject["topics"][topic_idx]
+
+    # Skip any topic that already has a published post — the rotation repeats
+    # within a family, and a repeat means duplicate content on the live site.
+    used_topics = published_topics()
+    if topic in used_topics:
+        for offset in range(1, len(subject["topics"])):
+            candidate = subject["topics"][(topic_idx + offset) % len(subject["topics"])]
+            if candidate not in used_topics:
+                log(f"Topic already published, using next unused: {candidate}")
+                topic = candidate
+                break
+        else:
+            log(f"All topics in family already published, skipping: {family}")
+            return None
 
     log(f"Generating analysis: family={family}, topic={topic}")
 

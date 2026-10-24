@@ -96,6 +96,156 @@ def pick_regional_story(stories, region_hint=None):
     return ai_stories[0] if ai_stories else None
 
 
+# ── Source grounding ───────────────────────────────────────────────────────
+
+def fetch_source_excerpt(url, max_chars=6000):
+    """Fetch a source page and return readable text for factual grounding.
+
+    The regional prompts tell the model to write about "a development from
+    the UK/EU/US". When the story is actually from elsewhere, the model used
+    to invent a local origin to satisfy the framing. Giving it the real
+    text removes the need to guess.
+
+    Returns "" on any failure — this is an enhancement, never a hard
+    dependency.
+    """
+    if not url or not url.startswith("http"):
+        return ""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SolAI/1.0)"}
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read(1_500_000).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return ""
+
+    try:
+        soup = BeautifulSoup(raw, "lxml")
+    except Exception:
+        try:
+            soup = BeautifulSoup(raw, "html.parser")
+        except Exception:
+            return ""
+
+    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header"]):
+        tag.decompose()
+
+    # Prefer the description meta tag — it is usually a clean summary.
+    desc = ""
+    for meta in soup.find_all("meta"):
+        name = (meta.get("name") or meta.get("property") or "").lower()
+        if name in ("description", "og:description"):
+            desc = (meta.get("content") or "").strip()
+            if desc:
+                break
+
+    text = re.sub(r"[ \t]+", " ", soup.get_text("\n"))
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+
+    if desc and desc not in text:
+        text = f"{desc}\n\n{text}"
+
+    return text[:max_chars].strip()
+
+
+# ── Truncation repair ──────────────────────────────────────────────────────
+
+def _ends_mid_sentence(text):
+    """True when the body stops without closing its final sentence."""
+    if not text:
+        return True
+    stripped = text.rstrip()
+    if not stripped:
+        return True
+    # Ignore trailing markdown emphasis markers and quotes when checking.
+    tail = stripped.rstrip('*"\'”’)]')
+    return tail[-1:] not in ".!?\"'”’)]"
+
+
+# A sentence terminator followed by whitespace and a capital — but not the
+# period in an abbreviation like "U.S." (single capital letter before it).
+_SENTENCE_END = re.compile(r"(?<![A-Z])[.!?][\"'”’)]*\s+(?=[A-Z“\"(\-])")
+
+
+def repair_truncation(text):
+    """Drop an incomplete trailing sentence; return None if nothing is left.
+
+    A model that hits its token ceiling stops mid-word. Rather than publish
+    a sentence fragment, cut back to the last complete sentence.
+
+    Walks backwards from the end of the body, dropping:
+      * the truncated trailing line (trimmed in-line to its last complete
+        sentence where possible),
+      * any heading left dangling with no body beneath it.
+
+    Returns None when no safe cut exists.
+    """
+    if not text:
+        return None
+    if not _ends_mid_sentence(text):
+        return text.strip()
+
+    lines = text.rstrip().split("\n")
+    i = len(lines) - 1
+
+    while i >= 0:
+        candidate_lines = list(lines[: i + 1])
+
+        # The final line is the fragment. If it contains a complete earlier
+        # sentence, cut back to it rather than throwing the paragraph away.
+        if i == len(lines) - 1:
+            trimmed = _trim_to_last_sentence(candidate_lines[-1])
+            if trimmed:
+                candidate_lines[-1] = trimmed
+            else:
+                candidate_lines.pop()
+                i -= 1
+                continue
+
+        candidate = "\n".join(candidate_lines).rstrip()
+        if not candidate:
+            i -= 1
+            continue
+
+        # A heading with no paragraph under it is a dangling fragment too.
+        last_content = [l for l in candidate_lines if l.strip()]
+        if last_content and last_content[-1].strip().startswith("#"):
+            i -= 1
+            continue
+
+        if _ends_mid_sentence(candidate):
+            i -= 1
+            continue
+
+        words = len(re.findall(r"\b[\w'’-]+\b", candidate))
+        if words < 200:
+            return None
+        return candidate + "\n"
+
+    return None
+
+
+def _trim_to_last_sentence(line):
+    """Cut a line back to its last complete sentence, or '' if none."""
+    if not line or not _ends_mid_sentence(line):
+        return ""
+    matches = list(_SENTENCE_END.finditer(line))
+    if not matches:
+        return ""
+    cut = matches[-1].end()
+    trimmed = line[:cut].rstrip()
+    if not trimmed or _ends_mid_sentence(trimmed):
+        return ""
+    return trimmed
+
+
 # ── Generate blog post ─────────────────────────────────────────────────────
 
 AI_TAGS_BY_REGION = {
@@ -117,7 +267,7 @@ REGION_DESCRIPTIONS = {
 }
 
 PROMPTS = {
-    "uk": """Write a concise, engaging blog post analysing one significant AI development from the UK today.
+    "uk": """Write a concise, engaging blog post analysing one significant AI development through a UK lens.
 
 Title format: "UK AI Weekly: [compelling headline]"
 Date: {date}
@@ -131,9 +281,14 @@ Requirements:
 - Include a "What this means" section
 - End with a one-sentence takeaway
 - Do NOT use bullet points
-- Do NOT be generic — this is a specific story, not a summary""",
+- Do NOT be generic — this is a specific story, not a summary
 
-    "eu": """Write a concise, engaging blog post analysing one significant AI development from the EU today.
+GROUND RULES (these matter more than the word count):
+- The story below may NOT be British. If it is not, write about how it lands in the UK — who here is building on it, what UK regulators would make of it, what it means for UK readers. Do NOT claim it originated in the UK.
+- Never invent company names, people, products, or national origins. Use only organisations and facts present in the source material.
+- If the source material is thin, say plainly what is known and what is not. Honest gaps read better than confident invention.""",
+
+    "eu": """Write a concise, engaging blog post analysing one significant AI development through an EU lens.
 
 Title format: "EU AI Watch: [compelling headline]"
 Date: {date}
@@ -147,9 +302,14 @@ Requirements:
 - Start with a hook: what happened, why it matters
 - Include a "What this means" section
 - End with a one-sentence takeaway
-- Do NOT use bullet points""",
+- Do NOT use bullet points
 
-    "us": """Write a concise, engaging blog post analysing one significant AI development from the US today.
+GROUND RULES (these matter more than the word count):
+- The story below may NOT be European. If it is not, write about how it lands in Europe — how the AI Act, GDPR, or Brussels would treat it, and what European companies should take from it. Do NOT claim it originated in the EU.
+- Never invent company names, people, products, or national origins. Use only organisations and facts present in the source material.
+- If the source material is thin, say plainly what is known and what is not. Honest gaps read better than confident invention.""",
+
+    "us": """Write a concise, engaging blog post analysing one significant AI development through a US lens.
 
 Title format: "US AI Pulse: [compelling headline]"
 Date: {date}
@@ -163,7 +323,12 @@ Requirements:
 - Start with a hook: what happened, why it matters
 - Include a "What this means" section
 - End with a one-sentence takeaway
-- Do NOT use bullet points""",
+- Do NOT use bullet points
+
+GROUND RULES (these matter more than the word count):
+- The story below may NOT be American. If it is not, write about how it lands in the US — Silicon Valley's likely response, US policy, what American builders should take from it. Do NOT claim it originated in the US.
+- Never invent company names, people, products, or national origins. Use only organisations and facts present in the source material.
+- If the source material is thin, say plainly what is known and what is not. Honest gaps read better than confident invention.""",
 }
 
 
@@ -172,6 +337,14 @@ def generate_post(region, story, llm_api_key=None):
     prompt = PROMPTS[region].format(date=POST_DATE)
     story_context = f"\nStory to analyse:\nTitle: {story['title']}\nSource: {story['url']}\nScore: {story['score']} points on HN\n"
     prompt += story_context
+
+    # Feed the model the actual source page so it can ground the analysis in
+    # real facts. Without this the model invents company names and national
+    # origins to satisfy the regional framing (it invented "SpeechSphere" and
+    # claimed a US project "emerged from the UK").
+    excerpt = fetch_source_excerpt(story["url"])
+    if excerpt:
+        prompt += f"\nSource page text (use ONLY these facts):\n{excerpt}\n"
     print(f"[{region}] Generating post about: {story['title'][:60]}")
 
     key = _load_minimax_key()
@@ -179,22 +352,22 @@ def generate_post(region, story, llm_api_key=None):
         print(f"[{region}] No MiniMax key — using structured fallback")
         return None
 
-    messages = [{"role": "user", "content": prompt}]
-    body = json.dumps({
-        "model": "MiniMax-Text-01",
-        "max_tokens": 600,
-        "temperature": 0.7,
-        "messages": messages,
-    }).encode()
     try:
-
-        result = minimax_generate(prompt, api_key=key, max_tokens=600)  # uses helper with 180s timeout + retries
+        # max_tokens=600 was the truncation bug: 600 tokens is roughly 450
+        # words, so a post asked for 400-600 words was cut off mid-sentence.
+        # 260 of 275 published regional posts ended on a fragment. 1400 tokens
+        # leaves headroom for a full 600-word body plus the title.
+        result = minimax_generate(prompt, api_key=key, max_tokens=1400)
 
         if result:
-
-            print(f"[{region}] ✅ MiniMax")
-
-            return result
+            # A hard cut still ends mid-sentence. Repair it by dropping the
+            # incomplete trailing fragment, then verify the body actually
+            # closes. Anything still broken falls back to the template.
+            repaired = repair_truncation(result)
+            if repaired:
+                print(f"[{region}] ✅ MiniMax")
+                return repaired
+            print(f"[{region}] ⚠️  Generated text was truncated — using template fallback")
 
     except Exception as e:
 
@@ -219,6 +392,18 @@ def _clean_title(raw):
     t = t.strip()
     t = t.strip('"').strip("'").strip()
     t = re.sub(r"\s+", " ", t)
+    t = t.strip()
+
+    # The model sometimes opens a quote and never closes it, e.g.
+    # 'US AI Pulse: "Dessa: The AI That Talks Like Us'. The unbalanced quote
+    # then leaks into the YAML double-quoted scalar and breaks frontmatter.
+    # Drop a dangling quote that has no partner in the string.
+    if t.count('"') % 2 == 1:
+        t = t.replace('"', "", 1)
+    if t.count("'") % 2 == 1:
+        # Only strip a stray apostrophe when it is not a possessive/quote
+        # inside a word (e.g. "Dessa's" must survive).
+        t = re.sub(r"(?<![A-Za-z])'(?![A-Za-z])", "", t, count=1)
     return t.strip()
 
 

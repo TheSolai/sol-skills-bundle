@@ -101,12 +101,15 @@ def devto_update(article_id, title, body, tags, description, api_key, canonical_
                 return True, out[3:]
             # 429 = rate limited; dev.to also answers 404 for some
             # rate-limited requests, so treat both as retryable.
-            if re.search(r'"code":\s*(429|404)', out):
+            if re.search(r'"code":\s*429', out):
                 if attempt < max_retries:
                     wait = 20 * attempt
                     print(f"     ⏳ rate limited (attempt {attempt}), waiting {wait}s…")
                     time.sleep(wait)
                     continue
+            # A bare 404 on PUT means the article is outside dev.to's edit
+            # window (roughly the last 30 days) — it cannot be repaired
+            # through the API. Do not retry.
             return False, out
         return False, last
     except subprocess.TimeoutExpired:

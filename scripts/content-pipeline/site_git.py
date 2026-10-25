@@ -32,12 +32,14 @@ Usage:
 import fcntl
 import os
 import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 LOCK_FILE = Path("/tmp/sol-site-publish.lock")
+OG_GENERATOR = Path("_scripts/generate_og_images.py")
 
 
 class PublishError(RuntimeError):
@@ -96,6 +98,36 @@ def ensure_main(cwd=SITE_DIR):
             raise PublishError(f"git pull failed: {r.stderr.strip()[:300]}")
 
 
+def generate_og_images(cwd=SITE_DIR, timeout=900):
+    """Regenerate Open Graph images before content is committed.
+
+    Every post's layout points og:image at og/<source-filename>.png. If a post
+    ships without that file, its social card 404s — which is exactly what
+    happened to 100% of the posts before the layout and the generator were
+    made to agree on the filename.
+
+    The generator is incremental (a manifest of source hashes lives in
+    og/.manifest.json), so a normal publish only rasterises the new or edited
+    posts. It raises if the rendering tools are missing rather than silently
+    publishing a post with a broken image.
+    """
+    script = cwd / OG_GENERATOR
+    if not script.exists():
+        return None
+
+    r = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip()
+        raise PublishError(f"OG image generation failed: {detail[:400]}")
+    return (r.stdout or "").strip()
+
+
 def publish(message, paths=None, cwd=SITE_DIR, allow_empty=False):
     """
     Commit content and publish it to origin/main.
@@ -106,6 +138,10 @@ def publish(message, paths=None, cwd=SITE_DIR, allow_empty=False):
     """
     with publish_lock():
         ensure_main(cwd)
+
+        # Must happen before staging so the new images are committed with the
+        # post that needs them.
+        generate_og_images(cwd=cwd)
 
         if paths is None:
             add = _git(["add", "-A"], cwd=cwd)

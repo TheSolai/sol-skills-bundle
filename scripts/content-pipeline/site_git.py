@@ -108,38 +108,42 @@ def _worktree_dirty(cwd):
 def ensure_main(cwd=SITE_DIR):
     """Put the working tree on `main` and sync it with origin/main.
 
-    Only pulls when the worktree is clean. A dirty worktree means a pipeline
-    has already written content that has not been committed yet, and pulling
-    over it is not safe:
+    Only fast-forwards when the worktree is clean and local main is a strict
+    ancestor of origin/main. Two failure modes are deliberately avoided here:
 
-      * `git pull --rebase --autostash` stashes the pending content, rebases,
-        and re-applies the stash. When the stash application conflicts, git
-        writes CONFLICT MARKERS into the file and still exits 0. The next
-        `git add -A` then commits those markers into the repository — which
-        is exactly how the OG manifest got corrupted with
-        `<<<<<<< Updated upstream` markers and shipped to origin/main.
+      * Pulling over a dirty worktree. `git pull --rebase --autostash`
+        stashes the pending content, rebases, and re-applies the stash. When
+        the stash application conflicts, git writes CONFLICT MARKERS into the
+        file and still exits 0. The next `git add -A` then commits those
+        markers into the repository — which is exactly how the OG manifest
+        got corrupted with `<<<<<<< Updated upstream` markers and shipped to
+        origin/main.
 
-    So: when the tree is dirty we leave it alone and let the publish loop
-    reconcile with origin/main after the content is committed. That path
-    rebases a clean tree and, if it conflicts, rebuilds the derived
-    artefacts from scratch instead of merging them.
+      * Rebasing here. A rebase of a diverged branch can conflict, and this
+        function has no way to resolve one. The publish loop owns the
+        reconciliation: it rebases a clean tree and, on conflict, resolves
+        the shared derived artefact in place.
     """
     r = _git(["checkout", "main"], cwd=cwd)
     if r.returncode != 0:
         raise PublishError(f"git checkout main failed: {r.stderr.strip()[:300]}")
 
     if _worktree_dirty(cwd):
-        # Pending content — do not pull over it.
+        # Pending content — do not touch the tree.
         return
 
-    r = _git(["pull", "--ff-only", "origin", "main"], cwd=cwd)
-    if r.returncode != 0:
-        # Local main diverged — rebase our commits on top of origin/main.
-        # The worktree is clean here, so --autostash has nothing to stash and
-        # cannot leave conflict markers behind.
-        r = _git(["pull", "--rebase", "--autostash", "origin", "main"], cwd=cwd)
-        if r.returncode != 0:
-            raise PublishError(f"git pull failed: {r.stderr.strip()[:300]}")
+    _git(["fetch", "origin", "main"], cwd=cwd)
+
+    # Fast-forward only when HEAD is a strict ancestor of origin/main.
+    behind = _git(["merge-base", "--is-ancestor", "HEAD", "origin/main"], cwd=cwd)
+    if behind.returncode != 0:
+        # Either we are ahead, or the branch has diverged. Both are handled
+        # by the publish loop's rebase step.
+        return
+
+    ff = _git(["merge", "--ff-only", "origin/main"], cwd=cwd)
+    if ff.returncode != 0:
+        raise PublishError(f"git merge --ff-only failed: {ff.stderr.strip()[:300]}")
 
 
 def generate_og_images(cwd=SITE_DIR, timeout=900):
@@ -177,9 +181,18 @@ def _og_png_for(cwd, post_path):
 
     The layout derives og:image from the post's source filename stem, so a
     post committed without its PNG ships with a 404 social card.
+
+    Only files under `_posts/` have that contract — a Markdown file elsewhere
+    in the repo is not a post and must not be blocked by this check.
     """
     p = Path(post_path)
     if p.suffix.lower() != ".md":
+        return None
+    try:
+        rel = p.relative_to(Path(cwd))
+    except ValueError:
+        return None
+    if rel.parts[0] != "_posts":
         return None
     return Path(cwd) / OG_DIR / (p.stem + ".png")
 
@@ -326,47 +339,80 @@ def _assert_no_conflict_markers(cwd):
 
 
 def _commit(cwd, message, allow_empty):
-    """Create the commit. Returns True if a commit was created."""
+    """Create the commit. Returns True if a commit was created.
+
+    "Nothing to commit" is not an error: it means the content is already in
+    the tree, so it is already published. Callers (bloopers-refresh, the
+    analysis pipeline) already treat a None return as "nothing new to
+    commit", so raising here only produced false "Git push failed" lines.
+    """
     _assert_no_conflict_markers(cwd)
     commit = _git(["commit", "-m", message], cwd=cwd)
     if commit.returncode == 0:
         return True
     combined = (commit.stdout + commit.stderr).lower()
     if "nothing to commit" in combined:
-        # Nothing new to commit is NOT the same as "nothing to push".
-        # A previous run may have committed successfully and then died during
-        # the push — the commit is sitting on local main, the worktree is
-        # clean, and returning here would strand it forever. Fall through to
-        # the push instead.
-        if not allow_empty:
-            raise PublishError("git commit: nothing to commit")
         return False
     raise PublishError(f"git commit failed: {commit.stderr.strip()[:300]}")
 
 
 def _recover_from_conflict(cwd, saved, content_paths, stage_all=False):
-    """Rebuild our content on top of a racing publisher's origin/main.
+    """Resolve a rebase conflict caused by a shared derived artefact.
 
-    `git pull --rebase` conflicts when two publishers regenerate the OG
-    manifest in the same window. The manifest is a pure function of the set of
-    posts on disk, and every pipeline that adds a post rewrites the whole
-    file — so two publishers in the same window always collide on it.
+    The OG manifest is a pure function of the set of posts on disk. Two
+    publishers adding posts in the same window both rewrite the whole file,
+    so the merge always conflicts there.
 
-    Rather than merge two manifests, we drop the conflicted state, reset onto
-    the new origin/main, restore our content files, and regenerate the OG
-    artefacts from the merged post set. The result is the correct union
-    without anyone having to hand-resolve a JSON diff.
+    The old recovery reset the branch onto origin/main. That is destructive:
+    this clone often holds unpushed commits from another publisher (a
+    weekly roundup mid-flight, say), and resetting silently threw them away.
+    So instead we resolve in place:
+
+      * take the upstream version of the derived artefact,
+      * continue the rebase,
+      * let generate_og_images() rebuild the artefact from the merged post
+        set, which yields the correct union of both publishers' work.
+
+    A conflict in a *content* file is a different thing entirely — two
+    people edited the same post. That is left for a human rather than
+    silently resolved.
     """
     _git(["rebase", "--abort"], cwd=cwd)
-    _git(["reset", "--hard", "origin/main"], cwd=cwd)
-    _restore(saved)
+    _git(["fetch", "origin", "main"], cwd=cwd)
+
+    for _ in range(5):
+        r = _git(["rebase", "origin/main"], cwd=cwd, timeout=120)
+        if r.returncode == 0:
+            break
+
+        conflicts = _git(["diff", "--name-only", "--diff-filter=U"], cwd=cwd)
+        names = [l.strip() for l in conflicts.stdout.splitlines() if l.strip()]
+        if not names:
+            _git(["rebase", "--abort"], cwd=cwd)
+            raise PublishError(f"git rebase failed: {r.stderr.strip()[:300]}")
+
+        for name in names:
+            if not name.startswith(OG_DIR + "/"):
+                _git(["rebase", "--abort"], cwd=cwd)
+                raise PublishError(
+                    f"content conflict in {name} — needs manual resolution"
+                )
+            # 'ours' during a rebase is the upstream side.
+            _git(["checkout", "--ours", name], cwd=cwd)
+            _git(["add", name], cwd=cwd)
+
+        cont = _git(["-c", "core.editor=true", "rebase", "--continue"], cwd=cwd, timeout=120)
+        if cont.returncode != 0:
+            _git(["rebase", "--abort"], cwd=cwd)
+            raise PublishError(
+                f"git rebase --continue failed: {cont.stderr.strip()[:300]}"
+            )
+    else:
+        raise PublishError("git rebase did not converge after 5 attempts")
+
+    # Rebuild the derived artefacts from the merged post set.
     generate_og_images(cwd=cwd)
-    _stage(
-        cwd,
-        content_paths,
-        _derived_paths(cwd, content_paths),
-        stage_all=stage_all,
-    )
+    _stage(cwd, content_paths, _derived_paths(cwd, content_paths), stage_all)
 
 
 def _push(cwd):
@@ -448,6 +494,26 @@ def publish(message, paths=None, cwd=SITE_DIR, allow_empty=False):
                 _stage(cwd, content, derived, stage_all)
                 created_commit = _commit(cwd, message, allow_empty)
 
+                if created_commit:
+                    # Check BEFORE pushing: a post without its social card
+                    # should never go live in the first place.
+                    _verify_og_images(cwd, content)
+
+                # Reconcile with origin/main BEFORE pushing. A diverged
+                # branch would otherwise fail the push — and every failed
+                # push still pays for the full pre-push credential scan.
+                _git(["fetch", "origin", "main"], cwd=cwd)
+                if not _worktree_dirty(cwd):
+                    r = _git(["rebase", "origin/main"], cwd=cwd, timeout=120)
+                    if r.returncode != 0:
+                        # Conflict — resolve the shared derived artefact
+                        # in place rather than resetting the branch.
+                        _recover_from_conflict(cwd, saved, content, stage_all)
+                        derived = _derived_paths(cwd, content)
+                        created_commit = _commit(cwd, message, allow_empty)
+                        if created_commit:
+                            _verify_og_images(cwd, content)
+
                 # Remember where the remote was before we pushed, so we can
                 # tell "published something" apart from "was already up to date".
                 remote_before = _git(["rev-parse", "origin/main"], cwd=cwd)
@@ -457,21 +523,6 @@ def publish(message, paths=None, cwd=SITE_DIR, allow_empty=False):
                 ok, last_error = _push(cwd)
                 if ok:
                     break
-
-                # Another publisher beat us to origin/main. Bring their work
-                # in and try again.
-                if attempt == 2:
-                    break
-
-                _git(["fetch", "origin", "main"], cwd=cwd)
-                # The tree is clean (we just committed), so rebase directly.
-                # No --autostash: it can re-apply a stash with conflict
-                # markers and still exit 0.
-                r = _git(["rebase", "origin/main"], cwd=cwd, timeout=120)
-                if r.returncode != 0:
-                    # Rebase conflict — rebuild instead of merging.
-                    _recover_from_conflict(cwd, saved, content, stage_all)
-                    derived = _derived_paths(cwd, content)
 
             if not ok:
                 raise PublishError(
@@ -492,7 +543,6 @@ def publish(message, paths=None, cwd=SITE_DIR, allow_empty=False):
                 # commit: there was genuinely nothing to publish.
                 if not created_commit and remote_sha_before == head.stdout.strip():
                     return None
-                _verify_og_images(cwd, content)
                 return head.stdout.strip()
             return None
         finally:

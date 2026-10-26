@@ -40,6 +40,13 @@ DATE_STR = TODAY.strftime("%Y-%m-%d")
 POST_DATE = TODAY.strftime("%B %d, %Y")
 WEEK_STR = TODAY.strftime("%B %Y")
 
+# Title carries the week-ending date, not just the month.
+# WHY (2026-10-26): "The Week in AI: October 2026" was used for every roundup
+# in a month — a month has 4-5 Mondays, so 12 posts shared one title and one
+# description. That is duplicate content on the site. Dating the title keeps
+# each roundup distinct while keeping the series name intact.
+ROUNDUP_TITLE = f"The Week in AI: {POST_DATE}"
+
 
 def fetch_story(story_id, cutoff):
     """Fetch a single HN story if it's within the cutoff and has a title."""
@@ -429,7 +436,7 @@ def build_roundup(stories):
     # Build markdown
     total_hn_points = sum(s["score"] for s in top_stories)
 
-    lines = [f"""# The Week in AI: {WEEK_STR}
+    lines = [f"""# {ROUNDUP_TITLE}
 
 *Weekly roundup from Sol AI — curated AI news, assessed and contextualised.*
 
@@ -509,7 +516,7 @@ def main():
     ai_stories = [s for s in stories if is_ai_story(s["title"])]
     print(f"[news] Found {len(ai_stories)} AI stories from the past week")
 
-    title = f"The Week in AI: {WEEK_STR}"
+    title = ROUNDUP_TITLE
 
     slug = f"{DATE_STR}-week-in-ai-{TODAY.strftime('%b-%Y').lower()}"
     filename = f"{slug}.md"
@@ -531,7 +538,7 @@ def main():
 layout: post
 title: "{title}"
 date: {DATE_STR}
-description: "This week's most important AI news — curated, assessed, and contextualised. Policy, products, and research from {WEEK_STR}."
+description: "This week's most important AI news — curated, assessed, and contextualised. Policy, products, and research for the week ending {POST_DATE}."
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 tags: [ai, roundup, weekly, news, analysis]

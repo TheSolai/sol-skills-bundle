@@ -37,7 +37,7 @@ DEVTO_API_KEY = os.getenv("DEVTO_API_KEY", "")
 
 TODAY = datetime.datetime.now(datetime.timezone.utc)
 DATE_STR = TODAY.strftime("%Y-%m-%d")
-POST_DATE = TODAY.strftime("%B %d, %Y")
+POST_DATE = f"{TODAY.strftime('%B')} {TODAY.day}, {TODAY.year}"
 WEEK_STR = TODAY.strftime("%B %Y")
 
 # Title carries the week-ending date, not just the month.

@@ -1,238 +1,358 @@
 #!/usr/bin/env python3
 """
-skills-update.py — Refresh the skills showcase on the Sol AI homepage
+skills-update.py — Weekly rotation of the site's featured skills.
 
-Rotates which 6 skills are featured in the homepage hero section.
-Keeps the showcase fresh without changing the actual skill marketplace.
-Reads skills from schemas.json and randomly selects 6.
+WHAT CHANGED AND WHY (2026-10-26)
+----------------------------------
+The old version of this script spliced six hardcoded HTML cards into the
+homepage with a regex, then stopped there:
+
+    pattern = r'(<div class="skills-grid">)...'
+
+Two things broke that:
+
+1. The 2026-09-29 landing page rework ("Demote 6 generic skill cards to a
+   single 'Browse the marketplace' CTA") removed the `skills-grid` markup
+   from index.html. The CSS survived; the markup did not. Every run after
+   that failed with "Could not find skills grid in homepage" and changed
+   nothing on the site.
+
+2. The script never committed or pushed anything. The homepage edits it
+   made were only ever published by accident, when some other cron job
+   happened to commit the same working tree. When the markup disappeared,
+   the rotation stopped entirely — with a cheerful "✅" nowhere in sight.
+
+The homepage HTML is now a TEMPLATE, so it is the wrong place to store
+rotating content. This version follows the documented design instead:
+
+    schemas.json  ->  pick 6 (date-seeded)  ->  _data/featured-skills.json
+                                                        |
+                                                        v
+                                             Liquid reads it at build time
+
+and then commits and pushes the data file to origin/main through
+site_git.publish(), the same locked, verified helper every other content
+pipeline uses. A template redesign can no longer break the rotation, and
+the rotation can no longer fail to publish.
 
 Usage:
-    python3 skills-update.py [--dry-run]
+    python3 skills-update.py [--dry-run] [--count N]
 
-Crontab (weekly, Monday 8am UK):
-    0 8 * * 1 cd /Users/amre/Projects/sol-skills-bundle && python3 scripts/content-pipeline/skills-update.py >> logs/skills-update.log 2>&1
+Schedule:
+    Mondays 08:00 — launchd ai.sol.skills-update
 """
 
-import sys
-import os
+import datetime
 import json
+import os
 import random
 import re
-import datetime
+import sys
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
-BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle")
-SKILL_EMOJIS = {
-    "email": "📧", "security": "🛡️", "audit": "🔍", "tarot": "🔮",
-    "log": "🪵", "commit": "🏷️", "seo": "📊", "memory": "🧠",
-    "writing": "✍️", "blog": "📝", "code": "💻", "api": "🔌",
-    "pdf": "📄", "image": "🖼️", "video": "🎬", "music": "🎵",
-    "default": "⚡",
-}
 
-SKILL_DESCRIPTIONS = {
-    "email": "Automated email that works while you sleep. Real inbox, real replies.",
-    "security": "Scan any codebase for security issues before they become incidents.",
-    "audit": "Audit any URL for title, OG tags, canonical URLs, and JSON-LD.",
-    "tarot": "22-card Major Arcana generated locally via Ollama. 100% private.",
-    "log": "Parse any log file — errors, stack traces, HTTP codes. Instant clarity.",
-    "commit": "Auto-generate Conventional Commits from your staged diffs.",
-    "memory": "Persistent memory for AI agents. Remembers context between sessions.",
-    "writing": "Long-form writing with structure, tone control, and citations.",
-    "blog": "Generate complete blog posts with metadata, tags, and SEO fields.",
-    "code": "Review code, find bugs, explain complex functions, write tests.",
-    "default": "A production-grade AI agent tool. MIT licensed. One-command install.",
-}
+# The marketplace manifest. Holds the pool of skills eligible for rotation.
+SCHEMAS_FILE = SITE_DIR / "skills" / "schemas.json"
 
-SKILLS_FILE = SITE_DIR / "skills" / "schemas.json"
-HOMEPAGE_FILE = SITE_DIR / "index.html"
+# Richer per-skill metadata (emoji, description, install command, source).
+# schemas.json only carries a name and a URL, so this is what stops the
+# cards reading like the generic filler the redesign demoted.
+CATALOG_FILE = SITE_DIR / "_data" / "skills.json"
+
+# The Jekyll data file the templates read.
+FEATURED_FILE = SITE_DIR / "_data" / "featured-skills.json"
+
+DEFAULT_COUNT = 6
+SUMMARY_MAX_WORDS = 18
+
+# Used only when a skill has no emoji in the catalogue.
+FALLBACK_EMOJI = "⚡"
 
 
-def load_skills():
-    """Load skills from schemas.json.
+def log(msg):
+    print(msg, flush=True)
 
-    Handles two formats:
-    1. Plain JSON array (direct list of skill objects)
-    2. HTML file with embedded JSON-LD <script> tag containing ItemList element
+
+# --------------------------------------------------------------------------
+# Loading
+# --------------------------------------------------------------------------
+
+def load_schema_skills():
+    """Load the skill pool from schemas.json.
+
+    schemas.json is an HTML file carrying a JSON-LD block, not a plain JSON
+    document, so it needs two attempts: a direct parse first, then a
+    brace-counted scan of any <script type="application/ld+json"> blocks.
+
+    Returns a list of {"name", "url"} dicts.
     """
-    if not SKILLS_FILE.exists():
-        print(f"  ⚠️  Skills file not found: {SKILLS_FILE}")
+    if not SCHEMAS_FILE.exists():
+        log(f"  ⚠️  schemas file not found: {SCHEMAS_FILE}")
         return []
 
-    with open(SKILLS_FILE, encoding="utf-8") as f:
-        raw = f.read()
+    raw = SCHEMAS_FILE.read_text(encoding="utf-8")
 
-    # Try direct JSON parse first (plain JSON array)
     try:
         data = json.loads(raw)
         if isinstance(data, list):
-            return data
-        elif isinstance(data, dict):
-            return data.get("skills", data.get("skills_list", []))
+            return _normalise(data)
+        if isinstance(data, dict):
+            return _normalise(data.get("skills", data.get("skills_list", [])))
     except json.JSONDecodeError:
         pass
 
-    # Fall back: extract JSON-LD from HTML file
-    # Note: use brace-counting instead of non-greedy regex (.*?) because
-    # the JSON contains nested braces — non-greedy stops at the first }
-    script_tag_pattern = re.compile(
+    script_tag = re.compile(
         r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>\s*(.*?)\s*</script>',
-        re.DOTALL | re.IGNORECASE
+        re.DOTALL | re.IGNORECASE,
     )
 
-    all_ld = []
-    for match in script_tag_pattern.finditer(raw):
-        raw_json = match.group(1).strip()
-        if not raw_json:
+    skills = []
+    for match in script_tag.finditer(raw):
+        block = match.group(1).strip()
+        if not block:
             continue
-        try:
-            ld = json.loads(raw_json)
-            all_ld.append(ld)
-        except json.JSONDecodeError:
-            # Try brace-counting parse for nested JSON
-            if raw_json.startswith('{'):
-                depth = 0
-                end = 0
-                for i, ch in enumerate(raw_json):
-                    if ch == '{':
-                        depth += 1
-                    elif ch == '}':
-                        depth -= 1
-                        if depth == 0:
-                            end = i + 1
-                            break
-                if end > 0:
-                    try:
-                        ld = json.loads(raw_json[:end])
-                        all_ld.append(ld)
-                    except json.JSONDecodeError:
-                        pass
+        for ld in _parse_ld_json(block):
+            for item_list in _find_item_lists(ld):
+                for entry in item_list.get("itemListElement", []):
+                    name = entry.get("name", "")
+                    if name:
+                        skills.append({"name": name, "url": entry.get("url", "")})
 
-    if not all_ld:
-        print(f"  ⚠️  No JSON-LD found in {SKILLS_FILE}")
+    if not skills:
+        log(f"  ⚠️  No skills found in {SCHEMAS_FILE}")
+    return skills
+
+
+def _normalise(items):
+    """Coerce a plain JSON skill list into {"name", "url"} dicts."""
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("title") or ""
+        if name:
+            out.append({"name": name, "url": item.get("url") or item.get("source") or ""})
+    return out
+
+
+def _parse_ld_json(block):
+    """Parse a JSON-LD block, falling back to brace counting for nested JSON."""
+    try:
+        return [json.loads(block)]
+    except json.JSONDecodeError:
+        pass
+
+    if not block.startswith("{"):
+        return []
+
+    depth = 0
+    end = 0
+    for i, ch in enumerate(block):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if not end:
         return []
 
     try:
-        # Walk all JSON-LD objects to find ItemList elements
-        item_lists = []
-        for ld in all_ld:
-            if ld.get("@type") == "ItemList":
-                item_lists.append(ld)
-            # Also check @graph for multiple types
-            for item in ld.get("@graph", []):
-                if item.get("@type") == "ItemList":
-                    item_lists.append(item)
-
-        skills = []
-        for item_list in item_lists:
-            for li in item_list.get("itemListElement", []):
-                name = li.get("name", "")
-                url = li.get("url", "")
-                if name:
-                    skills.append({"name": name, "url": url, "title": name})
-
-        return skills
-    except (json.JSONDecodeError, KeyError) as e:
-        print(f"  ⚠️  Failed to parse JSON-LD: {e}")
+        return [json.loads(block[:end])]
+    except json.JSONDecodeError:
         return []
 
 
-def get_emoji(name):
-    """Get emoji for a skill based on its name."""
-    name_lower = name.lower()
-    for key, emoji in SKILL_EMOJIS.items():
-        if key in name_lower:
-            return emoji
-    return SKILL_EMOJIS["default"]
+def _find_item_lists(node):
+    """Yield every ItemList object in a JSON-LD tree."""
+    if isinstance(node, dict):
+        if node.get("@type") == "ItemList":
+            yield node
+        for value in node.values():
+            yield from _find_item_lists(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _find_item_lists(value)
 
 
-def get_description(name):
-    """Get description for a skill."""
-    name_lower = name.lower()
-    for key, desc in SKILL_DESCRIPTIONS.items():
-        if key in name_lower:
-            return desc
-    return SKILL_DESCRIPTIONS["default"]
+def load_catalog():
+    """Load rich metadata from _data/skills.json, keyed by skill name."""
+    if not CATALOG_FILE.exists():
+        log(f"  ⚠️  catalogue not found: {CATALOG_FILE} — using schema data only")
+        return {}
+
+    try:
+        data = json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        log(f"  ⚠️  could not parse {CATALOG_FILE}: {e} — using schema data only")
+        return {}
+
+    if not isinstance(data, list):
+        return {}
+
+    catalog = {}
+    for skill in data:
+        if isinstance(skill, dict) and skill.get("name"):
+            catalog[skill["name"]] = skill
+    return catalog
 
 
-def build_skill_card(name, desc, emoji):
-    """Build a skill card HTML block."""
-    # URL-encode spaces for the link
-    slug = name.lower().replace(" ", "-")
-    return f'''                        <a href="/skills/" class="skill-card">
-                            <span class="skill-emoji">{emoji}</span>
-                            <div class="skill-info">
-                                <h3>{name}</h3>
-                                <p>{desc}</p>
-                            </div>
-                        </a>'''
+# --------------------------------------------------------------------------
+# Selection
+# --------------------------------------------------------------------------
+
+def pick_skills(skills, count, seed):
+    """Pick `count` skills at random, deterministically for a given seed.
+
+    The seed is the calendar ordinal, so re-running on the same day always
+    yields the same six and never fights the launchd copy of this job.
+    """
+    if not skills:
+        return []
+    rng = random.Random(seed)
+    return rng.sample(skills, min(count, len(skills)))
 
 
-def update_homepage(skills, dry_run=False):
-    """Replace the skills showcase section on the homepage."""
-    with open(HOMEPAGE_FILE, encoding="utf-8") as f:
-        content = f.read()
+def summarise(text, max_words=SUMMARY_MAX_WORDS):
+    """Shorten a description to a word count, cutting on a word boundary."""
+    if not text:
+        return ""
+    words = text.split()
+    if len(words) <= max_words:
+        return text.strip()
+    return " ".join(words[:max_words]).rstrip(",;:- ") + "…"
 
-    # Pick 6 random skills (use seeded random for reproducibility)
-    random.seed(datetime.date.today().toordinal())
-    selected = random.sample(skills, min(6, len(skills)))
 
-    # Build new skill cards
-    new_cards = [build_skill_card(s.get("name", s.get("title", "Skill")), get_description(s.get("name", "")), get_emoji(s.get("name", ""))) for s in selected]
-    new_cards_html = "\n".join(new_cards)
+def build_records(selected, catalog):
+    """Turn selected skills into the records written to the data file."""
+    records = []
+    for skill in selected:
+        name = skill.get("name", "")
+        meta = catalog.get(name, {})
 
-    # Find and replace the skills grid
-    pattern = r'(<div class="skills-grid">)\s*(.*?)\s*(</div>\s*<a href="/skills/" class="view-all">)'
+        description = (meta.get("description") or "").strip()
+        if not description:
+            description = "A production-grade AI agent tool. MIT licensed. One-command install."
 
-    def replace_cards(m):
-        return f'<div class="skills-grid">\n{new_cards_html}\n                    </div>\n                    <a href="/skills/" class="view-all">'
+        records.append({
+            "name": name,
+            "slug": meta.get("slug") or name.lower().replace(" ", "-"),
+            "emoji": meta.get("emoji") or FALLBACK_EMOJI,
+            "summary": summarise(description),
+            "description": description,
+            "url": meta.get("source") or skill.get("url") or "",
+            "category": meta.get("category") or "",
+            "install": meta.get("install") or "",
+        })
+    return records
 
-    # Check pattern matches first (distinguishes "no match" from "already up to date")
-    if not re.search(pattern, content, flags=re.DOTALL):
-        print("  ⚠️  Could not find skills grid in homepage — check pattern")
+
+# --------------------------------------------------------------------------
+# Writing
+# --------------------------------------------------------------------------
+
+def build_payload(records, today, seed):
+    """Build the exact JSON that goes into _data/featured-skills.json."""
+    return {
+        "generated": today.isoformat(),
+        "seed": seed,
+        "count": len(records),
+        "skills": records,
+    }
+
+
+def write_featured(payload):
+    """Write the data file. Returns True if the file changed."""
+    content = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+    if FEATURED_FILE.exists() and FEATURED_FILE.read_text(encoding="utf-8") == content:
         return False
 
-    new_content = re.sub(pattern, replace_cards, content, flags=re.DOTALL)
-
-    if new_content == content:
-        print(f"  ℹ️  Homepage already shows these 6 skills (seed={datetime.date.today().toordinal()}) — nothing to do")
-        return True
-
-    if not dry_run:
-        with open(HOMEPAGE_FILE, "w", encoding="utf-8") as f:
-            f.write(new_content)
-        print(f"  ✅ Updated homepage skills showcase with {len(selected)} random skills")
-
+    FEATURED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FEATURED_FILE.write_text(content, encoding="utf-8")
     return True
 
 
+# --------------------------------------------------------------------------
+# Publishing
+# --------------------------------------------------------------------------
+
+def publish(payload):
+    """Commit and push the data file to origin/main.
+
+    Uses site_git.publish(), which targets origin/main explicitly (never
+    whatever branch happens to be checked out), serialises against the other
+    content pipelines with a lock file, and verifies the push landed.
+    """
+    from site_git import publish as site_publish
+
+    message = f"Skills rotation: {payload['generated']} — {payload['count']} featured skills"
+    sha = site_publish(message, paths=[str(FEATURED_FILE)], allow_empty=True)
+    return sha
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
 def main():
     dry_run = "--dry-run" in sys.argv
+    count = DEFAULT_COUNT
+    if "--count" in sys.argv:
+        try:
+            count = int(sys.argv[sys.argv.index("--count") + 1])
+        except (IndexError, ValueError):
+            log("  ⚠️  --count needs a number; using default 6")
 
-    print(f"\n[{datetime.datetime.now():%Y-%m-%d %H:%M}] skills-update running")
+    today = datetime.date.today()
+    seed = today.toordinal()
 
-    skills = load_skills()
+    log(f"\n[{datetime.datetime.now():%Y-%m-%d %H:%M}] skills-update running")
+
+    skills = load_schema_skills()
     if not skills:
-        print("  ⚠️  No skills found — check schemas.json")
-        return
+        log("  ❌ No skills to rotate — check schemas.json")
+        return 1
 
-    print(f"  Found {len(skills)} skills in marketplace")
+    catalog = load_catalog()
+    log(f"  Found {len(skills)} skills in marketplace")
+
+    selected = pick_skills(skills, count, seed)
+    payload = build_payload(build_records(selected, catalog), today, seed)
+
+    log(f"  Featured (seed={seed}):")
+    for record in payload["skills"]:
+        log(f"    {record['emoji']} {record['name']}")
 
     if dry_run:
-        random.seed(datetime.date.today().toordinal())
-        sample = random.sample(skills, min(6, len(skills)))
-        print(f"  [DRY RUN] Would feature these 6 skills:")
-        for s in sample:
-            print(f"    {get_emoji(s.get('name',''))} {s.get('name', s.get('title','?'))}")
-        return
+        log(f"  [DRY RUN] Would write {FEATURED_FILE}")
+        return 0
 
-    updated = update_homepage(skills, dry_run=False)
-    if updated:
-        print(f"  ✅ Homepage skills showcase refreshed")
+    changed = write_featured(payload)
+    if not changed:
+        log("  ℹ️  Featured skills unchanged — nothing to publish")
+        return 0
+
+    log(f"  ✅ Wrote {FEATURED_FILE}")
+
+    try:
+        sha = publish(payload)
+    except Exception as e:
+        log(f"  ❌ Publish failed: {e}")
+        return 1
+
+    if sha:
+        log(f"  ✅ Committed and pushed to origin/main ({sha[:12]})")
     else:
-        print(f"  ❌ Failed to update homepage")
+        log("  ℹ️  Nothing to publish (file was already committed)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

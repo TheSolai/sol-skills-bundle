@@ -30,15 +30,34 @@ All publishing goes through `site_git.publish()`. Never run a bare `git push`
 — that is what caused the 2026-10-22 silent outage (see the note in
 `site_git.py`).
 
-**`publish()` must be called with `allow_empty=True`.** Without it, the retry
-loop raises `PublishError: git commit: nothing to commit` when a previous
-attempt already committed but the push was beaten by a racing publisher.
+**`publish()` returns `None` when there was nothing new to publish** — the
+content was already in the tree. That is a success, not a failure, and callers
+must not subscript the result (`sha[:12]` raises `TypeError` on `None` and
+prints a bogus "Git push failed" line for a run that succeeded). Handle `None`
+before printing a SHA.
 
-### Pushes are slow — this is the credential gate, not a hang
+The `allow_empty` argument is retained for compatibility but no longer
+changes behaviour: "nothing to commit" is treated as a benign no-op rather
+than an error, because it means the post is already published.
+
+### When `paths` is given, the OG image ships with the post
+
+`publish(msg, paths=[post])` also stages `og/<post-stem>.png` and
+`og/.manifest.json`. A post committed without its social card ships with a
+404 preview, and `publish()` now refuses to push a post whose OG image is
+missing — it raises before the push rather than after.
+
+### Pushes take a few seconds — this is the credential gate
 
 `.git/hooks/pre-push` runs `secret-scan.py` over the working tree and the
-push range. It inspects ~5,600 files and takes **5+ minutes**. Do not kill a
-push that looks stuck; it will land. Use a background task and wait.
+push range. It used to inspect ~5,600 files one subprocess per blob and take
+**5+ minutes**, long enough that `git push` hit its own timeout *inside* the
+hook and the commit never landed. The scanner now reads every blob through a
+single `git cat-file --batch` process: the worktree scan takes ~8s, a
+200-commit history range ~25s, and the full gate ~12s.
+
+If a push ever does look stuck again, check the gate first — but it should
+not. Use a background task and wait.
 
 If the gate reports `BLOCKED — credential found in the working tree`, run the
 scanner by hand to get the real finding:
@@ -55,16 +74,31 @@ check the file compiles and retry.
 ### Rebase conflicts on OG files
 
 When several jobs publish at once, `git pull --rebase` conflicts on
-`og/.manifest.json` and `og/*.png`. Resolution:
+`og/.manifest.json` and `og/*.png`.
 
-- `og/*.png` → take **upstream** (`git checkout --ours <file>`). Upstream
-  carries the "repaired" image; the local side is usually a duplicate from a
-  job that ran twice.
-- `og/.manifest.json` → take the **union** of both sides. Each side has
-  entries the other lacks, and the hashes never conflict.
+`site_git.publish()` now handles this itself. It rebases **before** pushing
+rather than after a rejected push (each rejected push still pays for the
+credential scan), and on conflict it resolves the shared derived artefact in
+place: take **upstream** (`git checkout --ours <file>` — during a rebase
+`--ours` is origin/main and `--theirs` is the commit being replayed), then
+let `generate_og_images()` rebuild the manifest from the merged post set.
+The manifest is a pure function of the posts on disk, so regenerating it
+always yields the correct union of both publishers' work — no hand-merged
+JSON.
 
-During a rebase, `--ours` is upstream (origin/main) and `--theirs` is the
-commit being replayed.
+Two rules still hold:
+
+- `og/*.png` → take **upstream**. Upstream carries the "repaired" image; the
+  local side is usually a duplicate from a job that ran twice.
+- A conflict in a *content* file is not resolvable this way — two jobs edited
+  the same post. `publish()` raises and leaves it for a human rather than
+  silently picking a side.
+
+Never `git pull --rebase --autostash` over a dirty worktree. When the stash
+re-application conflicts, git writes `<<<<<<< Updated upstream` markers into
+the file and **still exits 0**, so the next `git add -A` commits the markers
+into the repository. `ensure_main()` no longer does this, and `publish()`
+refuses to commit anything carrying conflict markers.
 
 ## Content generation
 

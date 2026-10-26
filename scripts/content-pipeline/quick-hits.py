@@ -257,7 +257,7 @@ def main():
         cwd = SITE_DIR
         from site_git import publish
         sha = publish(f"Quick Hits: {DAY_STR} AI briefing", cwd=cwd)
-        print(f"[quick-hits] Committed and pushed to origin/main ({sha[:12]}).")
+        print(f"[quick-hits] Committed and pushed to origin/main ({sha[:12] if sha else 'nothing new'}).")
     except Exception as e:
         print(f"[quick-hits] Git push failed: {e}")
 

@@ -247,7 +247,7 @@ def main():
         cwd = SITE_DIR
         from site_git import publish
         sha = publish(f"Tool Spotlight: {tool['name']}", cwd=cwd)
-        print(f"[tool-spotlight] Committed and pushed to origin/main ({sha[:12]}).")
+        print(f"[tool-spotlight] Committed and pushed to origin/main ({sha[:12] if sha else 'nothing new'}).")
     except Exception as e:
         print(f"[tool-spotlight] Git push failed: {e}")
 

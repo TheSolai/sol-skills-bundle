@@ -138,7 +138,7 @@ hero_image: /images/sol-avatar.png
     try:
         from site_git import publish
         sha = publish(f"Trending ({slot}): {title_short[:50]}", paths=[str(post_path)])
-        log(f"✓ committed and pushed to origin/main ({sha[:12]})")
+        log(f"✓ committed and pushed to origin/main ({sha[:12] if sha else 'nothing new'})")
     except Exception as e:
         log(f"❌ git publish failed: {e}")
 

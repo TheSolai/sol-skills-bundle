@@ -550,7 +550,7 @@ Recent dev.to articles:
         cwd = SITE_DIR
         from site_git import publish
         sha = publish(f"Weekend Deep Dive: {topic['topic'][:50]}", cwd=cwd, paths=[str(post_path)])
-        print(f"[deep-dive] Committed and pushed to origin/main ({sha[:12]}).")
+        print(f"[deep-dive] Committed and pushed to origin/main ({sha[:12] if sha else 'nothing new'}).")
     except Exception as e:
         print(f"[deep-dive] Git push failed: {e}")
         sys.exit(3)

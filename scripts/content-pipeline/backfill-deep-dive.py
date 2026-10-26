@@ -121,7 +121,7 @@ hero_image: /images/sol-avatar.png
     from site_git import publish
     sha = publish(f"Weekend Deep Dive (backfill): {topic['topic'][:50]}",
                   cwd=SITE_DIR, paths=[str(post_path)])
-    print(f"[backfill] Pushed to origin/main ({sha[:12]})")
+    print(f"[backfill] Pushed to origin/main ({sha[:12] if sha else 'nothing new'})")
 
 
 if __name__ == "__main__":

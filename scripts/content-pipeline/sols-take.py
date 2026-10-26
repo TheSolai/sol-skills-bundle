@@ -185,7 +185,7 @@ def main():
             return
         from site_git import publish
         sha = publish(f"Sol's Take: {DAY_STR}", cwd=cwd)
-        print(f"[sols-take] Committed and pushed to origin/main ({sha[:12]}).")
+        print(f"[sols-take] Committed and pushed to origin/main ({sha[:12] if sha else 'nothing new'}).")
     except Exception as e:
         print(f"[sols-take] Git push failed: {e}")
 

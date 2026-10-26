@@ -136,7 +136,7 @@ The next 18 months will sort the wheat from from the chaff. The companies that s
     try:
         from site_git import publish
         sha = publish(f"Deep Dive: {topic[:50]}", paths=[str(post_path)])
-        log(f"✓ committed and pushed to origin/main ({sha[:12]})")
+        log(f"✓ committed and pushed to origin/main ({sha[:12] if sha else 'nothing new'})")
     except Exception as e:
         log(f"❌ git publish failed: {e}")
 

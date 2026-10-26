@@ -101,7 +101,7 @@ The lesson: don't bet on demos. Bet on boring infrastructure that solves real pr
     try:
         from site_git import publish
         sha = publish(f"Quick Take ({day_name}): {topic[:50]}", paths=[str(post_path)])
-        log(f"✓ committed and pushed to origin/main ({sha[:12]})")
+        log(f"✓ committed and pushed to origin/main ({sha[:12] if sha else 'nothing new'})")
     except Exception as e:
         log(f"❌ git publish failed: {e}")
 

@@ -24,9 +24,10 @@ import argparse
 import time
 import urllib.request
 import urllib.error
+from devto_key import load_devto_key
 
 DEVTO_API = "https://dev.to/api/articles"
-DEFAULT_KEY = os.environ.get("DEVTO_API_KEY", "SmxPhE8pmiScGnW8SprUCF7U")
+DEFAULT_KEY = load_devto_key()
 
 
 def load_post(path):

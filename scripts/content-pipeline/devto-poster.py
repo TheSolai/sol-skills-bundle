@@ -11,6 +11,12 @@ Usage:
 
 Crontab entry (after daily-content runs, ~7:30am UK):
     30 7 * * * cd /Users/amre/Projects/sol-skills-bundle && python3 scripts/content-pipeline/devto-poster.py >> logs/devto-poster.log 2>&1
+
+Note (Aug 2026): The urllib POST was hanging on long-lived Python processes
+in this Mac environment (TCP/TLS handshake stalls on reused sockets). The
+POST is now run in a fresh subprocess with a 45s hard timeout so any hang
+is bounded. This makes the script self-recovering — no external watchdog
+needed. See logs/sol-devto-poster.log for prior incident tracebacks.
 """
 
 import sys
@@ -19,29 +25,140 @@ import json
 import re
 import time
 import datetime
+import subprocess
 import urllib.request
 import urllib.error
 from pathlib import Path
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle")
-LOG_FILE = BUNDLE_DIR / "scripts/content-pipeline/logs/devto-post.log"
-TRACKER_FILE = BUNDLE_DIR / "scripts/content-pipeline/logs/devto-posted.json"
+LOG_FILE = BUNDLE_DIR / "logs/devto-post.log"
+TRACKER_FILE = BUNDLE_DIR / "logs/devto-posted.json"
+LOCK_FILE = BUNDLE_DIR / "logs/.devto-poster.lock"
+LOCK_STALE_AFTER_SEC = 7200  # 2h — bounds damage if a PID gets recycled
 DEVTO_API = "https://dev.to/api/articles"
-DEVTO_API_KEY = os.environ.get("DEVTO_API_KEY", "SmxPhE8pmiScGnW8SprUCF7U")
+# Key resolution order:
+#   1. $DEVTO_API_KEY env var (set by launchd / cron)
+#   2. ~/.openclaw/workspace/secrets/devto-api-key.txt (canonical secret)
+#   3. hardcoded legacy fallback (kept only so the script doesn't crash if
+#      both above are missing — the key here is dead, so a 401 will surface
+#      and the operator gets a clear signal to fix the source).
+from devto_key import load_devto_key
+
+DEVTO_API_KEY = load_devto_key()
+POST_HARD_TIMEOUT = 45  # seconds — cap per POST via subprocess
 
 
 def load_tracker():
     if TRACKER_FILE.exists():
         with open(TRACKER_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
+        # Migrate from old list format to new dict format keyed by slug
+        if isinstance(data, list):
+            tracker = {}
+            for entry in data:
+                local_path = entry.get("local_path", "")
+                slug = Path(local_path).stem if local_path else entry.get("title", str(entry))
+                tracker[slug] = {
+                    "url": entry.get("url"),
+                    "id": entry.get("devto_id"),
+                    "posted_at": entry.get("posted_at"),
+                    "canonical": entry.get("url"),  # dev.to URL is the canonical
+                }
+            return tracker
+        return data
     return {}
 
 
 def save_tracker(tracker):
+    """Write the tracker atomically so an interrupted write can never leave a
+    truncated JSON file behind (the tracker is the dedupe source of truth)."""
     TRACKER_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(TRACKER_FILE, "w") as f:
+    tmp = TRACKER_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
         json.dump(tracker, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, TRACKER_FILE)
+
+
+def _pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def acquire_lock():
+    """Guard against concurrent runs.
+
+    This script is scheduled twice: a user crontab entry (`30 7 * * * ... --max=10`)
+    and an agent cron task that runs the same command. Both fire at 07:30 and
+    both target the same tracker file and the same dev.to account. Without a
+    lock, each run loads its own in-memory copy of the tracker and posts the
+    same articles twice, then rewrites the tracker wholesale — clobbering the
+    other run's entries (lost update) and re-posting on the next run.
+
+    Returns True if the lock was acquired (caller should proceed).
+    Returns False if another live run holds it (caller should exit quietly).
+    """
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, "w") as f:
+                json.dump(
+                    {
+                        "pid": os.getpid(),
+                        "acquired": datetime.datetime.now().isoformat(),
+                    },
+                    f,
+                )
+            return True
+        except FileExistsError:
+            pid = 0
+            acquired = None
+            try:
+                info = json.loads(LOCK_FILE.read_text())
+                pid = int(info.get("pid") or 0)
+                acquired = info.get("acquired")
+            except Exception:
+                pass
+
+            age = None
+            if acquired:
+                try:
+                    acquired_dt = datetime.datetime.fromisoformat(acquired)
+                    age = (datetime.datetime.now() - acquired_dt).total_seconds()
+                except Exception:
+                    age = None
+
+            if _pid_alive(pid) and (age is None or age < LOCK_STALE_AFTER_SEC):
+                print(
+                    f"  🔒 Another dev.to poster is already running (PID {pid}) — "
+                    "exiting without posting to avoid duplicates."
+                )
+                return False
+
+            print(f"  🧹 Clearing stale lock (PID {pid} not running).")
+            try:
+                LOCK_FILE.unlink()
+            except FileNotFoundError:
+                pass
+    print("  🔒 Could not acquire lock — exiting without posting.")
+    return False
+
+
+def release_lock():
+    try:
+        LOCK_FILE.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def load_post(path):
@@ -91,7 +208,7 @@ def load_post(path):
     return meta, body
 
 
-def body_to_devto(body):
+def body_to_devto(body, canonical_base="https://thesolai.github.io"):
     """Clean Jekyll body for dev.to posting."""
     lines = body.splitlines()
     cleaned = []
@@ -103,8 +220,27 @@ def body_to_devto(body):
             continue
         cleaned.append(line)
     text = "\n".join(cleaned).strip()
-    text = re.sub(r'\[.*?\]\(/blog/\)', '', text)
+
+    # Convert relative /blog/ links to absolute Sol site links so readers
+    # can click through to the original post and discover more content
+    text = re.sub(r'\[([^\]]+)\]\(/blog/([^)]+)\)',
+                  rf'[\1]({canonical_base}/blog/\2)', text)
+
+    # Strip bare /blog/ link fragments that have no label
+    text = re.sub(r'\[([^\]]*)\]\(/blog/\)', '', text)
+
     return text
+
+
+def devto_footer(canonical_url):
+    """Append a footer to drive readers back to the Sol site."""
+    return (
+        "\n\n---\n"
+        "🤖 *This post was automatically syndicated from "
+        f"[**The Sol AI Blog**]({canonical_url}) — "
+        "daily AI analysis from a UK/EU/US perspective.*\n"
+        "*[Follow along for more →](https://thesolai.github.io)*"
+    )
 
 
 def jekyll_url(post_path):
@@ -126,13 +262,20 @@ def devto_tags(tags_raw):
         tags = []
     clean = []
     for t in tags:
-        t = re.sub(r"[^a-z0-9\-]", "", t.lower())
+        t = re.sub(r"[^a-z0-9]", "", t.lower())
         if t and len(t) < 25 and t not in clean:
             clean.append(t)
     return clean[:4]
 
 
 def post_to_devto(title, body, tags, description, api_key, canonical_url=""):
+    """POST to dev.to via a fresh subprocess with a hard timeout.
+
+    This avoids the urllib TCP/TLS handshake hang seen on long-lived
+    Python processes on this Mac (no ESTABLISHED TCP, no log progress,
+    urllib's `timeout=30` doesn't fire because the connect never
+    completes). A fresh interpreter per POST sidesteps that.
+    """
     payload = {
         "article": {
             "title": title,
@@ -145,30 +288,93 @@ def post_to_devto(title, body, tags, description, api_key, canonical_url=""):
     if canonical_url:
         payload["article"]["canonical_url"] = canonical_url
 
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        DEVTO_API,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "api-key": api_key,
-            "User-Agent": "SolAI/1.0 (devto-poster.py)",
-        },
-        method="POST",
+    helper = (
+        'import sys, json, urllib.request, urllib.error\n'
+        'payload_path, api_key = sys.argv[1], sys.argv[2]\n'
+        'with open(payload_path) as f: payload = json.load(f)\n'
+        'data = json.dumps(payload).encode("utf-8")\n'
+        'req = urllib.request.Request(\n'
+        '    "https://dev.to/api/articles",\n'
+        '    data=data,\n'
+        '    headers={"Content-Type":"application/json","api-key":api_key,"User-Agent":"SolAI/1.0"},\n'
+        '    method="POST")\n'
+        'try:\n'
+        '    with urllib.request.urlopen(req, timeout=30) as resp:\n'
+        '        result = json.loads(resp.read().decode("utf-8"))\n'
+        '        print("OK|"+json.dumps({"status":resp.status,"id":result.get("id"),"url":result.get("url")}))\n'
+        'except urllib.error.HTTPError as e:\n'
+        '    body = e.read().decode("utf-8")\n'
+        '    try:\n'
+        '        err = json.loads(body)\n'
+        '        err_msg = err.get("error","").lower()\n'
+        '        if e.code == 422 and "canonical" in err_msg:\n'
+        '            # Article already exists under this canonical. Look up the\n'
+        '            # existing URL via the user-articles listing so the caller\n'
+        '            # can record it. No retry — retrying without canonical would\n'
+        '            # create a duplicate article.\n'
+        '            canonical = payload.get("article", {}).get("canonical_url", "")\n'
+        '            existing_url = ""\n'
+        '            existing_id = None\n'
+        '            try:\n'
+        '                list_req = urllib.request.Request(\n'
+        '                    "https://dev.to/api/articles/me/published?per_page=100",\n'
+        '                    headers={"api-key": api_key, "User-Agent": "SolAI/1.0"})\n'
+        '                with urllib.request.urlopen(list_req, timeout=15) as lr:\n'
+        '                    for art in json.loads(lr.read().decode("utf-8")):\n'
+        '                        if art.get("canonical_url") == canonical:\n'
+        '                            existing_url = art.get("url", "")\n'
+        '                            existing_id = art.get("id")\n'
+        '                            break\n'
+        '            except Exception: pass\n'
+        '            print("EXISTS|"+json.dumps({"code":e.code,"canonical":canonical,"url":existing_url,"id":existing_id}))\n'
+        '            sys.exit(0)\n'
+        '        if e.code == 429:\n'
+        '            print("RATE_LIMITED|"+json.dumps({"code":e.code,"body":body[:500]}))\n'
+        '            sys.exit(0)\n'
+        '    except Exception: pass\n'
+        '    print("HTTP_ERROR|"+json.dumps({"code":e.code,"body":body[:500]}))\n'
+        'except Exception as e:\n'
+        '    print("ERROR|"+json.dumps({"type":type(e).__name__,"msg":str(e)}))\n'
     )
-
+    payload_path = f"/tmp/_devto_payload_{int(time.time()*1000)}_{os.getpid()}.json"
+    Path(payload_path).write_text(json.dumps(payload))
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            return result
-    except urllib.error.HTTPError as e:
-        body_err = e.read().decode("utf-8")
+        result = subprocess.run(
+            ["python3", "-u", "-c", helper, payload_path, api_key],
+            capture_output=True, text=True, timeout=POST_HARD_TIMEOUT
+        )
+        out_line = (result.stdout or "").strip().splitlines()[-1] if result.stdout else ""
+        if out_line.startswith("OK|"):
+            data = json.loads(out_line[3:])
+            data["__status"] = "ok"
+            return data
+        if out_line.startswith("EXISTS|"):
+            data = json.loads(out_line[len("EXISTS|"):])
+            data["__status"] = "exists"
+            return data
+        if out_line.startswith("RATE_LIMITED|"):
+            data = json.loads(out_line[len("RATE_LIMITED|"):])
+            data["__status"] = "rate_limited"
+            print(f"  ❌ dev.to rate limited (HTTP {data['code']}): {data.get('body','')[:200]}")
+            return data
+        if out_line.startswith("HTTP_ERROR|"):
+            err = json.loads(out_line[len("HTTP_ERROR|"):])
+            print(f"  ❌ dev.to HTTP {err['code']}: {err['body'][:200]}")
+            return {"__status": "http_error", "code": err["code"], "body": err["body"]}
+        if out_line.startswith("ERROR|"):
+            err = json.loads(out_line[len("ERROR|"):])
+            print(f"  ❌ dev.to {err['type']}: {err['msg']}")
+            return {"__status": "error", "type": err["type"], "msg": err["msg"]}
+        print(f"  ❌ dev.to unexpected response: stdout={result.stdout[:200]!r} stderr={result.stderr[:200]!r}")
+        return {"__status": "unknown"}
+    except subprocess.TimeoutExpired:
+        print(f"  ❌ dev.to POST hung for >{POST_HARD_TIMEOUT}s — likely urllib TCP/TLS stall, continuing to next post")
+        return {"__status": "timeout"}
+    finally:
         try:
-            err = json.loads(body_err)
-            print(f"  ❌ dev.to error {e.code}: {err}")
-        except Exception:
-            print(f"  ❌ HTTP {e.code}: {body_err[:300]}")
-        return None
+            os.unlink(payload_path)
+        except OSError:
+            pass
 
 
 def get_recent_posts(hours=20):
@@ -188,19 +394,28 @@ def get_recent_posts(hours=20):
     return sorted(recent, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def main():
+def _run():
     dry_run = "--dry-run" in sys.argv
+    max_posts = 0  # 0 = unlimited
+    for arg in sys.argv[1:]:
+        if arg.startswith("--max="):
+            try:
+                max_posts = int(arg.split("=", 1)[1])
+            except ValueError:
+                pass
     tracker = load_tracker()
 
     print(f"\n[{datetime.datetime.now():%Y-%m-%d %H:%M}] dev.to auto-poster running")
     print(f"  Tracker has {len(tracker)} posts already posted")
 
-    posts = get_recent_posts(hours=22)
+    posts = get_recent_posts(hours=48)
     if not posts:
         print("  No recent posts found. Done.")
         return
 
     print(f"  Found {len(posts)} recently-modified posts")
+    if max_posts:
+        print(f"  Cap: posting at most {max_posts} new post(s) this run")
 
     posted_count = 0
     for post_path in posts:
@@ -215,13 +430,18 @@ def main():
             print(f"  ⏭ Already posted: {slug}")
             continue
 
+        if not post_path.exists():
+            print(f"  ⏭ Skipping (file not found): {slug}")
+            continue
+
         meta, body = load_post(post_path)
         title = meta.get("title", "")
         description = meta.get("description", "")
         tags_raw = meta.get("tags", [])
         tags = devto_tags(tags_raw)
         canonical = jekyll_url(post_path)
-        devto_body = body_to_devto(body)
+        devto_body = body_to_devto(body, canonical_base="https://thesolai.github.io")
+        devto_body += devto_footer(canonical)
 
         if not title or len(devto_body) < 200:
             print(f"  ⏭ Skipping (too short or no title): {slug}")
@@ -248,7 +468,7 @@ def main():
             canonical_url=canonical,
         )
 
-        if result and result.get("url"):
+        if result and result.get("__status") == "ok" and result.get("url"):
             tracker[slug] = {
                 "url": result["url"],
                 "id": result.get("id"),
@@ -258,13 +478,44 @@ def main():
             save_tracker(tracker)
             print(f"  ✅ Posted: {result['url']}")
             posted_count += 1
-        else:
-            # If it failed due to rate limit, stop and wait
-            print("  ⚠️  Posting failed — stopping to respect rate limit")
+            if max_posts and posted_count >= max_posts:
+                print(f"  🛑 Hit --max={max_posts} cap — stopping")
+                break
+        elif result and result.get("__status") == "exists":
+            # Canonical URL is already on dev.to (posted earlier by us or by a probe).
+            # Mark tracker so we don't retry next run, then continue to the next post.
+            existing_url = result.get("url") or f"(canonical:{canonical})"
+            tracker[slug] = {
+                "url": existing_url,
+                "id": result.get("id"),
+                "posted_at": datetime.datetime.now().isoformat(),
+                "canonical": canonical,
+                "note": "already-on-devto",
+            }
+            save_tracker(tracker)
+            print(f"  ⏭  Already on dev.to (canonical conflict): {existing_url}")
+            posted_count += 1
+            if max_posts and posted_count >= max_posts:
+                print(f"  🛑 Hit --max={max_posts} cap — stopping")
+                break
+        elif result and result.get("__status") == "rate_limited":
+            # 429 — must wait a full minute. Stop the loop; the next cron run
+            # will pick up where we left off (the unposted post stays untracked).
+            print("  ⚠️  Rate limited — stopping to wait for the next cron run")
             break
+        else:
+            # Any other failure (HTTP error, urllib error, timeout, unexpected
+            # response): log and continue. We do NOT break — these are usually
+            # transient or one-off and shouldn't block the rest of the queue.
+            print("  ⏭  Skipping (will retry next run)")
+            continue
 
     print(f"\n[{datetime.datetime.now():%Y-%m-%d %H:%M}] Done. Posted {posted_count} new posts.")
 
 
 if __name__ == "__main__":
-    main()
+    if acquire_lock():
+        try:
+            _run()
+        finally:
+            release_lock()

@@ -188,11 +188,16 @@ def update_homepage(skills, dry_run=False):
     def replace_cards(m):
         return f'<div class="skills-grid">\n{new_cards_html}\n                    </div>\n                    <a href="/skills/" class="view-all">'
 
+    # Check pattern matches first (distinguishes "no match" from "already up to date")
+    if not re.search(pattern, content, flags=re.DOTALL):
+        print("  ⚠️  Could not find skills grid in homepage — check pattern")
+        return False
+
     new_content = re.sub(pattern, replace_cards, content, flags=re.DOTALL)
 
     if new_content == content:
-        print("  ⚠️  Could not find skills grid in homepage — check pattern")
-        return False
+        print(f"  ℹ️  Homepage already shows these 6 skills (seed={datetime.date.today().toordinal()}) — nothing to do")
+        return True
 
     if not dry_run:
         with open(HOMEPAGE_FILE, "w", encoding="utf-8") as f:

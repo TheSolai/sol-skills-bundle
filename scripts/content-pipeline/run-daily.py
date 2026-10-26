@@ -418,6 +418,65 @@ def _yaml(value: str) -> str:
     v = v.replace("\n", " ").replace("\r", " ").strip()
     return f'"{v}"'
 
+def _post_region_and_url(path: Path):
+    """Return (region, hn_url) for an existing post, or (None, None).
+
+    Region is detected from the filename token that follows the date
+    (e.g. '2026-10-25-uk-ai-weekly-...') and falls back to the frontmatter
+    tags, which also carry the region.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+
+    region = None
+    m = re.match(r"^\d{4}-\d{2}-\d{2}-(uk|eu|us)-", path.name)
+    if m:
+        region = m.group(1)
+
+    hn_url = ""
+    m = re.search(r"^hn_url:\s*(\S*)", text, re.M)
+    if m:
+        hn_url = m.group(1)
+
+    if region is None:
+        m = re.search(r"^tags:\s*\[([^\]]*)\]", text, re.M)
+        tag_blob = m.group(1) if m else ""
+        if not tag_blob:
+            m = re.search(r"^tags:\s*\n((?:\s*-\s*.+\n?)+)", text, re.M)
+            tag_blob = m.group(1) if m else ""
+        for candidate in ("uk", "eu", "us"):
+            if re.search(rf"(^|[\s,\[\]\"'-]){candidate}($|[\s,\]\"'])", tag_blob):
+                region = candidate
+                break
+
+    return region, hn_url
+
+
+def find_duplicate_post(region, hn_url, date_str=None):
+    """Find an existing post for this region/story that the pipeline already wrote.
+
+    The filename of a regional post is derived from the LLM-generated title,
+    so two runs on the same day produce two *different* filenames for the
+    same story. Checking `filepath.exists()` therefore never matched, and
+    every re-run published a duplicate post. Match on the stable keys
+    instead: date + region + source URL.
+    """
+    date_str = date_str or DATE_STR
+    posts_dir = SITE_DIR / "_posts"
+    if not posts_dir.is_dir():
+        return None
+
+    for path in sorted(posts_dir.glob(f"{date_str}-*.md")):
+        post_region, post_url = _post_region_and_url(path)
+        if post_region != region:
+            continue
+        if hn_url and post_url and post_url == hn_url:
+            return path
+    return None
+
+
 def build_jekyll_post(region, content, story, title=None):
     """Build a Jekyll-formatted blog post from content."""
     # If content is None/empty, generate a structured fallback
@@ -477,7 +536,10 @@ One takeaway: Watch this space. The AI story is still being written.
         # "**...**", which leaks into frontmatter and fails the site health test.
         title = _clean_title(lines[0]) if lines else story["title"]
 
-    slug = re.sub(r'[^a-z0-9-]+', '-', (title or story["title"]).lower()).strip('-')[:60]
+    # Truncating to 60 chars can leave a trailing hyphen (the strip above
+    # happens before the cut). Jekyll's :title permalink drops that hyphen,
+    # so the live URL no longer matches the filename. Trim again after.
+    slug = re.sub(r'[^a-z0-9-]+', '-', (title or story["title"]).lower()).strip('-')[:60].strip('-')
     filename = f"{DATE_STR}-{slug}.md"
     filepath = SITE_DIR / "_posts" / filename
 
@@ -674,6 +736,15 @@ def main():
         story = pick_regional_story(ai_stories)
         if not story:
             print(f"[{region}] No story available, skipping")
+            continue
+
+        # Dedupe on date + region + source URL, checked *before* generating
+        # content. The generated title (and therefore the filename) changes
+        # between runs, so a filename check cannot detect that today's post
+        # for this region already exists.
+        duplicate = find_duplicate_post(region, story.get("url", ""))
+        if duplicate:
+            print(f"[{region}] ⚠️  Already published this story: {duplicate.name}")
             continue
 
         content = generate_post(region, story)

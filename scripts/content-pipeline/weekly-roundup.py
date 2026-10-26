@@ -14,6 +14,23 @@ from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
+try:
+    from _minimax_helper import minimax_generate, load_minimax_key
+except Exception:  # pragma: no cover - helper missing must not break publishing
+    minimax_generate = None
+
+    def load_minimax_key():
+        return ""
+
+try:
+    # run_daily.py is import-safe (guarded by __main__) and already carries a
+    # tested source-excerpt fetcher used to ground its MiniMax prompts.
+    from run_daily import fetch_source_excerpt
+except Exception:  # pragma: no cover - fall back to headline-only grounding
+    def fetch_source_excerpt(url, max_chars=6000):
+        return ""
+
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 DEVTO_API_KEY = os.getenv("DEVTO_API_KEY", "")
@@ -94,6 +111,299 @@ def is_ai_story(title):
     return any(kw in t for kw in keywords)
 
 
+# ── Sol's Take ──────────────────────────────────────────────────────────────
+#
+# HISTORY (2026-10-26): the "Sol's Take" section used to be a hardcoded string
+# in build_roundup(). Every roundup since October shipped byte-identical
+# commentary — all 12 live posts hash to the same block. The selection logic
+# was fine; the commentary was a lie about itself.
+#
+# It is now generated from the actual week's stories, grounded in the source
+# pages, and falls back to a deterministic-but-contextual template if the LLM
+# is unreachable. The fallback still names the real stories, so the section is
+# never generic filler.
+
+# A reasoning model gives markedly better commentary than MiniMax-Text-01:
+# sharper opinions, no "underscores a shift towards" filler, and honest when
+# a story is too thin to judge. Text-01 stays as the fallback tier.
+TAKE_MODEL = "MiniMax-M2.7"
+TAKE_MODEL_FALLBACK = "MiniMax-Text-01"
+
+SOL_TAKE_SYSTEM = """You are Sol AI, writing the commentary section of a weekly AI news roundup.
+
+Voice: direct, honest, slightly wry. A technically literate observer who has
+opinions and does not pad. You are not a hype bot and not a cynic.
+
+STYLE, by example. This is the register to hit — note it is about a DIFFERENT
+topic from any story you will be given, so borrow the voice, not the content:
+  "The most interesting thing on the board this week was a licensing change
+   nobody expected and three separate blog posts arguing about it. Meanwhile
+   the launch everyone actually noticed is forgettable. That's usually the
+   shape of a week: the loud story is loud, and the quiet one matters more."
+
+Not this:
+  "This week's AI news paints a picture of an industry in flux, grappling with
+   both pragmatic advancements and existential questions."
+
+BANNED PHRASES — these are the tells of machine-written analysis. Do not use
+them or anything shaped like them: "underscores", "paints a picture",
+"collectively urge us", "in an increasingly", "the era of", "it's a reminder
+that", "this isn't just", "raises questions about", "points to a shift
+towards", "suggests that", "highlights the".
+
+GROUND RULES (these matter more than the style):
+- Write about the stories you were given. Do NOT echo, quote, or paraphrase
+  this brief back to the reader, and do not open with a quotation mark.
+- Name each story you discuss by its ACTUAL TITLE, in quotes or italics. The
+  reader sees headlines, not a numbered list — never write "story 1",
+  "the first story", or "the second item".
+- Never invent companies, people, products, numbers, or events. Use only what
+  appears in the material provided. If a story is thin on detail, say plainly
+  that it is thin rather than filling the gap.
+- Do not repeat the score/comment counts back to the reader; they are already
+  shown next to each headline.
+- Do not add a heading. Do not use bullet points. Output plain paragraphs.
+- Do not start with "This week's pattern:" or any stock opening phrase.
+- Take a position. A reader should be able to disagree with you."""
+
+
+def _story_digest(stories):
+    """Render the week's stories into a grounded prompt block."""
+    blocks = []
+    for i, story in enumerate(stories, 1):
+        block = (
+            f"{i}. {story['title']}\n"
+            f"   HN: {story['score']} points, {story['comments']} comments\n"
+            f"   {story['url']}"
+        )
+        excerpt = fetch_source_excerpt(story["url"], max_chars=2500)
+        if excerpt:
+            block += f"\n   Source excerpt: {excerpt}"
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
+
+# Titles and abbreviations that end in a period but do not end a sentence.
+_ABBREV_TAIL = re.compile(
+    r"(?:\bDr|\bMr|\bMrs|\bMs|\bProf|\bInc|\bLtd|\bCo|\bCorp|\bJr|\bSr|"
+    r"\bSt|\bvs|\bapprox|\bEst|\bNo|\bMt|\bFt|\be\.g|\bi\.e)\.$",
+    re.IGNORECASE,
+)
+# A single capital letter + period is an initial ("J. Smith", "U.S.").
+_INITIAL_TAIL = re.compile(r"\b[A-Z]\.$")
+
+
+def _needs_merge(fragment):
+    """True if this fragment ends in an abbreviation/initial, not a real stop."""
+    if not fragment:
+        return False
+    return bool(_ABBREV_TAIL.search(fragment) or _INITIAL_TAIL.search(fragment))
+
+
+def _split_sentences(para):
+    """
+    Split a paragraph into sentences, preserving every original character.
+
+    Uses finditer + slicing rather than re.split: re.split consumes the
+    matched delimiter, which silently ate the sentence-ending punctuation
+    and left the trimmed text running on mid-sentence.
+
+    The lookbehind requires the terminator NOT be preceded by a capital
+    letter, so "U.S." does not split. Fragments ending in a title or an
+    initial ("Dr." / "J.") are re-merged with the sentence that follows.
+    """
+    terminator = re.compile(r"(?<![A-Z])[.!?][\"'”’)]*(?=\s+[A-Z“\"(\-])")
+    sentences = []
+    start = 0
+    for m in terminator.finditer(para):
+        chunk = para[start:m.end()].strip()
+        if chunk:
+            sentences.append(chunk)
+        start = m.end()
+    tail = para[start:].strip()
+    if tail:
+        sentences.append(tail)
+
+    # Re-merge abbreviation fragments into the sentence that follows them.
+    merged = []
+    for sentence in sentences:
+        if merged and _needs_merge(merged[-1]):
+            merged[-1] = merged[-1] + " " + sentence
+        else:
+            merged.append(sentence)
+    return merged
+
+
+def _ends_cleanly(sentence):
+    """True if the sentence ends with terminal punctuation, not mid-thought."""
+    return bool(sentence) and sentence.rstrip()[-1:] in ".!?\"'”’)"
+
+
+def _trim_to_words(text, limit=200):
+    """
+    Trim prose to a word ceiling, cutting only at sentence boundaries.
+
+    The model consistently writes ~60% over the brief no matter how the
+    prompt is worded, so the ceiling is enforced here instead. Working
+    paragraph-by-paragraph preserves the blank lines between them.
+    """
+    if len(text.split()) <= limit:
+        return text
+
+    kept_paragraphs = []
+    count = 0
+
+    for para in [p.strip() for p in text.split("\n\n") if p.strip()]:
+        if count >= limit:
+            break
+        kept = []
+        for sentence in _split_sentences(para):
+            words = len(sentence.split())
+            if count + words > limit and kept:
+                break
+            kept.append(sentence)
+            count += words
+        # A trailing fragment (no terminal punctuation) means the model was
+        # cut off mid-sentence — drop it rather than publish it.
+        if kept and not _ends_cleanly(kept[-1]):
+            count -= len(kept.pop().split())
+        if kept:
+            kept_paragraphs.append(" ".join(kept))
+
+    trimmed = "\n\n".join(kept_paragraphs).strip()
+    # If trimming gutted the piece, keep the original — a short comment is
+    # worse than a slightly long one.
+    if len(trimmed.split()) < 80:
+        return text
+    return trimmed
+
+
+def generate_sol_take(stories):
+    """
+    Generate contextual commentary for the roundup via MiniMax.
+
+    Returns markdown text, or None if the LLM could not be reached — the
+    caller then uses fallback_sol_take(). Never raises: a commentary failure
+    must not cost us the post.
+    """
+    if not stories or minimax_generate is None:
+        return None
+
+    key = load_minimax_key()
+    if not key:
+        print("[take] No MiniMax key — using contextual fallback")
+        return None
+
+    prompt = (
+        f"Here are the {len(stories)} AI stories that made this week's roundup "
+        f"({WEEK_STR}):\n\n{_story_digest(stories)}\n\n"
+        "Now write the commentary. Format: exactly 3 short paragraphs, 3-4 "
+        "sentences each, HARD LIMIT 180 words. A piece over 180 words is "
+        "rejected. Name the stories you discuss by their titles, and take a "
+        "position a reader could disagree with."
+    )
+
+    # Reasoning models give markedly better commentary than MiniMax-Text-01
+    # here — sharper opinions, no "underscores a shift towards" filler, and
+    # honest when a story is too thin to judge. They need a big token
+    # budget because most of it goes on thinking before any text appears.
+    # Text-01 stays as the fallback tier, then the deterministic template.
+    attempts = [
+        (TAKE_MODEL, 6000),
+        (TAKE_MODEL_FALLBACK, 900),
+    ]
+    for model, max_tokens in attempts:
+        try:
+            text = minimax_generate(
+                prompt,
+                api_key=key,
+                max_tokens=max_tokens,
+                system=SOL_TAKE_SYSTEM,
+                temperature=0.8,
+                model=model,
+                timeout=240,
+            )
+        except Exception as e:
+            print(f"[take] MiniMax error ({model}): {e}")
+            continue
+
+        if text:
+            break
+    else:
+        text = None
+
+    if not text:
+        print("[take] MiniMax returned nothing — using contextual fallback")
+        return None
+
+    text = text.strip()
+    # Strip a stray markdown heading the model may have added anyway.
+    text = re.sub(r"^#{1,6}\s*Sol'?s Take\s*[:—-]?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # The model sometimes wraps the whole section in a single pair of quotes,
+    # as if quoting the brief back. Unwrap it.
+    if len(text) > 200 and text.startswith('"') and text.rstrip().endswith('"'):
+        text = text[1:].rstrip()[:-1].strip()
+    text = text.strip()
+
+    if len(text) < 80:
+        print("[take] Commentary too short — using contextual fallback")
+        return None
+
+    trimmed = _trim_to_words(text, limit=200)
+    if trimmed != text:
+        print(f"[take] Trimmed commentary {len(text.split())} -> {len(trimmed.split())} words")
+
+    # Whatever happened above, never publish text that stops mid-sentence
+    # (the model can also be cut off by max_tokens).
+    if not _ends_cleanly(trimmed):
+        paragraphs = [p.strip() for p in trimmed.split("\n\n") if p.strip()]
+        if paragraphs:
+            sentences = _split_sentences(paragraphs[-1])
+            if sentences and not _ends_cleanly(sentences[-1]):
+                sentences = sentences[:-1]
+                paragraphs[-1] = " ".join(sentences)
+            trimmed = "\n\n".join(p for p in paragraphs if p).strip()
+
+    return trimmed
+
+
+def fallback_sol_take(stories):
+    """
+    Deterministic commentary used when the LLM is unreachable.
+
+    Still names the real stories, so the section stays specific to the week
+    instead of degrading into the same boilerplate every run.
+    """
+    if not stories:
+        return (
+            "A quiet week by the standards of this industry, which is itself "
+            "worth noticing."
+        )
+
+    top = stories[0]
+    runners = stories[1:3]
+
+    parts = [
+        f"The week belonged to *{top['title']}*. It was the story that moved "
+        f"the most people, and the one worth arguing about.",
+    ]
+
+    if runners:
+        names = " and ".join(f"*{s['title']}*" for s in runners)
+        parts.append(
+            f"Close behind came {names}. Different news, same underlying "
+            f"question: who is actually paying for all of this, and what do "
+            f"they get back?"
+        )
+
+    parts.append(
+        "Details on each are above. My take: the argument isn't over whether "
+        "these matter — it's over which of them will still matter in a year."
+    )
+    return "\n\n".join(parts)
+
+
 def build_roundup(stories):
     """Build the weekly roundup post content in Sol's voice."""
     ai_stories = sorted([s for s in stories if is_ai_story(s["title"])],
@@ -136,18 +446,15 @@ This week in AI: {len(top_stories)} stories that mattered, drawn from {total_hn_
             lines.append(f"[Read more →]({story['url']}) — {story['score']} points · {story['comments']} comments\n")
         lines.append("")
 
-    # Sol's commentary
-    lines.append("""## Sol's Take
+    # Sol's commentary — generated from this week's actual stories.
+    take = generate_sol_take(top_stories) or fallback_sol_take(top_stories)
 
-This week's pattern: the AI industry is still in full infrastructure-building mode. Custom silicon, bigger models, faster inference. The policy conversation is catching up — but slowly.
+    lines.append(f"""## Sol's Take
 
-The most interesting signal this week is the growing split between AI as a product (consumer apps, tools) and AI as infrastructure (chips, APIs, enterprise platforms). That's where the real money and the real competition is right now.
-
-The research side remains energetic — new models, new benchmarks, new use cases. But the translation from research to product is faster than ever, which means the gap between "this is possible" and "this is deployed" is closing rapidly.
-
-What I'm watching next week: whether any of this week's releases actually stick.
+{take}
 
 ---
+
 *Roundup published every Monday. Follow [Sol AI](https://thesolai.github.io) for daily AI analysis.*""")
 
     return "\n".join(lines), top_stories
@@ -202,12 +509,23 @@ def main():
     ai_stories = [s for s in stories if is_ai_story(s["title"])]
     print(f"[news] Found {len(ai_stories)} AI stories from the past week")
 
-    content, top_stories = build_roundup(stories)
     title = f"The Week in AI: {WEEK_STR}"
 
     slug = f"{DATE_STR}-week-in-ai-{TODAY.strftime('%b-%Y').lower()}"
     filename = f"{slug}.md"
     filepath = SITE_DIR / "_posts" / filename
+
+    # Check for an existing post BEFORE building the body. Two schedulers
+    # fire this job (launchd Monday 07:00 and the 08:00 cron), so the second
+    # run must not burn an LLM call to generate commentary it will discard.
+    if filepath.exists():
+        print(f"[roundup] ⚠️  Already exists: {filepath.name}")
+        print(f"\n{'='*60}")
+        print(f"Weekly roundup already published — nothing to do.")
+        print(f"{'='*60}\n")
+        return
+
+    content, top_stories = build_roundup(stories)
 
     frontmatter = f"""---
 layout: post
@@ -224,33 +542,30 @@ featured: true
 {content}
 """
 
-    if filepath.exists():
-        print(f"[roundup] ⚠️  Already exists: {filepath.name}")
-    else:
-        filepath.write_text(frontmatter, encoding="utf-8")
-        print(f"[roundup] ✅ Written: {filepath.name}")
+    filepath.write_text(frontmatter, encoding="utf-8")
+    print(f"[roundup] ✅ Written: {filepath.name}")
 
-        # Publish to origin/main.
-        # NOTE (2026-10-22): this used to create a `roundup/<date>` branch and
-        # open a PR. That was the root cause of a silent publishing outage:
-        # the repo was left checked out on the side branch, and every other
-        # pipeline script ran a bare `git push`, which pushed THAT branch
-        # instead of main. 19 commits and ~20 posts never went live while the
-        # logs cheerfully reported success. The PRs were also never merged.
-        # All publishing now goes through site_git.publish(), which always
-        # targets origin/main and verifies the push landed.
-        try:
-            from site_git import publish
-            sha = publish(f"Sol AI weekly roundup: {WEEK_STR}", allow_empty=True)
-            if sha:
-                print(f"[git] ✅ Pushed to origin/main ({sha[:12]})")
-            else:
-                print("[git] No changes to commit")
-        except Exception as e:
-            print(f"[git] ❌  Push FAILED: {e}")
+    # Publish to origin/main.
+    # NOTE (2026-10-22): this used to create a `roundup/<date>` branch and
+    # open a PR. That was the root cause of a silent publishing outage:
+    # the repo was left checked out on the side branch, and every other
+    # pipeline script ran a bare `git push`, which pushed THAT branch
+    # instead of main. 19 commits and ~20 posts never went live while the
+    # logs cheerfully reported success. The PRs were also never merged.
+    # All publishing now goes through site_git.publish(), which always
+    # targets origin/main and verifies the push landed.
+    try:
+        from site_git import publish
+        sha = publish(f"Sol AI weekly roundup: {WEEK_STR}", allow_empty=True)
+        if sha:
+            print(f"[git] ✅ Pushed to origin/main ({sha[:12]})")
+        else:
+            print("[git] No changes to commit")
+    except Exception as e:
+        print(f"[git] ❌  Push FAILED: {e}")
 
-        # Cross-post to dev.to
-        post_to_devto(title, content, ["ai", "news", "weekly", "roundup"])
+    # Cross-post to dev.to
+    post_to_devto(title, content, ["ai", "news", "weekly", "roundup"])
 
     print(f"\n{'='*60}")
     print(f"Weekly roundup complete!")

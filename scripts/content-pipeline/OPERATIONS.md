@@ -118,6 +118,79 @@ boundaries, never mid-sentence), and give style examples about a *different*
 topic than the stories in play — with a matching example, the model copies
 it verbatim.
 
+`run-daily.py` has **no** equivalent of `_trim_to_words`. "400-600 words"
+there is a prompt instruction only, so the published length drifts over —
+the 2026-10-27 posts came in at 582 (UK), 645 (EU) and 640 (US) body
+words. Add a sentence-boundary trim there if the range needs to hold.
+
+## A generator must never publish content that already exists
+
+Every recurring series publishes on a schedule, so the generator is asked
+the same question every day: *has this story already been covered?* The
+answer has to be a **stable key**, not a filename and not a date.
+
+Two keys are in use, and `post_identity.py` is the single definition of
+both, so the audit and the generators cannot drift apart:
+
+- **source URL** — the external story a post comments on. This is the
+  stable key for anything that comments on the news. The *body* is not a
+  stable key: a trending post embeds the live Hacker News point count,
+  so the same story republished over a month produced 25 URLs whose
+  bodies differed only in that number, and a body comparison caught
+  almost none of them.
+- **body signature** — the post text with formatting stripped. This is
+  the stable key for a series that writes its own material (the bloopers
+  templates). It is how the audit detects that a template has been
+  republished.
+
+Two bugs came from ignoring this, and both are now guarded:
+
+- `run-daily.py` picked a bloopers template with `random.choice()` from a
+  fixed pool of 3. Nothing checked whether that template had already
+  been published, so every run republished an already-published story
+  under a new date — 101 duplicate URLs between June and October.
+- `trending-topics.py` always took `hits[0]` from the HN index. One
+  story stayed at the top for a month, so it was republished every three
+  hours — 25 URLs for one story.
+
+The rule for anything that writes into `_posts/`:
+
+> Before writing, check the archive for the stable key. If the key is
+> already covered, pick something else or write nothing. Never publish a
+> second URL for content that is already published.
+
+When a generator has nothing eligible left, **skip and log it**. The
+bloopers series is in that state now — all 3 templates are published, so
+the daily slot goes quiet until new material is added. That is the
+correct behaviour: a silent copy is worse than a gap.
+
+`seo-health.py` reports the same thing the other way round. `duplicate_offenders()`
+is the single definition of "this post needs a canonical", and
+`seo-repair-canonicals.py` applies exactly what the audit prescribes —
+the repair can never disagree with the check that reports it.
+
+## The 08:00 cron duplicates the 07:00 launchd job
+
+`ai.sol.daily-content` (launchd, 07:00) already runs `run-daily.py`, so the
+08:00 cron invocation of the same script is a **guaranteed no-op**: the
+day's posts exist, `find_duplicate_post()` matches them on date + region +
+source URL, and the run reports "Already published this story" for all
+three regions and exits without pushing. That is correct behaviour, not a
+failure — do not treat it as a broken pipeline.
+
+The dedupe key is the **source URL**, so a re-run only skips when HN's top
+AI story is unchanged. If a different story takes the top slot between
+07:00 and 08:00, the 08:00 run publishes a *second* set of three regional
+posts for the same day, because nothing checks for a post that already
+exists for that date and region. If that ever happens, delete the
+duplicate set rather than keeping both.
+
+Note also that `python3` on PATH in this environment resolves to the
+Learnage venv (`/Users/amre/Projects/Learnage/.venv/bin/python3`), not
+`/usr/bin/python3` or `/opt/homebrew/bin/python3`. The launchd job pins
+`/opt/homebrew/bin/python3`; a bare `python3` in a cron entry depends on
+whatever the shell resolves first.
+
 ## The weekly roundup's "Sol's Take"
 
 Was a hardcoded string. All 12 roundups published in October 2026 shipped
@@ -135,3 +208,20 @@ description — duplicate content across 12 posts.
 `devto-poster.py` posts a new article; `devto_update.py --slug <slug>`
 updates an existing one when the Jekyll post changes. The tracker is
 `logs/devto-posted.json`.
+
+Two things decide *which* posts get posted, and both were bugs first:
+
+- **Recency is the post's publication date, not the file mtime.** The
+  og:image SEO fix of 2026-10-25 rewrote 149 post front matters in a single
+  second, so every mtime jumped to that moment. An mtime-based queue then
+  re-ingested the whole archive — 95 unposted posts, 55 of them sharing two
+  titles — and pushed the genuinely new posts out of the way. The queue is
+  now `front-matter date:` within `RECENT_WINDOW_DAYS` (7), which survives
+  front-matter rewrites. Backfilling older posts is `devto_backfill.py`'s
+  job, not the daily poster's.
+
+- **dev.to refuses a title reused within five minutes.** Recurring series
+  ("AI Bloopers: …", "Trending: …") reuse one title every day, so they
+  collide with each other and each collision was dropped silently — run
+  after run, with only a cheerful "will retry next run". A collision is now
+  retried once with the publication date appended, e.g. `… (12 Oct 2026)`.

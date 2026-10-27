@@ -17,6 +17,7 @@ from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from _minimax_helper import minimax_generate, load_minimax_key
+from post_identity import body_signature, published_signatures
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle")
@@ -639,9 +640,28 @@ BLOOPER_TEMPLATES = [
 
 
 def generate_blooper_post():
-    """Generate the daily bloopers post."""
+    """Generate the daily bloopers post.
+
+    Only a template whose body has never been published is eligible. The
+    template pool is small and finite, so a blind `random.choice` kept
+    republishing an already-published story under a new date — that is how
+    ~100 duplicate URLs piled up between June and October. Each new URL
+    was a new crawlable page with the same text.
+
+    When every template has been used, no post is written. The caller
+    reports that loudly rather than publishing a copy. Resuming the series
+    means adding a new template to BLOOPER_TEMPLATES.
+
+    Returns (filepath, frontmatter). filepath is None when there is no
+    unused template left.
+    """
     import random
-    content = random.choice(BLOOPER_TEMPLATES)
+    published = published_signatures(SITE_DIR / "_posts")
+    unused = [t for t in BLOOPER_TEMPLATES if body_signature(t) not in published]
+    if not unused:
+        return None, None
+
+    content = random.choice(unused)
     title = "AI Bloopers: The Most Absurd AI Fails This Week"
     slug = f"{DATE_STR}-ai-bloopers"
     filename = f"{slug}.md"
@@ -760,14 +780,25 @@ def main():
     # 3. Generate bloopers post
     print("\n[bloopers] Generating weekly bloopers post...")
     filepath, frontmatter = generate_blooper_post()
-    if filepath.exists():
+    bloopers_written = False
+    if filepath is None:
+        print("[bloopers] ⚠️  Every bloopers template has already been published — "
+              "skipping rather than republishing a story under a new date. "
+              "Add a new template to BLOOPER_TEMPLATES to resume this series.")
+    elif filepath.exists():
         print(f"[bloopers] ⚠️  Already exists: {filepath.name}")
     else:
         filepath.write_text(frontmatter, encoding="utf-8")
+        bloopers_written = True
         print(f"[bloopers] ✅ Written: {filepath.name}")
 
-    # 4. Push to GitHub if changes made
-    if generated_posts or not filepath.exists():
+    # 4. Push to GitHub if changes made.
+    # The bloopers post counts as a change in its own right. The old test
+    # was `generated_posts or not filepath.exists()`, but filepath always
+    # existed by this point, so the condition collapsed to `generated_posts`
+    # — a run that produced only a bloopers post committed nothing and the
+    # post stayed unpublished.
+    if generated_posts or bloopers_written:
         try:
             from site_git import publish
             sha = publish(f"Sol AI daily content: {DATE_STR}", allow_empty=True)

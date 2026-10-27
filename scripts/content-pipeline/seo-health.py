@@ -39,6 +39,9 @@ from collections import defaultdict
 from datetime import date
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from post_identity import normalise_url, source_url
+
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle")
 BASE_URL = "https://thesolai.github.io"
@@ -230,55 +233,190 @@ def check_canonicals(posts):
     return issues
 
 
-def check_duplicate_content(posts):
-    """Posts with an identical body must be consolidated onto one canonical URL.
+def _tags_blob(front_matter):
+    """The tags value, as text — inline list or block list."""
+    m = re.search(r"^tags:\s*(.*)$", front_matter, re.MULTILINE)
+    if m and m.group(1).strip():
+        return m.group(1)
+    m = re.search(r"^tags:\s*\n((?:\s+-\s*.+\n?)+)", front_matter, re.MULTILINE)
+    return m.group(1) if m else ""
 
-    A duplicate group is healthy when exactly one member is the canonical
-    target and every other member carries a `canonical:` front matter key
-    pointing at it. A group with no consolidation is still an issue.
+
+def _region_of(post, front_matter):
+    """The region this post analyses, or '' when it is not a regional post.
+
+    The regional series (EU AI Watch / UK AI Weekly / US AI Pulse) covers
+    one story from three angles. That is a deliberate variant, not a
+    duplicate — but the same region telling the same story again on a
+    later date is republication.
+    """
+    for tag in re.findall(r"[a-z]+", _tags_blob(front_matter).lower()):
+        if tag in ("uk", "eu", "us"):
+            return tag
+    m = re.match(r"^\d{4}-\d{2}-\d{2}-(uk|eu|us)-", post.stem.lower())
+    return m.group(1) if m else ""
+
+
+def _series_of(post, front_matter):
+    """The recurring series a post belongs to.
+
+    Regional posts are their own series (one per region). Everything else
+    is grouped by the token after the date in the filename — 'trending',
+    'ai-bloopers', 'quick-hits', and so on.
+    """
+    region = _region_of(post, front_matter)
+    if region:
+        return region
+    m = re.match(r"^\d{4}-\d{2}-\d{2}-([a-z0-9]+(?:-[a-z0-9]+)?)", post.stem.lower())
+    return m.group(1) if m else post.stem.lower()
+
+
+def duplicate_offenders(posts):
+    """Return (offenders, regional_groups, regional_posts).
+
+    offenders is a list of (post name, its own URL, the canonical URL it
+    should carry). regional_groups / regional_posts count the by-design
+    regional repetition that is reported rather than flagged.
+
+    This is the single definition of "this post needs a canonical" — the
+    audit reports from it, and the repair script applies it.
+    """
+    metas = []
+    for p in posts:
+        text = p.read_text(encoding="utf-8", errors="replace")
+        fm, _ = split_front_matter(text)
+        metas.append({
+            "path": p,
+            "name": p.name,
+            "url": post_url(p),
+            "body": post_body(p),
+            "source": normalise_url(source_url(text)),
+            "series": _series_of(p, fm),
+            "region": _region_of(p, fm),
+            "canonical": field(fm, "canonical"),
+        })
+
+    by_body = defaultdict(list)
+    by_family = defaultdict(list)
+    for i, m in enumerate(metas):
+        if m["body"]:
+            by_body[m["body"]].append(i)
+        if m["source"] and m["series"]:
+            by_family[(m["source"], m["series"])].append(i)
+
+    # Union the two relations so a family that matches on both is one group.
+    parent = list(range(len(metas)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for members in list(by_body.values()) + list(by_family.values()):
+        for other in members[1:]:
+            union(members[0], other)
+
+    components = defaultdict(list)
+    for i in range(len(metas)):
+        components[find(i)].append(i)
+
+    offenders = []
+    regional_groups = 0
+    regional_posts = 0
+    for idxs in components.values():
+        if len(idxs) < 2:
+            continue
+        members = sorted((metas[i] for i in idxs), key=lambda m: m["name"])
+
+        # The same region telling the same story on the same day is a
+        # defect — the pipeline published that story twice. The same story
+        # covered from a different region, or on a different day, is the
+        # intended design of the regional series and is only counted.
+        by_region_day = defaultdict(list)
+        for m in members:
+            by_region_day[(m["region"], m["name"][:10])].append(m)
+        for _, cell in sorted(by_region_day.items()):
+            if len(cell) < 2:
+                continue
+            cell.sort(key=lambda m: m["name"])
+            target = cell[0]["url"]
+            if not target:
+                continue
+            for m in cell[1:]:
+                if m["canonical"] != target:
+                    offenders.append((m["name"], m["url"], target))
+
+        if any(m["region"] for m in members):
+            regional_groups += 1
+            regional_posts += len(members)
+            continue
+
+        # A recurring non-regional series (trending, bloopers, ...) that
+        # published the same story or the same article more than once. The
+        # family gets one canonical URL: the earliest member, which is the
+        # original because filenames are date-prefixed.
+        target = members[0]["url"]
+        if not target:
+            continue
+        for m in members[1:]:
+            if m["canonical"] != target:
+                offenders.append((m["name"], m["url"], target))
+
+    return offenders, regional_groups, regional_posts
+
+
+def check_duplicate_content(posts):
+    """Find content published under more than one URL.
+
+    A body signature alone is not enough to catch republication. The
+    trending series embeds the live Hacker News point count in its body,
+    so the same story republished for a month produced 25 URLs whose
+    bodies differed only in that number — and a body-only comparison
+    caught almost none of them.
+
+    Two identities are therefore tracked:
+
+      * the body signature — literally the same article
+      * (source story, series) — the same story told by the same series
+
+    A family is healthy when exactly one member is the canonical target
+    and every other member carries a `canonical:` pointing at it. A
+    family of 30 posts where 29 already point at the original is ONE
+    broken post, not 30 — the count is the number of offenders.
+
+    Regional variants of one story (EU/UK/US on the same day) are a
+    deliberate design choice, so they are counted and reported separately
+    rather than flagged as errors.
     """
     issues = []
-    groups = defaultdict(list)
-    for p in posts:
-        body = post_body(p)
-        if body:
-            groups[body].append(p)
+    notes = []
 
-    unconsolidated = 0
-    for body, members in groups.items():
-        if len(members) < 2:
-            continue
-        urls = {}
-        for m in members:
-            u = post_url(m)
-            if u:
-                urls[str(m)] = u
+    offenders, regional_groups, regional_posts = duplicate_offenders(posts)
 
-        canonicals = {}
-        for m in members:
-            fm, _ = split_front_matter(m.read_text(encoding="utf-8", errors="replace"))
-            canonicals[str(m)] = field(fm, "canonical")
+    for name, own_url, target in offenders[:20]:
+        issues.append(
+            f"❌ {name}: republication of an existing post and carries no "
+            f"canonical: — add canonical: {target} (its own URL is {own_url})"
+        )
+    if len(offenders) > 20:
+        issues.append(
+            f"❌ ... and {len(offenders) - 20} more republished posts with no canonical:"
+        )
 
-        targets = {c for c in canonicals.values() if c}
-        # The canonical target is the member nobody points away from.
-        targets_in_group = {t for t in targets if t in urls.values()}
-        if len(targets_in_group) == 1:
-            target = targets_in_group.pop()
-            missing = [m.name for m in members
-                       if urls.get(str(m)) != target and canonicals.get(str(m)) != target]
-            if not missing:
-                continue
+    if regional_groups:
+        notes.append(
+            f"ℹ️  {regional_posts} posts in {regional_groups} groups share a source "
+            f"story with another post in the same regional series (by design — "
+            f"the UK/EU/US angles of one story are separate articles)"
+        )
 
-        unconsolidated += len(members) - 1
-        if unconsolidated <= 10:
-            names = ", ".join(sorted(m.name for m in members)[:3])
-            issues.append(
-                f"❌ {len(members)} posts share an identical body "
-                f"(e.g. {names}) — they need a canonical: pointing at one of them"
-            )
-    if unconsolidated > 10:
-        issues.append(f"❌ ... and {unconsolidated - 10} more duplicated posts")
-    return issues
+    return issues, notes
 
 
 def check_seo_files():
@@ -543,8 +681,10 @@ def main():
     print(f"    {'✅ All good!' if not canonical_issues else f'{len(canonical_issues)} issue(s) found'}")
 
     print("[4] Checking for duplicate content...")
-    dupe_issues = check_duplicate_content(posts)
+    dupe_issues, dupe_notes = check_duplicate_content(posts)
     all_issues.extend(dupe_issues)
+    for note in dupe_notes:
+        print(f"    {note}")
     print(f"    {'✅ All good!' if not dupe_issues else f'{len(dupe_issues)} issue(s) found'}")
 
     print("[5] Checking SEO infrastructure...")

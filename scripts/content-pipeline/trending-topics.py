@@ -9,8 +9,11 @@ and writes a short commentary post. Different from Quick Hits — these
 are real-time responses to breaking stories.
 """
 
-import os, datetime, urllib.request, urllib.parse, json
+import os, datetime, urllib.request, urllib.parse, json, sys, subprocess
 from pathlib import Path
+
+sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
+from post_identity import normalise_url, published_source_urls, source_url
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 LOG_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline/logs")
@@ -58,22 +61,74 @@ def log(msg):
     print(msg)
 
 
-def fetch_top_story():
-    """Fetch the top trending AI story right now."""
+def story_url(hit):
+    """The link to the story itself — the stable identity of a trending post."""
+    return hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
+
+
+def fetch_top_story(covered_urls=None):
+    """Fetch the top trending AI story that has not been covered yet.
+
+    The same story stayed at the top of the HN index for a month, so taking
+    `hits[0]` republished it every few hours — 25 separate URLs for one
+    story. The bodies were never identical (each post embeds the live point
+    count, which moves), so the SEO audit's body comparison only ever
+    caught a fraction of them. The stable key is the source URL, so that is
+    what is matched on here, and the next uncovered story in the results
+    is taken instead.
+    """
     params = {
         "query": "AI agent",
         "tags": "story",
         "numericFilters": "points>30",
-        "hitsPerPage": 10,
+        "hitsPerPage": 30,
     }
     url = HN_ALGOLIA + "?" + urllib.parse.urlencode(params)
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "SolAI-Trending/1.0"})
         data = json.loads(urllib.request.urlopen(req, timeout=15).read())
-        return data.get("hits", [{}])[0] if data.get("hits") else None
     except Exception as e:
         log(f"fetch failed: {e}")
         return None
+
+    covered = covered_urls or set()
+    hits = data.get("hits", [])
+    if not hits:
+        return None
+    for hit in hits:
+        if normalise_url(story_url(hit)) not in covered:
+            return hit
+    log("every trending candidate has already been covered")
+    return None
+
+
+def _posts_on_disk():
+    posts_dir = SITE_DIR / "_posts"
+    return sorted(posts_dir.glob("*.md")) if posts_dir.is_dir() else []
+
+
+def _covered_source_urls():
+    """Source URLs of every post already in the archive."""
+    out = set()
+    for p in _posts_on_disk():
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        key = normalise_url(source_url(text))
+        if key:
+            out.add(key)
+    return out
+
+
+def _is_published(path):
+    """True when the file is committed to the published tree."""
+    r = subprocess.run(
+        ["git", "-C", str(SITE_DIR), "ls-files", "--error-unmatch", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    return r.returncode == 0
 
 
 def generate_post():
@@ -83,13 +138,37 @@ def generate_post():
     hour = today.hour
     slot = "morning" if hour < 12 else ("afternoon" if hour < 16 else "evening")
 
-    story = fetch_top_story()
+    # One trending post per day. The 09:00 / 13:00 / 17:00 slots used to
+    # overwrite the same file, because the story at the top of the index
+    # never changed — the later runs only ever refreshed the point count.
+    # The second and third slots now do nothing.
+    existing = [p for p in _posts_on_disk()
+                if p.name.startswith(f"{date_str}-trending-")]
+    if existing:
+        post_path = existing[0]
+        if _is_published(post_path):
+            log(f"today's trending post is already published ({post_path.name}) — skipping")
+        else:
+            # Written but never committed — the exact failure the Oct 2026
+            # incident produced. Retry the publish instead of adding
+            # another post on top of it.
+            log(f"today's trending post was written but never published "
+                f"({post_path.name}) — retrying publish")
+            try:
+                from site_git import publish
+                sha = publish(f"Trending ({slot}): retry unpublished post", paths=[str(post_path)])
+                log(f"✓ publish retry: {sha[:12] if sha else 'nothing new'}")
+            except Exception as e:
+                log(f"❌ publish retry failed: {e}")
+        return None
+
+    story = fetch_top_story(_covered_source_urls())
     if not story:
-        log("no trending story found")
+        log("no uncovered trending story found")
         return None
 
     title = story.get("title", "AI News Today")
-    url = story.get("url") or f"https://news.ycombinator.com/item?id={story.get('objectID')}"
+    url = story_url(story)
     points = story.get("points", 0)
     comments = story.get("num_comments", 0)
 
@@ -127,7 +206,7 @@ hero_image: /images/sol-avatar.png
 
 ---
 
-*Trending Topics posts run 3x daily (09:00 / 13:00 / 17:00 UK). Subscribe at [sol-alias.com](https://thesolai.github.io) or follow [@TheSolAI](https://github.com/TheSolAI) on GitHub.*
+*Trending Topics posts run daily, each commenting on a story that has not been covered yet. Subscribe at [sol-alias.com](https://thesolai.github.io) or follow [@TheSolAI](https://github.com/TheSolAI) on GitHub.*
 """
 
     SITE_DIR.mkdir(parents=True, exist_ok=True)

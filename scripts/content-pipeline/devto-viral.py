@@ -28,6 +28,7 @@ from devto_key import load_devto_key
 from _minimax_helper import minimax_generate, load_minimax_key
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
+SITE_BASE_URL = "https://thesolai.github.io"
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 DEVTO_API_KEY = load_devto_key()
 MINIMAX_KEY_PATH = Path.home() / ".openclaw" / "workspace" / "secrets" / "minimax-key.txt"
@@ -49,7 +50,12 @@ TRENDS_FILE = BUNDLE_DIR / "_data" / "devto-trends.json"
 # against an almost-empty file and re-posted content that was already live.
 ROOT_BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle")
 POSTED_FILE = ROOT_BUNDLE_DIR / "logs" / "devto-posted.json"
-ADVERTISED_FILE = BUNDLE_DIR / "logs" / "devto-advertised.json"
+# Same story as POSTED_FILE: the tracker lives at the bundle root, next to
+# logs/devto-posted.json, and skills/sol-devto-viral/SKILL.md documents that
+# path. The nested scripts/content-pipeline/logs/ copy was a second, divergent
+# file — writes went there while the documented path went stale, so the ad
+# history looked empty even after a run had logged new opportunities.
+ADVERTISED_FILE = ROOT_BUNDLE_DIR / "logs" / "devto-advertised.json"
 TRENDS_FILE.parent.mkdir(parents=True, exist_ok=True)
 BUNDLE_DIR.joinpath("logs").mkdir(exist_ok=True)
 
@@ -203,6 +209,18 @@ def sanitize_devto_tag(tag: str) -> str | None:
     return cleaned[:20]
 
 
+def _jekyll_slug(slug: str) -> str:
+    """Reproduce Jekyll's Utils.slugify (default mode) for a post slug.
+
+    Jekyll replaces every run of non-alphanumeric characters with a single
+    hyphen and then strips leading/trailing hyphens. Post filenames that were
+    truncated at 80 characters keep a trailing hyphen, and a few contain
+    doubled hyphens, so the raw filename stem is NOT the URL Jekyll serves.
+    """
+    out = "".join(ch if ch.isalnum() else "-" for ch in slug)
+    return re.sub(r"-+", "-", out).strip("-").lower()
+
+
 def jekyll_canonical(post_path: Path) -> str | None:
     """Canonical URL for a published Jekyll post, or None if it has none.
 
@@ -217,12 +235,39 @@ def jekyll_canonical(post_path: Path) -> str | None:
     tutorial-*.md, guide-*.md files) are not published by Jekyll at all —
     they 404 and are absent from the sitemap — so they get no canonical and
     must never be cross-posted.
+
+    Two corrections to the filename-derived URL, both of which silently
+    404'd and left the post stuck in the queue forever:
+
+    1. The URL slug is Jekyll's slugify of the filename stem, not the stem
+       itself: runs of non-alphanumeric characters collapse to a single
+       hyphen and leading/trailing hyphens are dropped. Filenames truncated
+       at 80 characters end in "-", so 35 posts resolved to a URL with a
+       trailing hyphen that does not exist on the live site.
+    2. A post may declare an explicit `permalink:` in its frontmatter, which
+       overrides the filename-derived URL. One post uses it so the
+       apostrophe in "what doesn't" stays out of the URL.
     """
+    content = post_path.read_text(encoding="utf-8", errors="replace")
+
+    # An explicit permalink in the frontmatter wins over the filename.
+    if content.startswith("---"):
+        end = content.find("---", 3)
+        if end != -1:
+            m_perm = re.search(r"^permalink:\s*(\S+)\s*$", content[3:end], re.M)
+            if m_perm:
+                perm = m_perm.group(1).strip().strip('"').strip("'")
+                if perm.startswith("/"):
+                    return f"{SITE_BASE_URL}{perm}"
+
     m = re.match(r"^(\d{4})-(\d{2})-(\d{2})-(.+)$", post_path.stem)
     if not m:
         return None
     y, mo, d, slug = m.groups()
-    return f"https://thesolai.github.io/blog/{y}/{mo}/{d}/{slug}/"
+    slug = _jekyll_slug(slug)
+    if not slug:
+        return None
+    return f"{SITE_BASE_URL}/blog/{y}/{mo}/{d}/{slug}/"
 
 
 def canonical_is_live(url: str) -> bool:

@@ -13,7 +13,7 @@ import os, datetime, urllib.request, urllib.parse, json, sys, subprocess
 from pathlib import Path
 
 sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
-from post_identity import normalise_url, published_source_urls, source_url
+from post_identity import normalise_url, published_source_urls, source_url, source_urls
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 LOG_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline/logs")
@@ -108,16 +108,21 @@ def _posts_on_disk():
 
 
 def _covered_source_urls():
-    """Source URLs of every post already in the archive."""
+    """Source URLs of every post already in the archive.
+
+    Every source URL in a post counts, not just the first one — a digest
+    post carries three stories and the archive must know about all three.
+    """
     out = set()
     for p in _posts_on_disk():
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        key = normalise_url(source_url(text))
-        if key:
-            out.add(key)
+        for url in source_urls(text):
+            key = normalise_url(url)
+            if key:
+                out.add(key)
     return out
 
 

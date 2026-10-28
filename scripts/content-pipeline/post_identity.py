@@ -78,6 +78,28 @@ def source_url(text):
     return None
 
 
+def source_urls(text):
+    """Every external story this post comments on.
+
+    WHY (2026-10-28): `source_url()` returns the first match only, which is
+    right for a post that comments on one story — but a digest post carries
+    three `*Source:*` lines, and only the first was ever registered with the
+    archive. The dedupe could not see the other two, so it would happily
+    republish a story the archive already covered.
+
+    Order is preserved and duplicates are dropped.
+    """
+    out = []
+    seen = set()
+    for pattern in SOURCE_URL_PATTERNS:
+        for m in pattern.finditer(text):
+            url = m.group(1).strip()
+            if url and url not in seen:
+                seen.add(url)
+                out.append(url)
+    return out
+
+
 def normalise_url(url):
     """Reduce a URL to a stable comparison key.
 
@@ -111,7 +133,11 @@ def published_signatures(posts_dir):
 
 
 def published_source_urls(posts_dir):
-    """Set of normalised source URLs already published."""
+    """Set of normalised source URLs already published.
+
+    Every source URL in every post counts, not just the first one — a digest
+    post carries three stories and the archive must know about all three.
+    """
     out = set()
     posts_dir = Path(posts_dir)
     if not posts_dir.is_dir():
@@ -121,7 +147,8 @@ def published_source_urls(posts_dir):
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        key = normalise_url(source_url(text))
-        if key:
-            out.add(key)
+        for url in source_urls(text):
+            key = normalise_url(url)
+            if key:
+                out.add(key)
     return out

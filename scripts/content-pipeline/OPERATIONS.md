@@ -155,6 +155,14 @@ both, so the audit and the generators cannot drift apart:
   templates). It is how the audit detects that a template has been
   republished.
 
+One caveat on the source-URL key: `source_url()` returns the **first**
+`*Source:*` link in a post, which is correct for a post that comments on one
+story. A digest post carries three, and only the first was ever registered
+with the archive — so the dedupe could not see the other two and would
+republish a covered story. `source_urls()` returns every match, and
+`published_source_urls()` uses it. `source_url()` keeps its first-match
+contract for the audit's per-post labelling.
+
 Two bugs came from ignoring this, and both are now guarded:
 
 - `run-daily.py` picked a bloopers template with `random.choice()` from a

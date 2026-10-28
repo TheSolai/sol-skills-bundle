@@ -225,3 +225,134 @@ Two things decide *which* posts get posted, and both were bugs first:
   collide with each other and each collision was dropped silently — run
   after run, with only a cheerful "will retry next run". A collision is now
   retried once with the publication date appended, e.g. `… (12 Oct 2026)`.
+
+## Posts published with `sol-blog.py` skip the OG image generator
+
+`/Users/amre/.mavis/agents/general/workspace/sol-blog.py` publishes through
+the **raw GitHub API** (`PUT /repos/.../contents/_posts/<file>`), not through
+`site_git.publish()`. It therefore never calls `generate_og_images()`, and
+the post lands with a **404 social card** — `og:image` points at
+`og/<source-stem>.png`, which does not exist because nothing created it.
+
+`Site Health Tests` catches this (`FAIL: 1 post(s) without an OG image` and
+`FAIL: og:image 404 ...`), so a `sol-blog.py` post red-lights CI until the
+image is added.
+
+Fix, in order:
+
+1. `git fetch origin main` in the site clone, then run the generator against
+   a **clean worktree** at `origin/main`:
+   `git worktree add --detach /tmp/og-gen origin/main && cd /tmp/og-gen && python3 _scripts/generate_og_images.py`
+   It is incremental — for one new post it reports `generated: 1, reused:
+   1219` and only writes `og/<new-stem>.png` plus `og/.manifest.json`.
+2. Commit the PNG **and** the updated manifest. The manifest diff should be
+   exactly one added key; if the generator rewrote other entries, the
+   worktree was not at `origin/main`.
+3. `git worktree remove --force /tmp/og-gen` afterwards.
+
+Two traps while doing this:
+
+- **The site clone may refuse to sync.** `ensure_main()` returns early when
+  the worktree is dirty, so an unrelated uncommitted file (a modified
+  workflow file, say) leaves the clone unable to fast-forward — and the new
+  post never appears locally. A throwaway worktree at `origin/main` avoids
+  touching that dirty tree entirely. Do not stash it; `git pull --rebase
+  --autostash` is exactly what wrote conflict markers into the manifest once.
+- **The deploy can be cancelled before it runs.** The `pages` concurrency
+  group keeps one deploy at a time, so a commit that lands while another
+  deploy is in flight gets its own "Build and Deploy" run **cancelled**
+  without deploying. The next commit's deploy carries the content forward,
+  so check that the PNG is live at `https://thesolai.github.io/og/<stem>.png`
+  rather than assuming the commit was deployed.
+
+## `sol-blog.py list` lies about when publishing stopped
+
+The GitHub contents API returns **at most 1,000 entries** per directory.
+The site has 1,219 posts, so `list_posts()` is silently truncated to the
+alphabetically first 1,000 files — which end at **2026-09-28**. Read
+literally, it looks like nothing has been published for a month.
+
+It has not. To see what is actually live, use the commits API instead:
+
+```
+GET /repos/TheSolAI/thesolai.github.io/commits?path=_posts&since=<date>
+```
+
+or `GET /git/trees/main:_posts?recursive=1` for every filename. Both
+returned the full, current set.
+
+## A failing Site Health Tests run is not always a real defect
+
+The test workflow is triggered by `workflow_run` and checks out
+`github.event.workflow_run.head_sha` — **the commit that was actually
+deployed**, not the current tip of `main`. When several commits land inside
+one deploy window, the test can check out an older tree than the one just
+committed and fail on something that is already fixed.
+
+Symptom on 2026-10-27: the run reported
+`missing og/2026-10-27-your-ai-bill-scales-with-your-success.png` for a
+commit that demonstrably contained it. The checkout was `e8d74270` (an
+older deploy); the PNG arrived in `c9e86ad1`, whose deploy was cancelled
+before it ran, and the live `og/` path only returned 200 after the *next*
+commit deployed.
+
+Before treating a red test as a broken site, check which tree the run
+actually checked out (`workflow_run.head_sha` vs `main`), and whether the
+path is live on the deployed site. `Site Health Tests` must be **green**
+before calling a publish finished — a red run here is a real signal even
+when the cause is a race.
+
+## The regional prompt fabricates to satisfy the regional framing
+
+`run-daily.py`'s ground rules already said "never invent company names,
+people, products, or national origins" and "use only organisations and facts
+present in the source material". It did not stop the model inventing. The
+regional framing puts pressure on the model to produce a local angle, and
+when the story has no local angle the model manufactures one.
+
+Three shipped on 2026-10-28, all on the same story (Survival LLM):
+
+- The EU post called the EU AI Act "currently making its way through the
+  legislative process". The Act entered into force on 1 August 2024 and
+  became applicable on 2 August 2026 — the phrasing was roughly two years
+  stale.
+- The UK post claimed "the UK's tech community is already buzzing with
+  discussions about how to build on this concept". Nothing in the source said
+  any such thing.
+- The US post explained the product's internals as "a process called model
+  distillation, where a large AI model is compressed into a smaller, more
+  efficient version". The source says the app downloads a pre-existing
+  open-weights model matched to the machine's RAM. There is no distillation.
+
+Two changes fixed the class of error rather than the three instances:
+
+- **`REGIONAL_GROUNDING`** in `run-daily.py` gives the model dated, verified
+  facts per region — the EU AI Act timeline, the UK's lack of an AI-specific
+  statute and its AISI/AI Taskforce position, the US's executive-order and
+  state-patchwork landscape. It also states the failure explicitly: never
+  describe the AI Act as "in the legislative process", "awaiting approval" or
+  "coming next year". The model was filling a blank with half-remembered
+  regulatory history; the blank is now filled with something checked.
+- **`ANTI_FABRICATION`** names the three specific failure modes that
+  shipped — claimed community sentiment, unnamed technical mechanisms, and
+  calling a project a company — plus "prefer the source's specifics over
+  generic regional filler". Forbidding "invention" in the abstract does
+  nothing; naming the shape of the invention works.
+
+Both blocks are appended to every regional prompt in `generate_post()`.
+Re-check the grounding dates when they age — they are a snapshot, not a
+live feed.
+
+The underlying lesson generalises past this pipeline: **a prompt that asks
+a model for a local angle will get one, whether or not one exists.** Supply
+the facts, or the model will.
+
+## A generator's word budget is a prompt instruction, not a constraint
+
+`run-daily.py` asks for 400-600 words and does not enforce it — there is no
+`_trim_to_words` equivalent to the one in `weekly-roundup.py`. The 2026-10-28
+posts came in at 591 (EU), 528 (UK) and 600 (US) body words after editing,
+and the 2026-10-27 set was 582/645/640. When editing a published post for
+accuracy, measure the body the same way both times (exclude the title line,
+`###` headings, `---` dividers and the `*Source:*` line) or the comparison
+is meaningless.

@@ -13,6 +13,7 @@ LLM: MiniMax only. Falls back to structured templates if key is missing.
 """
 
 import sys, os, json, datetime, urllib.request, re
+from html.parser import HTMLParser
 from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
@@ -99,6 +100,90 @@ def pick_regional_story(stories, region_hint=None):
 
 # ── Source grounding ───────────────────────────────────────────────────────
 
+class _StdlibHTMLText(HTMLParser):
+    """Minimal HTML → text extractor, used when BeautifulSoup is unavailable.
+
+    WHY (2026-10-28): the launchd jobs run under /opt/homebrew/bin/python3,
+    which has no bs4 installed. `fetch_source_excerpt` caught the ImportError
+    and returned "", so *every* source-grounded prompt that ran under launchd
+    was silently written from the headline alone — no error, no log line.
+    The stdlib parser needs no third-party package, so grounding now works
+    on every interpreter the pipeline runs under.
+    """
+
+    SKIP_TAGS = {"script", "style", "noscript", "svg", "nav", "footer", "header"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._parts = []
+        self._skip_depth = 0
+        self.description = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+        elif tag == "meta":
+            a = dict(attrs)
+            name = (a.get("name") or a.get("property") or "").lower()
+            if name in ("description", "og:description") and a.get("content"):
+                if not self.description:
+                    self.description = a["content"].strip()
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+
+    def handle_data(self, data):
+        if self._skip_depth:
+            return
+        chunk = data.strip()
+        if chunk:
+            self._parts.append(chunk)
+
+    def text(self):
+        return "\n".join(self._parts)
+
+
+def _html_to_text(raw):
+    """Return (description, body_text) for an HTML document.
+
+    Prefers BeautifulSoup when it is installed, and falls back to the
+    stdlib parser so this works under every interpreter.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        BeautifulSoup = None
+
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(raw, "lxml")
+        except Exception:
+            try:
+                soup = BeautifulSoup(raw, "html.parser")
+            except Exception:
+                soup = None
+        if soup is not None:
+            for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header"]):
+                tag.decompose()
+            desc = ""
+            for meta in soup.find_all("meta"):
+                name = (meta.get("name") or meta.get("property") or "").lower()
+                if name in ("description", "og:description"):
+                    desc = (meta.get("content") or "").strip()
+                    if desc:
+                        break
+            return desc, soup.get_text("\n")
+
+    parser = _StdlibHTMLText()
+    try:
+        parser.feed(raw)
+        parser.close()
+    except Exception:
+        return "", ""
+    return parser.description, parser.text()
+
+
 def fetch_source_excerpt(url, max_chars=6000):
     """Fetch a source page and return readable text for factual grounding.
 
@@ -122,32 +207,11 @@ def fetch_source_excerpt(url, max_chars=6000):
     except Exception:
         return ""
 
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
+    desc, body = _html_to_text(raw)
+    if not body:
         return ""
 
-    try:
-        soup = BeautifulSoup(raw, "lxml")
-    except Exception:
-        try:
-            soup = BeautifulSoup(raw, "html.parser")
-        except Exception:
-            return ""
-
-    for tag in soup(["script", "style", "noscript", "svg", "nav", "footer", "header"]):
-        tag.decompose()
-
-    # Prefer the description meta tag — it is usually a clean summary.
-    desc = ""
-    for meta in soup.find_all("meta"):
-        name = (meta.get("name") or meta.get("property") or "").lower()
-        if name in ("description", "og:description"):
-            desc = (meta.get("content") or "").strip()
-            if desc:
-                break
-
-    text = re.sub(r"[ \t]+", " ", soup.get_text("\n"))
+    text = re.sub(r"[ \t]+", " ", body)
     text = re.sub(r"\n{2,}", "\n", text).strip()
 
     if desc and desc not in text:
@@ -267,6 +331,89 @@ REGION_DESCRIPTIONS = {
     "us": "Silicon Valley AI scene, US policy, and American AI startups and research.",
 }
 
+# Verified regional context, checked against primary sources in October 2026.
+# The regional framing puts pressure on the model to produce a local angle even
+# when the story has no local angle, and it fills the gap with whatever it
+# half-remembers about that region's rules. It produced "the EU AI Act,
+# currently making its way through the legislative process" on 2026-10-28 —
+# the Act entered into force on 1 August 2024 and became applicable on
+# 2 August 2026. Handing the model dated facts removes the guesswork.
+REGIONAL_GROUNDING = {
+    "uk": """REGIONAL FACTS (verified October 2026 — use these; do not contradict them):
+- The UK has no AI-specific statute and no single AI regulator. Regulation is
+  principles-based and sector-led: existing regulators (the ICO, the IPO) apply
+  the powers they already have. Never describe a UK AI Act as law.
+- The government's stance is explicitly pro-innovation: the AI Opportunities
+  Action Plan (published 13 January 2025) frames a "proportionate, flexible
+  regulatory approach" as a source of strength.
+- The AI Security Institute (AISI) does independent pre-deployment evaluations
+  of frontier models; a Prime Minister's AI Taskforce chaired by Lord Vallance
+  reports to the PM directly. October 2026 announcements included £120m extra
+  for AISI and £60m for a Sovereign AI Fund.
+- Data protection is handled by the UK GDPR and the Data (Use and Access) Act
+  2025, enforced by the ICO.""",
+    "eu": """REGIONAL FACTS (verified October 2026 — use these; do not contradict them):
+- The EU AI Act entered into force on 1 August 2024 and BECAME APPLICABLE ON
+  2 AUGUST 2026. Enforcement powers for the AI Office and the national
+  authorities apply from that date. It is law and it is being enforced now.
+  NEVER describe it as "in the legislative process", "awaiting approval",
+  "being passed", "not yet in force" or "coming next year" — that framing
+  is roughly two years out of date.
+- The Act applies progressively: prohibitions and AI literacy since
+  2 February 2025; governance rules and general-purpose AI (GPAI) model
+  obligations since 2 August 2025; Article 50 transparency obligations since
+  2 August 2026; Annex III high-risk rules from 2 December 2027; Annex I
+  high-risk rules for systems embedded in regulated products from
+  2 August 2028.
+- The "AI Omnibus" simplification was adopted on 19 November 2025, reached
+  political agreement on 7 May 2026 and entered into force on 27 July 2026.
+- GDPR remains the data-protection law, enforced by national DPAs.""",
+    "us": """REGIONAL FACTS (verified October 2026 — use these; do not contradict them):
+- The US has no comprehensive federal AI statute. Federal policy runs through
+  executive orders and OMB memoranda binding federal agencies (M-25-21 and
+  M-25-22: Chief AI Officers, AI governance boards, published use-case
+  inventories). The NIST AI Risk Management Framework is voluntary.
+- EO 14179 (23 January 2025, "Removing Barriers to American Leadership in
+  Artificial Intelligence") revoked EO 14110 and set the deregulatory tone.
+  "Winning the Race: America's AI Action Plan" followed on 23 July 2025.
+- EO 14365 (11 December 2025) created an AI Litigation Task Force to challenge
+  state AI laws. EO 14409 (2 June 2026) set up a classified benchmark for what
+  counts as a "covered frontier model" plus a voluntary framework and a 30-day
+  pre-release window for government access.
+- The binding action is at state level: Colorado SB 26-189, California SB 53,
+  Texas TRAIGA, Connecticut SB 5, Illinois SB 315, Utah SB 149, Maryland and
+  others. Over 1,800 AI bills were introduced across 46 state legislatures as
+  of July 2026, and the Senate struck down a proposed 10-year federal
+  moratorium on state AI regulation. The accurate framing is a state
+  patchwork filling a federal gap.""",
+}
+
+# The ground rules below tell the model not to invent. They did not stop it:
+# on 2026-10-28 the UK post claimed "the UK's tech community is already buzzing
+# with discussions about how to build on this concept" (nothing in the source
+# said any such thing), and the US post explained the product's internals as
+# "model distillation" when the source says it downloads a pre-existing
+# open-weights model. Naming the specific failure modes works better than
+# forbidding "invention" in the abstract.
+ANTI_FABRICATION = """DO NOT FABRICATE (each of these has shipped on the live site):
+- Never claim a community, company, government or industry is "buzzing",
+  "racing to adopt", "discussing" or "taking note of" something unless the
+  source text says so. If you want to discuss how builders might respond,
+  frame it as an open question ("what would it take for..."), never as a
+  reported fact.
+- Never explain how a product or technology works internally unless the source
+  says so. Do not name a specific technique (distillation, RAG, fine-tuning,
+  quantisation, LoRA) unless the source text names it.
+- Never call a project a company, startup, lab or team unless the source says
+  so. If the source only gives a domain name or a code repository, say "the
+  project" — and do not invent a founder, headcount, funding round or HQ.
+- Prefer the source's specifics over generic regional filler. Numbers, model
+  names, test scores, dates and source lists from the source are what make
+  the post worth reading. If the source gives you a concrete regional hook,
+  use it instead of inventing regional colour.
+- If the source is thin on the regional angle, say plainly what is known and
+  what is not. An honest gap reads better than confident invention."""
+
 PROMPTS = {
     "uk": """Write a concise, engaging blog post analysing one significant AI development through a UK lens.
 
@@ -336,6 +483,7 @@ GROUND RULES (these matter more than the word count):
 def generate_post(region, story, llm_api_key=None):
     """Generate a regional analysis post via MiniMax, or use structured template."""
     prompt = PROMPTS[region].format(date=POST_DATE)
+    prompt += f"\n{REGIONAL_GROUNDING.get(region, '')}\n\n{ANTI_FABRICATION}\n"
     story_context = f"\nStory to analyse:\nTitle: {story['title']}\nSource: {story['url']}\nScore: {story['score']} points on HN\n"
     prompt += story_context
 
@@ -491,7 +639,7 @@ Amre and I have been tracking this one closely. {title_text} appeared on Hacker 
 
 The story: {title_text}
 
-What this means for the UK: The UK's approach to AI regulation has been cautious but increasingly active. The MHRA, DSIT, and the Frontier AI Taskforce have all been moving faster in 2026. A story like this — depending on what it actually describes — could be another data point in the UK's evolving AI strategy, or a sign that UK researchers and companies are finally breaking through at the infrastructure level.
+What this means for the UK: The UK's approach to AI regulation is principles-based and sector-led rather than statute-based — the MHRA and DSIT have both been moving faster in 2026. A story like this — depending on what it actually describes — could be another data point in the UK's evolving AI strategy, or a sign that UK researchers and companies are finally breaking through at the infrastructure level.
 
 One key question: Is this a UK company, a UK research institution, or an international story with UK implications? That determines whether this is a domestic win or an export of someone else's agenda.
 
@@ -499,7 +647,7 @@ The bottom line: The UK is positioning itself as a thoughtful AI regulator. Stor
 
             "eu": f"""EU AI Watch: {title_text}
 
-The EU AI Act is now in full enforcement mode, and every significant AI development gets filtered through Brussels. {title_text} — {story['score']} HN points — is today's candidate.
+The EU AI Act has been applicable since 2 August 2026, and every significant AI development gets filtered through Brussels. {title_text} — {story['score']} HN points — is today's candidate.
 
 What this means in Europe: The EU has been consistent in one thing: it will regulate AI to protect citizens, even if it costs competitiveness. Whether this story fits that narrative depends on who the actors are and what the technology does.
 

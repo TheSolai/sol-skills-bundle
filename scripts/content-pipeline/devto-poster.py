@@ -48,6 +48,12 @@ from devto_key import load_devto_key
 DEVTO_API_KEY = load_devto_key()
 POST_HARD_TIMEOUT = 45  # seconds — cap per POST via subprocess
 
+# How far back to look for posts that have not been cross-posted yet.
+# Measured from the post's publication date (front-matter `date:`), not from
+# the file mtime. Seven days gives catch-up headroom for a missed cron run
+# (weekend gap, machine asleep) without dragging in the archive.
+RECENT_WINDOW_DAYS = 7
+
 
 def load_tracker():
     if TRACKER_FILE.exists():
@@ -377,21 +383,63 @@ def post_to_devto(title, body, tags, description, api_key, canonical_url=""):
             pass
 
 
-def get_recent_posts(hours=20):
-    """Get Jekyll posts modified in the last N hours."""
-    cutoff = datetime.datetime.now() - datetime.timedelta(hours=hours)
+def post_publication_date(post_path):
+    """Return a post's publication date, or None if it cannot be determined.
+
+    The front-matter `date:` is authoritative. Falls back to the filename date
+    prefix, which matches front matter for every post in _posts.
+    """
+    try:
+        with open(post_path, encoding="utf-8") as f:
+            head = f.read(2048)
+        m = re.search(r"^date:\s*[\"']?(\d{4}-\d{2}-\d{2})", head, re.M)
+        if m:
+            return datetime.datetime.strptime(m.group(1), "%Y-%m-%d").date()
+    except OSError:
+        pass
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", post_path.stem)
+    return datetime.datetime.strptime(m.group(1), "%Y-%m-%d").date() if m else None
+
+
+def get_recent_posts(days=RECENT_WINDOW_DAYS):
+    """Get Jekyll posts whose *publication date* falls within the last N days.
+
+    Filtering on file mtime is unsafe. Any bulk rewrite of post front matter
+    resets every mtime in one shot — on 2026-10-25 the og:image SEO fix
+    rewrote 149 posts within the same second — which floods this queue with
+    months-old archive posts and starves the genuinely new ones. The
+    publication date survives front-matter rewrites untouched, so it is what
+    decides whether a post is new.
+    """
+    cutoff = datetime.datetime.now().date() - datetime.timedelta(days=days)
     posts_dir = SITE_DIR / "_posts"
     if not posts_dir.exists():
         return []
 
     recent = []
+    undated = 0
     for f in posts_dir.iterdir():
         if not f.suffix == ".md":
             continue
-        mtime = datetime.datetime.fromtimestamp(f.stat().st_mtime)
-        if mtime > cutoff:
+        pub = post_publication_date(f)
+        if pub is None:
+            # Fail open — a post we cannot date is still content worth posting.
+            undated += 1
             recent.append(f)
-    return sorted(recent, key=lambda p: p.stat().st_mtime, reverse=True)
+            continue
+        if pub >= cutoff:
+            recent.append(f)
+
+    if undated:
+        print(f"  ⚠️  {undated} post(s) have no readable date — including them")
+
+    # Newest publication date first; mtime only breaks ties within a day.
+    return sorted(
+        recent,
+        key=lambda p: (post_publication_date(p) or datetime.date.min,
+                       p.stat().st_mtime),
+        reverse=True,
+    )
 
 
 def _run():
@@ -408,7 +456,7 @@ def _run():
     print(f"\n[{datetime.datetime.now():%Y-%m-%d %H:%M}] dev.to auto-poster running")
     print(f"  Tracker has {len(tracker)} posts already posted")
 
-    posts = get_recent_posts(hours=48)
+    posts = get_recent_posts(days=RECENT_WINDOW_DAYS)
     if not posts:
         print("  No recent posts found. Done.")
         return
@@ -467,6 +515,29 @@ def _run():
             api_key=DEVTO_API_KEY,
             canonical_url=canonical,
         )
+
+        # dev.to rejects an article whose title was used in the last five
+        # minutes. Recurring series ("AI Bloopers: ...", "Trending: ...")
+        # reuse the same title every day, so a backlog of them collides with
+        # itself and each one gets dropped — silently, run after run. Retry
+        # once with the publication date appended so every occurrence keeps a
+        # distinct title and actually reaches dev.to.
+        if (result and result.get("__status") == "http_error"
+                and result.get("code") == 422
+                and "title" in (result.get("body") or "").lower()):
+            pub_date = post_publication_date(post_path)
+            if pub_date:
+                dated_title = f"{title} ({pub_date:%d %b %Y})"
+                print(f"  ⚠️  Title used in the last 5 min — retrying as: {dated_title}")
+                time.sleep(62)
+                result = post_to_devto(
+                    title=dated_title,
+                    body=devto_body,
+                    tags=tags,
+                    description=description,
+                    api_key=DEVTO_API_KEY,
+                    canonical_url=canonical,
+                )
 
         if result and result.get("__status") == "ok" and result.get("url"):
             tracker[slug] = {

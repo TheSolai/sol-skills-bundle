@@ -356,3 +356,103 @@ and the 2026-10-27 set was 582/645/640. When editing a published post for
 accuracy, measure the body the same way both times (exclude the title line,
 `###` headings, `---` dividers and the `*Source:*` line) or the comparison
 is meaningless.
+
+## The midweek digest was three different things from its own description
+
+The job said: fetch HN stories from the past 3 days, pick the 3 most
+significant AI stories, write brief commentary in Sol's voice. The script did
+none of the last two and only half of the first.
+
+- **No time filter.** `fetch_hn_stories()` computed a `cutoff` timestamp and
+  never used it — the digest surfaced whatever was on the front page that
+  minute while claiming to cover three days. It now uses the HN Algolia API
+  with `numericFilters=created_at_i>{cutoff}`, falling back to the Firebase
+  API with the same filter applied.
+- **No commentary.** The post was a link list — title, URL, point count.
+  There was nothing to misfire, and nothing to read. It now generates the
+  same grounded, in-voice commentary as the roundup's "Sol's Take", with a
+  deterministic fallback that still names the real stories.
+- **No archive dedupe.** It never checked whether the archive already
+  covered a story, so it could publish a second URL for a story another post
+  had already covered. On 2026-10-28 it did exactly that: the digest
+  carried `brangus.io/survival-llm` while three other posts that day
+  carried the same story. It now filters on the source URL via
+  `post_identity.published_source_urls()`.
+
+The dedupe only works if the archive can *see* the link, and it could not:
+`post_identity.source_url()` matches `*Source: [title](url)` and
+`**Source story:** [title](url)`, and the digest was writing
+`[Read →](url)`. The digest now writes the house `*Source:*` line, so its
+stories are visible to the dedupe and to `seo-health.py`.
+
+`--refresh` rewrites today's post in place — same URL, no second copy — for
+when the commentary needs regenerating. Without it the script is idempotent:
+if today's file exists it does nothing, because the 07:00 launchd job
+(`ai.sol.midweek-news`) already ran. The 08:00 cron invocation is therefore
+a guaranteed no-op, exactly like `run-daily.py`'s.
+
+## Source grounding was silently dead in every launchd run
+
+Two independent faults, each hidden by a bare `except`:
+
+1. `weekly-roundup.py` imported the source fetcher with
+   `from run_daily import fetch_source_excerpt`. The file is named
+   `run-daily.py` — with a hyphen — so that import always raised
+   `ModuleNotFoundError`, and the `except Exception` swallowed it. The
+   roundup's "Sol's Take" was written from headlines alone, with no source
+   grounding, while OPERATIONS.md described it as grounded.
+2. Even with the import fixed, `fetch_source_excerpt()` returned `""`
+   whenever BeautifulSoup was missing — and it is missing from
+   `/opt/homebrew/bin/python3`, the interpreter every launchd job uses.
+   `bs4` and `lxml` are only installed for `/usr/bin/python3` and the
+   Learnage venv.
+
+So grounding was off in production and on in a manual run — the worst
+combination, because testing under the wrong interpreter looked fine.
+
+Fixed by two changes:
+
+- **`source_fetch.py`** loads `run-daily.py` via `importlib` and is the
+  single definition of that lookup. Both the roundup and the midweek digest
+  import from it.
+- **`run-daily.py`** gained `_StdlibHTMLText`, a `html.parser` extractor used
+  when bs4 is absent, so grounding no longer depends on a package that only
+  some interpreters have. The bs4 path is unchanged and still preferred.
+
+The general lesson: `except Exception: return ""` around an import is a
+silent-failure generator. If the fallback changes the *quality* of the
+output rather than only its formatting, log it loudly.
+
+## The manifest was committed whole while its PNGs were staged one by one
+
+`publish(msg, paths=[post])` stages the OG image matching that post, plus
+`og/.manifest.json` — the whole manifest, every entry in it. So any manifest
+entry whose PNG was not tracked got committed anyway, pointing `og:image` at
+a file that was not in the repository.
+
+The instance: `sol-blog.py` publishes through the raw GitHub API and never
+runs the OG generator (see above), so
+`2026-10-28-the-exponential-time-hypothesis-is-false-probably.md` had no
+social card. Site Health Tests went red on 2026-10-28 with "1 post(s)
+without an OG image" and a 404 on the live `og:image` URL.
+
+`publish()` now also stages every PNG the manifest references that git is
+not yet tracking — one `git ls-files og/` call, not one subprocess per
+entry, because the pre-push credential scan made per-blob subprocesses
+unaffordable. The drift was exactly one file, so the repair is
+self-limiting.
+
+Note the shape of the failure: the *manifest* was correct and the *image*
+was missing, so nothing in the repo looked wrong. Compare the manifest
+against the tracked PNGs when an `og:image` 404s.
+
+## Shared helpers live in `text_utils.py`
+
+The sentence-splitting and word-trimming helpers (`split_sentences`,
+`ends_cleanly`, `trim_to_words`) started in `weekly-roundup.py` and are now
+in `text_utils.py`, imported by both the roundup and the midweek digest.
+The implementation is unchanged — only the location — and the refactor was
+checked by diffing the helpers' output before and after on the same inputs.
+
+One definition, so the two generators cannot drift apart on how a word
+budget is enforced.

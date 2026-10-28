@@ -30,6 +30,7 @@ Usage:
 """
 
 import fcntl
+import json
 import os
 import shutil
 import subprocess
@@ -213,6 +214,49 @@ def _derived_paths(cwd, content_paths):
     manifest = Path(cwd) / OG_MANIFEST
     if manifest.exists():
         out.append(str(manifest))
+    return out
+
+
+def _manifest_png_paths(cwd):
+    """OG PNGs the manifest references that git is not yet tracking.
+
+    WHY (2026-10-28): the manifest is committed wholesale, but the PNGs were
+    staged selectively — only the ones matching the caller's content paths.
+    So a post published by another job (sol-blog.py skips the OG generator
+    entirely) had its manifest entry committed while its PNG stayed
+    untracked, leaving og:image pointing at a file that is not in the repo
+    and returns 404.
+
+    One `git ls-files` call, not one per entry — the pre-push credential scan
+    taught us that per-blob subprocesses are unaffordable at this scale.
+    """
+    manifest = Path(cwd) / OG_MANIFEST
+    if not manifest.exists():
+        return []
+    try:
+        entries = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(entries, dict):
+        return []
+
+    names = [n for n in entries if n.endswith(".png")]
+    if not names:
+        return []
+
+    tracked = set()
+    r = _git(["ls-files", OG_DIR], cwd=cwd)
+    if r.returncode == 0:
+        tracked = set(r.stdout.split())
+
+    out = []
+    for name in names:
+        rel = f"{OG_DIR}/{name}"
+        if rel in tracked:
+            continue
+        png = Path(cwd) / rel
+        if png.exists():
+            out.append(png)
     return out
 
 
@@ -483,7 +527,13 @@ def publish(message, paths=None, cwd=SITE_DIR, allow_empty=False):
             content = _changed_files(cwd)
         derived = _derived_paths(cwd, content)
 
-        tmpdir, saved = _snapshot(content + _og_png_paths(cwd, content))
+        # The manifest names every OG image; commit the ones git is not yet
+        # tracking alongside it, so a committed manifest entry can never
+        # point at a PNG that is missing from the repository.
+        manifest_pngs = _manifest_png_paths(cwd)
+        derived.extend(str(p) for p in manifest_pngs)
+
+        tmpdir, saved = _snapshot(content + _og_png_paths(cwd, content) + manifest_pngs)
         try:
             created_commit = False
             remote_sha_before = ""

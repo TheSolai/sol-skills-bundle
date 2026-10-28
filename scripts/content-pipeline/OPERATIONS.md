@@ -20,6 +20,17 @@ they overlap. Check before assuming a script runs once.
 The 08:00 slot is crowded — five jobs start within the same minute, plus the
 launchd jobs at 07:00. Expect them to race on the site repo.
 
+**The cron column above is out of date (checked 2026-10-28).** The only cron
+entry left in the crontab is `sol-post-to-devto` (`30 7 * * *`). The
+`sol-daily-content` entry is gone, which is what stopped the 07:00 launchd
+job and the 08:00 cron from both running `run-daily.py` — that pair was the
+cause of the same-day regional duplicates. Everything else has moved to
+launchd: `ai.sol.quick-take` (Tue 12:30), `ai.sol.trending-topics` (09:00
+and 13:00), `ai.sol.midweek-news` (Wed 07:00), `ai.sol.more-bloopers` (Wed
+11:00), `ai.sol.case-study` (Fri 09:00), `ai.sol.bloopers-refresh` (Sun
+08:00), `ai.sol.seo-health` (daily 08:00). Re-read the crontab and
+`~/Library/LaunchAgents` before trusting this table.
+
 Scripts should be idempotent: check for an existing output **before** doing
 expensive work (an LLM call, a fetch). `weekly-roundup.py` now checks for the
 post file before building the body.
@@ -35,6 +46,50 @@ So: stage explicit paths, and check `git status` before committing. A bare
 `git add -A` sweeps in another job's half-finished deletions, and a
 `git add -A && git commit` may commit work you did not write and have not
 read.
+
+## The workspace clone can break the site's build
+
+`thesolai.github.io` is cloned twice against the same remote: once at
+`/Users/amre/Projects/thesolai.github.io` and once at
+`/Users/amre/.openclaw/workspace`. The "Daily Workspace Git Backup" job
+commits the workspace's working tree into the published repo, so **a file
+that only ever existed in the workspace can end up in the site repo and be
+built by Jekyll.**
+
+That is how `skills/devrelay-publishing/SKILL.md` reached the site on
+2026-10-28 and broke the deploy three times. It documents a tool-call
+syntax that is literally a Liquid tag:
+
+    `{% agent_session <id_or_slug> %}`
+
+Jekyll runs Liquid **before** Markdown, so a code span does not protect it,
+and the build died with `Unknown tag 'agent_session'`. A build failure
+stops the deploy of every later commit too, so one bad file froze the site
+for ~80 minutes.
+
+The rule: **anything in the site repo that has YAML front matter is a Liquid
+template.** Posts and skill files are content, not templates, so they must
+not contain unescaped tags. Two ways out, both used:
+
+  * wrap it in `{% raw %}...{% endraw %}` — the site's existing convention
+    (the 2026-06-19 blog-composer post does this), and the right choice for
+    a post that means to show the syntax; or
+  * add the path to the top-level `exclude:` list in `_config.yml` — the
+    right choice for a file that must not be edited, such as an
+    agent-facing skill file that is synced from upstream. `exclude` stops
+    Jekyll processing the path at all; `sitemap.exclude` only hides the URL
+    and is not enough.
+
+Two guards now watch for this: `seo-health.py` check [12] flags unescaped
+Liquid in published content, and check [11] verifies the newest posts are
+live. Check [11] exists because the old live check only sampled older
+posts — older posts stay reachable while a deploy is broken, so the audit
+reported "all good" over a site that had not deployed at all.
+
+One more trap in the same family: a post title carrying markdown emphasis
+(`title: "**Some Title**"`) fails the repo's front matter test, and because
+that test runs against the whole repo it blocks every later commit too.
+`analysis-deep.py` now strips emphasis from the title it extracts.
 
 ## Publishing to thesolai.github.io
 
@@ -222,6 +277,40 @@ the real stories.
 Roundup titles are dated (`The Week in AI: November 2, 2026`). They used to
 be month-only, so every roundup in a month shared one title and one meta
 description — duplicate content across 12 posts.
+
+The same month-only/recurring-title problem survived in three other
+generators, because a *recurring* series reuses one title by construction:
+`sols-take.py` wrote `Sol's Take: <Weekday>`, `quick-hits.py` wrote
+`Quick Hits: <Weekday>'s AI Briefing`, and `more-bloopers.py` wrote
+`AI Bloopers: <Weekday> Edition — The Most Absurd AI Fails This Week`.
+A weekday title repeats every week, so each of those series had already
+accumulated 12–14 identically-titled pages, all with an identical meta
+description, and the dev.to cross-posting duplicated them onto dev.to as
+well — dev.to only refuses a title reused *within five minutes*, so a daily
+recurring title sails straight through that guard.
+
+All three now append the publication date, matching the roundup convention
+(`Sol's Take: Wednesday — October 28, 2026`). The series identity is kept in
+the title; the date is what makes it unique.
+
+Two things this fix does **not** do, on purpose:
+
+- It does not rewrite the pages that already carry the old titles. The
+  roundup fix took the same approach — historical posts keep their old
+  titles, and only new posts are unique. Changing a published title after
+  indexing is its own SEO decision, not a side effect of a generator fix.
+- It does not delete the redundant files. The archive still holds a large
+  backlog of near-duplicate pages (327 redundant files across 42 repeated
+  titles as of 2026-10-28 — 102 copies of `AI Bloopers: The Most Absurd AI
+  Fails This Week` alone, from the `random.choice()` bug above, plus 25
+  copies of one trending story). Cleaning that up is a separate job: it
+  needs redirects for every removed URL, and each removal is a live-page
+  change on the site.
+
+A generator is the right place to fix this, not the poster. The poster's job
+is to publish what exists; if the archive contains a duplicate-titled file,
+the poster has no way to know it is the second one. The rule stays the one
+above — nothing writes a second URL for content that is already published.
 
 ## dev.to cross-posts
 

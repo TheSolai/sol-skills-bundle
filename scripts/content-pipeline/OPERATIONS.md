@@ -24,6 +24,18 @@ Scripts should be idempotent: check for an existing output **before** doing
 expensive work (an LLM call, a fetch). `weekly-roundup.py` now checks for the
 post file before building the body.
 
+### Never `git add -A` in this repo
+
+The bundle's working tree carries other jobs' in-flight changes. On
+2026-10-28 it held a deleted `skills/solscribe/` tree and an untracked
+`logs/`, and a parallel session committed its own work — including the
+`run-daily.py` grounding edits — mid-task.
+
+So: stage explicit paths, and check `git status` before committing. A bare
+`git add -A` sweeps in another job's half-finished deletions, and a
+`git add -A && git commit` may commit work you did not write and have not
+read.
+
 ## Publishing to thesolai.github.io
 
 All publishing goes through `site_git.publish()`. Never run a bare `git push`

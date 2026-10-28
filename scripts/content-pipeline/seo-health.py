@@ -33,6 +33,7 @@ Or: 0 8 * * * python3 scripts/content-pipeline/seo-health.py >> logs/sol-seo.log
 
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
@@ -657,6 +658,108 @@ def _sample(items, n):
 
 # ─────────────────────────── main ───────────────────────────
 
+def _excluded_paths():
+    """Top-level `exclude` entries from the site's _config.yml."""
+    cfg = SITE_DIR / "_config.yml"
+    if not cfg.exists():
+        return set()
+    excluded = set()
+    in_block = False
+    for line in cfg.read_text(encoding="utf-8").splitlines():
+        if re.match(r"^exclude:\s*$", line):
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        entry = re.match(r"^\s+-\s+(.+?)\s*$", line)
+        if entry:
+            excluded.add(entry.group(1).strip().strip('"').strip("'"))
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue  # comments and blank lines inside the block
+        in_block = False
+    return excluded
+
+
+def check_liquid_in_content():
+    """Published content must not carry unescaped Liquid tags.
+
+    Jekyll runs Liquid before Markdown, so a literal `{% ... %}` in a post or
+    a skill file raises "Unknown tag" and fails the entire build. The build
+    failure stops the site deploying, and nothing looks wrong locally — on
+    2026-10-28 a skill file holding `{% agent_session %}` held up three
+    deploys before anyone noticed. Content that means to show Liquid must
+    wrap it in {% raw %}...{% endraw %}.
+    """
+    issues = []
+    excluded = _excluded_paths()
+    targets = list((SITE_DIR / "_posts").glob("*.md")) + list(
+        (SITE_DIR / "skills").glob("*/SKILL.md")
+    )
+    for path in targets:
+        rel = str(path.relative_to(SITE_DIR))
+        if any(rel == e or rel.startswith(e.rstrip("/") + "/") for e in excluded):
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        parts = split_front_matter(text)
+        body = parts[1] if len(parts) > 1 else text
+        body = re.sub(r"{%\s*raw\s*%}.*?{%\s*endraw\s*%}", "", body, flags=re.DOTALL)
+        if re.search(r"{%\s*\w", body):
+            issues.append(
+                f"❌ {rel}: contains an unescaped Liquid tag — Jekyll will fail to build. "
+                f"Wrap it in {{% raw %}}...{{% endraw %}} or exclude it in _config.yml."
+            )
+    return issues
+
+
+def check_deploy_freshness(posts):
+    """The newest posts in the repo must be live.
+
+    The live-site check samples older posts, which stay reachable while a
+    deploy is broken — so the audit can report "all good" for hours while the
+    site serves a stale build. Checking the newest posts closes that gap.
+
+    Posts written in the last few minutes are skipped: their deploy is still
+    in flight and flagging them would be a false alarm.
+    """
+    issues = []
+    dated = [p for p in posts if re.match(r"^\d{4}-\d{2}-\d{2}-", p.name)]
+    if not dated:
+        return issues
+
+    newest_date = max(p.name[:10] for p in dated)
+    candidates = [p for p in dated if p.name[:10] == newest_date]
+
+    grace = time.time() - 15 * 60
+    fresh = [p for p in candidates if p.stat().st_mtime > grace]
+    if fresh:
+        print(f"    skipped {len(fresh)} post(s) written in the last 15 minutes (deploy may be in flight)")
+    candidates = [p for p in candidates if p.stat().st_mtime <= grace]
+    if not candidates:
+        return issues
+
+    checked = 0
+    for p in candidates:
+        url = post_url(p)
+        if not url:
+            continue
+        status, _ = fetch(f"{BASE_URL}{url}")
+        if status == -1:
+            print(f"    deploy freshness check skipped (network error)")
+            return issues
+        if status != 200:
+            issues.append(
+                f"❌ {p.name} is not live (HTTP {status}) — the site may not be deploying. "
+                f"Check the 'Build and Deploy' workflow on GitHub."
+            )
+        else:
+            checked += 1
+    if checked:
+        print(f"    {checked} post(s) from {newest_date} are live")
+    return issues
+
+
 def main():
     print(f"\n{'='*60}")
     print(f"Sol AI — SEO Health Check — {TODAY}")
@@ -716,6 +819,16 @@ def main():
     live_issues = check_live(posts)
     all_issues.extend(live_issues)
     print(f"    {'✅ All good!' if not live_issues else f'{len(live_issues)} issue(s) found'}")
+
+    print("[11] Checking that the newest post is deployed...")
+    deploy_issues = check_deploy_freshness(posts)
+    all_issues.extend(deploy_issues)
+    print(f"    {'✅ All good!' if not deploy_issues else f'{len(deploy_issues)} issue(s) found'}")
+
+    print("[12] Checking published content for unescaped Liquid...")
+    liquid_issues = check_liquid_in_content()
+    all_issues.extend(liquid_issues)
+    print(f"    {'✅ All good!' if not liquid_issues else f'{len(liquid_issues)} issue(s) found'}")
 
     print(f"\n{'─'*60}")
     if not all_issues:

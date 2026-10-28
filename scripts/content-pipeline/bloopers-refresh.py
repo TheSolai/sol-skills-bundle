@@ -275,6 +275,11 @@ def count_cards(content):
     return content.count('<div class="blooper-card')
 
 
+def existing_titles(content):
+    """Titles already published on the page."""
+    return set(re.findall(r'<h3 class="blooper-title">(.*?)</h3>', content, re.DOTALL))
+
+
 def commit_and_push(message):
     """Commit changes in thesolai.github.io and push to origin."""
     if not SITE_DIR.exists():
@@ -305,6 +310,14 @@ def main():
     now = datetime.datetime.now()
     print(f"\n[{now:%Y-%m-%d %H:%M}] bloopers-refresh running")
 
+    # Read current bloopers.html first — the dedupe below needs to know what
+    # is already on the page.
+    if not BLOOPERS_FILE.exists():
+        print(f"  ❌ bloopers.html not found at {BLOOPERS_FILE}")
+        return
+    with open(BLOOPERS_FILE, encoding="utf-8") as f:
+        content = f.read()
+
     queue = load_queue()
     # Filter out already-added (committed) entries
     available = [b for b in queue if not b.get("_added")]
@@ -312,15 +325,22 @@ def main():
         print("  No bloopers in queue. Falling back to CURATED_BLOOPERS list.")
         available = list(CURATED_BLOOPERS)
 
+    # Never publish a blooper that is already on the page, whichever source it
+    # came from. The curated fallback has no _added flag of its own, so without
+    # this check it re-published its first entry on every run (15 copies of
+    # "The Git Commit That Rewrote History" by 2026-10-28).
+    published = existing_titles(content)
+    fresh = [b for b in available if b.get("title") not in published]
+    if len(fresh) != len(available):
+        print(f"  ℹ️  Skipping {len(available) - len(fresh)} blooper(s) already on the page.")
+    available = fresh
+    if not available:
+        print("  ⚠️  Every blooper available to this run is already published — nothing to add.")
+        print("      Add new ones to _data/bloopers-queue.json to resume this series.")
+        return
+
     to_add = available[:count_arg]
     print(f"  {len(to_add)} blooper(s) to add")
-
-    # Read current bloopers.html
-    if not BLOOPERS_FILE.exists():
-        print(f"  ❌ bloopers.html not found at {BLOOPERS_FILE}")
-        return
-    with open(BLOOPERS_FILE, encoding="utf-8") as f:
-        content = f.read()
 
     current_count = count_cards(content)
     print(f"  Current blooper count: {current_count}")

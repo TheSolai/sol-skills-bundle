@@ -351,6 +351,13 @@ def generate_analysis_post():
         title = topic
         body = result.strip()
 
+    # Strip markdown emphasis from the title. A title of "**Some Title**" is
+    # rejected by the site's front matter test ("stray '**' in title"), which
+    # fails the whole Pages deploy — and because the test runs against the
+    # whole repo, it blocks every later commit too.
+    title = re.sub(r"^(\*{1,2}|_{1,2})(.+?)\1$", r"\2", title).strip()
+    title = title.replace("**", "").replace("__", "").strip()
+
     # Strip leading "TL;DR" / "## TL;DR" if present (we add our own in template)
     body = body.replace("## TL;DR", "## TL;DR", 1)
 

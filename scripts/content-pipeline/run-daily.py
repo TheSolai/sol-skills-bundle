@@ -972,7 +972,7 @@ def main():
 
     print(f"\n{'='*60}")
     print("Pipeline complete!")
-    print(f"Generated: {len(generated_posts)} regional posts + 1 bloopers post")
+    print(f"Generated: {len(generated_posts)} regional posts + {1 if bloopers_written else 0} bloopers post")
     print(f"{'='*60}\n")
 
 

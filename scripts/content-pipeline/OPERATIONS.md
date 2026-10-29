@@ -595,3 +595,69 @@ checked by diffing the helpers' output before and after on the same inputs.
 
 One definition, so the two generators cannot drift apart on how a word
 budget is enforced.
+
+## A description that exists is not a description that works
+
+The SEO health check had two gaps that hid the same defect.
+
+The **local** front-matter pass asked only whether `description:` was
+present. `description: "Update"` is present. It is also a six-character
+search snippet and a six-character link preview, and the layout writes it
+straight into `<meta name="description">` with no length floor.
+
+The **live** pass was the one that could have caught it — it fetches the
+rendered page and tests the real `<meta>` tag — but it only samples
+twelve posts out of 1,238, evenly spread by index. A dozen samples out
+of 1,238 finds the defects that happen to sit at the sample points.
+
+Together: seven posts had descriptions too short to be usable, and the
+daily report named one of them. The other six were real and shipped.
+
+Fixed on 2026-10-29:
+
+- the local pass now checks every post's description length against
+  `MIN_DESCRIPTION_LENGTH` (20), the same line the live test uses, so the
+  two checks cannot disagree;
+- the live sample stays a spot-check, not the primary check — the local
+  pass sees all 1,238.
+
+A field being present is not a field being usable. Check the value, not
+the key.
+
+## The prompt's metadata block gets echoed into the body
+
+The regional prompts hand the model a spec block:
+
+```
+Title format: "UK AI Weekly: [compelling headline]"
+Date: {date}
+Tags: ai, uk, analysis, policy
+Image: /images/sol-avatar.png
+```
+
+The model sometimes treats that as part of its answer and writes it into
+the post body. It ships as visible text at the top of the article — raw
+front matter, a stray date, an avatar image — and the front matter it
+duplicates also renders a second `<h1>`.
+
+130 published posts carried it, in several shapes: fenced by `---`, fenced
+at the front only, or not fenced at all. The daily report never saw it,
+because the check looked for a `Tags:` line in the first or last few lines
+of the body, and the block was often four lines down.
+
+Two fixes, and both are needed:
+
+- the prompt now says not to write the Date, Tags or Image lines;
+- `strip_metadata_echo()` in `run-daily.py` removes the echo before the
+  body is written, matching the metadata run by content rather than by
+  one fixed layout.
+
+The prompt change alone is not the fix. A prompt is a request; this has
+to hold whatever the model returns. The stripping is what makes it true.
+
+**Still open:** 361 posts repeat their title as the first line of the
+body. The layout already renders `<h1>{{ page.title }}</h1>`, so 147 of
+them have two `<h1>` elements and 173 repeat the title as a bold
+paragraph. The fix is mechanical (drop the first body line when it
+normalises to the title) but it touches 361 files, so it needs a
+decision, not a cron run.

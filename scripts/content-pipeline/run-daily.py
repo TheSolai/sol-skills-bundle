@@ -430,6 +430,7 @@ Requirements:
 - End with a one-sentence takeaway
 - Do NOT use bullet points
 - Do NOT be generic — this is a specific story, not a summary
+- Do NOT write the Date, Tags or Image lines into your answer — the pipeline sets those. Output only the title line and the article body
 
 GROUND RULES (these matter more than the word count):
 - The story below may NOT be British. If it is not, write about how it lands in the UK — who here is building on it, what UK regulators would make of it, what it means for UK readers. Do NOT claim it originated in the UK.
@@ -451,6 +452,7 @@ Requirements:
 - Include a "What this means" section
 - End with a one-sentence takeaway
 - Do NOT use bullet points
+- Do NOT write the Date, Tags or Image lines into your answer — the pipeline sets those. Output only the title line and the article body
 
 GROUND RULES (these matter more than the word count):
 - The story below may NOT be European. If it is not, write about how it lands in Europe — how the AI Act, GDPR, or Brussels would treat it, and what European companies should take from it. Do NOT claim it originated in the EU.
@@ -472,6 +474,7 @@ Requirements:
 - Include a "What this means" section
 - End with a one-sentence takeaway
 - Do NOT use bullet points
+- Do NOT write the Date, Tags or Image lines into your answer — the pipeline sets those. Output only the title line and the article body
 
 GROUND RULES (these matter more than the word count):
 - The story below may NOT be American. If it is not, write about how it lands in the US — Silicon Valley's likely response, US policy, what American builders should take from it. Do NOT claim it originated in the US.
@@ -626,8 +629,100 @@ def find_duplicate_post(region, hn_url, date_str=None):
     return None
 
 
+# A metadata line the model echoed instead of leaving in the front matter.
+# The regional prompt gives the model a spec block (Title format / Date /
+# Tags / Image) and the model sometimes writes that block into its answer.
+_ECHO_KEY = re.compile(
+    r"^\s*\*{0,2}\s*(?:title|description|tags|layout|category|author"
+    r"|image|hero_image)\s*:",
+    re.IGNORECASE,
+)
+_ECHO_AUX = re.compile(
+    r"^\s*(?:"
+    r"\*{1,2}(?:\w+\s+\d{1,2},\s+\d{4}|\d{4}-\d{2}-\d{2})\*{1,2}\s*$"  # July 03, 2026
+    r"|!\[[^\]]*\]\([^)]*\)"                                        # ![Sol AI Avatar](…)
+    r"|\*{0,2}\s*date\s*:"
+    r")",
+    re.IGNORECASE,
+)
+
+# Stray metadata that trails the end of an article.
+_TRAILING_ECHO = re.compile(
+    r"^\s*\*{0,2}\s*(?:tags|layout|category)\s*:.*$", re.IGNORECASE
+)
+
+
+def strip_metadata_echo(content):
+    """Remove a metadata block the model echoed into the article body.
+
+    The prompt tells the model the post's Date, Tags and Image. Sometimes
+    it writes that spec into its answer instead of just writing the
+    article, and the block ships as visible text at the top of the post —
+    raw front matter, a stray date, an avatar image. 30 published posts
+    carry it.
+
+    The prompt is not the fix: a prompt is a request, and this needs to
+    hold whatever the model returns. So the echo is removed here, where
+    the content is known to be good.
+
+    The model writes the block in several shapes — fenced by `---`, fenced
+    at the front only, or not fenced at all — so the block is found by
+    looking for a run of metadata lines near the top rather than by
+    matching one fixed layout. A run is only removed when it contains a
+    real metadata key, so a `Date:` line in prose is left alone.
+
+    The title line is never part of a run: it is prose, not metadata.
+    """
+    if not content:
+        return content
+
+    lines = content.split("\n")
+
+    # A run of metadata near the top of the body.
+    start = None
+    for i in range(min(8, len(lines))):
+        if _ECHO_KEY.match(lines[i]) or _ECHO_AUX.match(lines[i]):
+            start = i
+            break
+    if start is not None:
+        end = start
+        while end < len(lines):
+            ln = lines[end]
+            if (
+                not ln.strip()
+                or ln.strip() == "---"
+                or _ECHO_KEY.match(ln)
+                or _ECHO_AUX.match(ln)
+            ):
+                end += 1
+            else:
+                break
+        region = lines[start:end]
+        if any(_ECHO_KEY.match(ln) for ln in region):
+            # If the run was a `---` fenced block, the opening fence goes too.
+            if (
+                region
+                and region[-1].strip() == "---"
+                and start > 0
+                and lines[start - 1].strip() == "---"
+            ):
+                start -= 1
+            del lines[start:end]
+
+    # Stray metadata at the very end.
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and _TRAILING_ECHO.match(lines[-1]):
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+    return "\n".join(lines).strip() + "\n"
+
+
 def build_jekyll_post(region, content, story, title=None):
     """Build a Jekyll-formatted blog post from content."""
+    content = strip_metadata_echo(content)
     # If content is None/empty, generate a structured fallback
     if not content or len(content) < 100:
         title_text = story['title']

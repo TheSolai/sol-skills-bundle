@@ -50,6 +50,11 @@ USER_AGENT = "SolAI-SEO-Health/2.0"
 
 TODAY = date.today().isoformat()
 
+# The live check below accepts a description of 20 characters or more
+# (`content="[^"]{20,}"`). Keep the local pass on exactly the same line so
+# the two never disagree about what counts as a usable description.
+MIN_DESCRIPTION_LENGTH = 20
+
 FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
 
 
@@ -157,8 +162,20 @@ def check_blog_posts():
 
         if not field(fm, "title"):
             issues.append(f"❌ {slug}: Missing title")
-        if not field(fm, "description"):
+        description = field(fm, "description")
+        if not description:
             issues.append(f"❌ {slug}: Missing description")
+        elif len(description) < MIN_DESCRIPTION_LENGTH:
+            # A description that exists is not a description that works. The
+            # layout writes it straight into <meta name="description">, so a
+            # 6-character placeholder ships as a 6-character search snippet.
+            # The live check below only samples a dozen posts, so this local
+            # pass is the one that has to see every post.
+            issues.append(
+                f"❌ {slug}: meta description too short "
+                f"({len(description)} chars, minimum {MIN_DESCRIPTION_LENGTH}) "
+                f"— {description!r}"
+            )
         if "hero_image:" not in fm and "image:" not in fm:
             issues.append(f"❌ {slug}: Missing hero_image")
         if not re.search(r"^layout:\s*post\s*$", fm, re.MULTILINE):
@@ -174,6 +191,53 @@ def check_blog_posts():
             )
 
     return issues, {p: post_body(p) for p in posts}
+
+
+# A metadata line the generator echoed into the body instead of leaving in
+# the front matter. It renders as visible italic text at the end of the
+# article, so readers see "Tags: ai, uk, analysis, policy" on the page.
+BODY_ARTIFACT_RE = re.compile(
+    r"^\*?\s*(?:Tags|Layout|Category)\s*:\s*.+?\*?\s*$", re.IGNORECASE
+)
+
+
+def check_body_artifacts(posts):
+    """Catch generator metadata echoed into a post body.
+
+    The regional prompts hand the model a metadata block (Title format /
+    Date / Tags / Image) and the model sometimes repeats it in its answer.
+    The generator now strips it, but posts published before the fix still
+    carry it, and a future prompt edit could bring it back.
+
+    Two shapes occur, so both ends of the body are inspected:
+
+    - regional series — the whole block is echoed at the *top* of the
+      body, between `---` rules, with a `*Tags: ...*` line inside it;
+    - hand-written series — a stray `*Tags: ...*` / `*Layout: post*`
+      pair trails the *end* of the body.
+
+    A `Tags:` line in the middle of an article is far more likely to be
+    prose or a code sample than an artefact, so the middle is not read.
+
+    This reads the raw body on purpose. `post_body()` is the
+    duplicate-detection normaliser — it lowercases, collapses every line
+    into one, and strips markdown markers, which hides the artefact.
+    """
+    issues = []
+    for post in posts:
+        text = post.read_text(encoding="utf-8", errors="replace")
+        _, body = split_front_matter(text)
+        lines = [ln.rstrip() for ln in body.strip().splitlines()]
+        non_empty = [ln for ln in lines if ln.strip()]
+        window = non_empty[:6] + non_empty[-6:]
+        for line in window:
+            if BODY_ARTIFACT_RE.match(line):
+                issues.append(
+                    f"❌ {post.name}: body carries generator metadata "
+                    f"— {line.strip()!r}"
+                )
+                break
+    return issues
 
 
 def check_og_images(posts):
@@ -815,17 +879,22 @@ def main():
     all_issues.extend(link_issues)
     print(f"    {'✅ All good!' if not link_issues else f'{len(link_issues)} issue(s) found'}")
 
-    print("[10] Checking the live site...")
+    print("[10] Checking post bodies for generator metadata...")
+    artifact_issues = check_body_artifacts(posts)
+    all_issues.extend(artifact_issues)
+    print(f"    {'✅ All good!' if not artifact_issues else f'{len(artifact_issues)} issue(s) found'}")
+
+    print("[11] Checking the live site...")
     live_issues = check_live(posts)
     all_issues.extend(live_issues)
     print(f"    {'✅ All good!' if not live_issues else f'{len(live_issues)} issue(s) found'}")
 
-    print("[11] Checking that the newest post is deployed...")
+    print("[12] Checking that the newest post is deployed...")
     deploy_issues = check_deploy_freshness(posts)
     all_issues.extend(deploy_issues)
     print(f"    {'✅ All good!' if not deploy_issues else f'{len(deploy_issues)} issue(s) found'}")
 
-    print("[12] Checking published content for unescaped Liquid...")
+    print("[13] Checking published content for unescaped Liquid...")
     liquid_issues = check_liquid_in_content()
     all_issues.extend(liquid_issues)
     print(f"    {'✅ All good!' if not liquid_issues else f'{len(liquid_issues)} issue(s) found'}")

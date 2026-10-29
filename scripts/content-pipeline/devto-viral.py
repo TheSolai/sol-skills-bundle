@@ -19,6 +19,7 @@ Or: 0 9 * * * python3 scripts/content-pipeline/devto-viral.py >> logs/sol-devto-
 from __future__ import annotations
 
 import sys, os, json, re, datetime, urllib.request, urllib.parse
+from collections import Counter
 from pathlib import Path
 import subprocess
 import time
@@ -26,6 +27,7 @@ import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from devto_key import load_devto_key
 from _minimax_helper import minimax_generate, load_minimax_key
+from post_identity import body_signature
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 SITE_BASE_URL = "https://thesolai.github.io"
@@ -307,6 +309,10 @@ def mine_trends() -> list:
             "read_time": a.get("reading_time_minutes", 1),
             "user": a.get("user", {}).get("name", "unknown"),
             "tag_list": a.get("tag_list", []),
+            # Keep the description: without article context the comment
+            # generator has nothing concrete to react to and falls back to
+            # generic filler ("Great post! It's fascinating how...").
+            "description": a.get("description", "") or "",
             "published": a.get("published_at", ""),
             "mined_at": DATE_STR,
         })
@@ -397,6 +403,26 @@ SOL_POSTS = [
     },
 ]
 
+# Tags that appear on nearly every dev.to AI post. They match every Sol post
+# equally, so they carry no signal when choosing which article to link.
+GENERIC_TAGS = {"ai", "webdev", "beginners", "programming", "tutorial",
+                "opensource", "showdev", "general", "web", "software"}
+
+# dev.to and Sol use different words for the same topic. Normalise so a
+# post tagged "programming" can match a Sol article tagged "coding".
+TAG_SYNONYMS = {
+    "programming": "coding",
+    "code": "coding",
+    "architecture": "engineering",
+    "devops": "engineering",
+    "systemdesign": "engineering",
+    "deepdive": "analysis",
+    "deepdives": "analysis",
+    "security": "privacy",
+    "productivity": "tooling",
+    "tooling": "tooling",
+}
+
 COMMENT_TEMPLATES = {
     "ai": "Hey — Sol wrote about this from the perspective of someone who actually lives with AI tools every day. Might be worth a read if you're thinking about the human side of this: {url}",
     "coding": "For what it's worth, Sol tackled something related to this from an AI collaboration angle. Worth a look if you're into the practical side: {url}",
@@ -423,6 +449,17 @@ def generate_comment(target_post: dict, sol_post: dict) -> str:
 - Naturally mention Sol's related post
 - Be conversational, not spammy
 - Add something small but real to the discussion
+
+Ground it in the article: react to a specific detail from the title or
+description below — a number, a tool, a failure mode, a decision the author
+made. Do not write a generic compliment that would fit any article.
+
+BANNED openers (these make the comment read like filler):
+- "Great post!" / "Great article!" / "Great insights!"
+- "Really enjoyed this..." / "Really interesting..."
+- "It's fascinating how..." / "It's amazing how..."
+
+Vary how you open. Start from the substance of what the author actually did.
 
 Do NOT write anything that sounds like marketing. Be a person, not an ad.
 
@@ -469,6 +506,39 @@ def find_posts_to_advertise() -> list:
     return candidates[:5]
 
 
+def pick_sol_post(post_tags: list[str], usage: Counter) -> dict:
+    """Choose which Sol article to link for a given dev.to post.
+
+    Scoring matters here: the previous first-match-wins loop broke on the
+    first Sol post sharing ANY tag. Because "ai" is on essentially every
+    dev.to post and on the first Sol post, that always returned the same
+    article — all 30 logged ad opportunities pointed at one URL.
+
+    Now: score by how many meaningful tags overlap, prefer a specific tag
+    match over a generic one, and rotate through Sol's articles so no single
+    post carries every link.
+
+    `usage` counts how often each article has already been advertised, so
+    the least-used article wins when relevance is otherwise equal.
+    """
+    normalized = {TAG_SYNONYMS.get(t.lower(), t.lower()) for t in post_tags}
+
+    def score(sp: dict) -> tuple[int, int]:
+        sol_tags = {TAG_SYNONYMS.get(t.lower(), t.lower()) for t in sp["tags"]}
+        overlap = normalized & sol_tags
+        # Specific matches beat generic ones.
+        specific = len(overlap - GENERIC_TAGS)
+        return (specific, len(overlap))
+
+    ranked = sorted(SOL_POSTS, key=score, reverse=True)
+    best_score = score(ranked[0])
+
+    # Among equally relevant articles, use the one advertised least so far.
+    candidates = [sp for sp in ranked if score(sp) == best_score]
+    candidates.sort(key=lambda sp: (usage.get(sp["url"], 0),))
+    return candidates[0]
+
+
 def advertise():
     """Comment on relevant dev.to posts with links to Sol's content."""
     print("[devto-viral] Advertising on dev.to...")
@@ -477,6 +547,11 @@ def advertise():
         advertised = []
 
     already_advertised = {a.get("url", a.get("post_url", "")) for a in advertised if isinstance(a, dict)}
+    # How often each Sol article has already been advertised — drives rotation.
+    usage: Counter = Counter(
+        a.get("sol_post_url", "") for a in advertised
+        if isinstance(a, dict) and a.get("sol_post_url")
+    )
     posts = find_posts_to_advertise()
     new_ads = []
 
@@ -484,16 +559,8 @@ def advertise():
         if post["url"] in already_advertised:
             continue
 
-        # Pick a Sol post relevant to this tag
-        post_tags = set(post["tag_list"])
-        sol_post = None
-        for sp in SOL_POSTS:
-            sp_tags = set(sp["tags"])
-            if sp_tags & post_tags:
-                sol_post = sp
-                break
-        if not sol_post:
-            sol_post = SOL_POSTS[0]  # Default to first
+        sol_post = pick_sol_post(post.get("tag_list") or [], usage)
+        usage[sol_post["url"]] += 1
 
         comment = generate_comment(post, sol_post)
         print(f"[devto-viral] Would comment on: {post['title'][:50]}")
@@ -540,6 +607,26 @@ def get_unposted_blog_posts() -> list:
         return []
 
     unposted = []
+    # Body signatures of posts already published to dev.to.
+    #
+    # WHY: the trending generator used to re-emit the same story under a new
+    # date every day, so one HN story became 25 dated files with identical
+    # bodies. The tracker dedupes on canonical URL, and every dated file has a
+    # different canonical, so all of them passed the check and were published
+    # to dev.to — 14 separate URLs for one article. Comparing the body text
+    # catches that case, which a URL check cannot.
+    posted_signatures = set()
+    for md in posts_dir.glob("*.md"):
+        if md.stem in posted_slugs:
+            try:
+                posted_signatures.add(body_signature(md.read_text(encoding="utf-8")))
+            except OSError:
+                continue
+
+    # Signatures already seen: posted ones, plus any picked up from this run
+    # so two copies of the same body are never both queued.
+    seen_signatures = set(posted_signatures)
+
     for md in sorted(posts_dir.glob("*.md"), reverse=True):
         content = md.read_text(encoding="utf-8")
 
@@ -569,6 +656,13 @@ def get_unposted_blog_posts() -> list:
             any(can in content for can in specific_canonicals)):
             continue
 
+        # Skip a post whose body duplicates one already published to dev.to.
+        # The newest dated copy wins (files are walked newest-first), so the
+        # live site keeps the freshest version and dev.to gets one URL.
+        signature = body_signature(content)
+        if signature in seen_signatures:
+            continue
+
         # Skip quick-hits and tool-spotlight for dev.to (too short)
         if "quick-hits" in md.name or "tool-spotlight" in md.name:
             continue
@@ -589,6 +683,7 @@ def get_unposted_blog_posts() -> list:
             "tags": fm.get("tags", "ai").replace("[", "").replace("]", "").split(","),
             "description": fm.get("description", ""),
         })
+        seen_signatures.add(signature)
 
     return unposted[:MAX_POSTS_PER_RUN]
 

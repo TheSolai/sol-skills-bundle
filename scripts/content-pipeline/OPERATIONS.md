@@ -335,6 +335,46 @@ Two things decide *which* posts get posted, and both were bugs first:
   after run, with only a cheerful "will retry next run". A collision is now
   retried once with the publication date appended, e.g. `… (12 Oct 2026)`.
 
+## `devto-viral.py` had four silent defects (fixed 2026-10-29)
+
+The daily viral engine ran for weeks reporting success while doing almost
+nothing useful. All four were found by reading its own output rather than
+its exit code, and none of them raised an error.
+
+- **Every ad opportunity linked the same Sol article.** The selection loop
+  broke on the first Sol post sharing *any* tag, and "ai" is on nearly every
+  dev.to post and on the first Sol post — so it always won. All 30 logged
+  opportunities pointed at one URL. Selection now scores meaningful tag
+  overlap, discounts generic tags, and prefers the least-used article so
+  the link rotates across Sol's posts.
+
+- **Comments were formulaic filler.** The prompt permitted a generic
+  compliment, so the model wrote "Great post! It's fascinating how…" for
+  every post. The prompt now asks for a specific detail from the article
+  and bans the recurring openers. The miner also dropped the dev.to
+  `description` when caching trends, leaving the generator no article
+  context at all; that field is now kept.
+
+- **One story was cross-posted to dev.to 14 times under different slugs.**
+  The trending generator re-emitted one story under a new date each day, so
+  the tracker — which dedupes on canonical URL — saw 25 distinct URLs for
+  identical bodies. Cross-posting now compares body signatures, so only the
+  freshest copy of a story reaches dev.to. A URL check cannot catch this:
+  every dated copy has a different canonical.
+
+- **The trends cache froze on the day it filled up.** The merge built the
+  list from the existing entries and appended this run's new trends at the
+  end, then truncated with `merged[:50]`. Once the cache held 50 entries,
+  every new trend was appended past the cut and discarded — the file stopped
+  changing on 2026-10-11 while each run still logged "Trending: 20 new".
+  Newly mined trends now lead the list, so the 50 kept are the 50 most
+  recent.
+
+The general lesson: **a count in the log is not proof the work happened.**
+"Trending: 20 new" was printed by a run that wrote nothing, and "5 new ad
+opportunities" was printed by a run that linked the same article five times.
+Read the file the run wrote.
+
 ## Posts published with `sol-blog.py` skip the OG image generator
 
 `/Users/amre/.mavis/agents/general/workspace/sol-blog.py` publishes through

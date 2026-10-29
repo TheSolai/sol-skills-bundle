@@ -320,15 +320,18 @@ def mine_trends() -> list:
     existing = load_json(TRENDS_FILE)
     if isinstance(existing, dict):
         existing = existing.get("trends", [])
-    # Dedupe by URL, keep 50 most recent
+    # Dedupe by URL, keep the 50 most recent.
+    #
+    # Newest first: this run's freshly mined trends are the most recent, so
+    # they must lead the list. The old order built the list from the existing
+    # entries and appended the new ones at the END, then truncated with
+    # merged[:50] — which discarded every new trend once the cache held 50
+    # entries. The file stopped changing on 2026-10-11 and every run since
+    # reported "20 new" while writing nothing.
     seen = set()
     merged = []
-    for t in reversed(existing):
+    for t in list(new_trends) + list(reversed(existing)):
         if t.get("url") not in seen:
-            seen.add(t.get("url"))
-            merged.append(t)
-    for t in new_trends:
-        if t["url"] not in seen:
             seen.add(t["url"])
             merged.append(t)
     merged = merged[:50]

@@ -411,6 +411,36 @@ path is live on the deployed site. `Site Health Tests` must be **green**
 before calling a publish finished — a red run here is a real signal even
 when the cause is a race.
 
+## A green Site Health Tests run may not have tested your commit
+
+The test fires on **deploy completion**, not on commit. A commit has no test
+of its own until *its* deploy finishes, and the tree the test checks out is
+the triggering deploy's `head_sha` — which can be an entirely older commit.
+
+The trap is that `gh run view <id> --json headSha` does **not** report that
+ref. On 2026-10-29 it reported `b7df2253` for a run whose Checkout step used
+`ref: 4c5bb679`. Read as "the broken commit passed its test", that is the
+wrong conclusion by a whole commit.
+
+The only reliable way to know which tree a run tested is the Checkout step
+in the run log:
+
+```
+gh run view <run-id> --log | grep -m1 "ref:"
+```
+
+So **a green run does not prove the tip is healthy**. To check a commit:
+wait for its deploy to complete, then find the test run whose Checkout
+`ref:` equals that commit — not the most recent test run.
+
+The converse bit on 2026-10-29: the `sol-blog.py` commit `b7df2253` shipped
+a post with no OG image, and the test that passed at 08:03 had checked out
+the *previous* commit. The test for `b7df2253` only fired at 08:05, once its
+deploy landed, and failed with `1 post(s) without an OG image` — the exact
+defect described above. The repair is the one in "Posts published with
+`sol-blog.py` skip the OG image generator"; the fix landed as `4252ae7a`
+and the gate went green on the next deploy.
+
 ## The regional prompt fabricates to satisfy the regional framing
 
 `run-daily.py`'s ground rules already said "never invent company names,

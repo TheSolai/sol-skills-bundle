@@ -22,7 +22,7 @@ from post_identity import body_signature, published_signatures
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle")
-TODAY = datetime.datetime.utcnow()
+TODAY = datetime.datetime.now(datetime.timezone.utc)
 DATE_STR = TODAY.strftime("%Y-%m-%d")
 POST_DATE = TODAY.strftime("%B %d, %Y")
 MINIMAX_KEY_PATH = Path.home() / ".openclaw" / "workspace" / "secrets" / "minimax-key.txt"

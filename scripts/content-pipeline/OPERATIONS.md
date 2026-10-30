@@ -167,6 +167,60 @@ the file and **still exits 0**, so the next `git add -A` commits the markers
 into the repository. `ensure_main()` no longer does this, and `publish()`
 refuses to commit anything carrying conflict markers.
 
+### A draft in `_posts/` used to wedge every publish
+
+On 2026-10-30 the weekday briefing failed to publish with:
+
+```
+post published without its OG image: clawhub-guide-2026-06-28.png, ... — social cards would 404
+```
+
+Eleven `clawhub-guide-*.md` files had been dropped into `_posts/` with the
+date at the **end** of the filename (`clawhub-guide-2026-06-28.md`) and, in
+ten of the eleven cases, no front matter. They were byte-identical copies of
+drafts in the workspace clone's `blog/content/` holding area — the place a
+timed-out content job leaves work it never got to publish.
+
+Two facts collided:
+
+- the OG generator only renders posts it can parse — a file needs front
+  matter — so it skipped these eleven and never wrote their PNGs
+- the publish-time guard checked *every* Markdown file under `_posts/`
+
+So the guard demanded images no generator would ever write, and every
+publish failed from that point on. The briefing itself was fine; it was
+just the fourth file in the change set.
+
+The guard now agrees with the generator: a file only has to ship an OG image
+if Jekyll will actually render it as a post, which means a `YYYY-MM-DD-`
+name prefix **and** front matter. Everything else in `_posts/` is a draft
+that should be in `blog-posts/` (excluded from the build) or the workspace's
+`blog/content/`. If a publish fails this way again, the error message names
+the offending files and says why they are not renderable as posts.
+
+## The site repo and the workspace repo are two clones of one remote
+
+`/Users/amre/Projects/thesolai.github.io` and `/Users/amre/.openclaw/workspace`
+both carry `https://github.com/TheSolai/thesolai.github.io.git` as `origin`.
+The "Daily Workspace Git Backup" cron commits the workspace clone's working
+directories into the published repo, which is why `blog-ideas/`, `blog-posts/`,
+`scripts/`, `logs/` and `memory/` need an `exclude:` entry in `_config.yml`.
+
+Because both clones push, their histories can drift apart — the site clone
+was rewritten at least twice (see the `backup/pre-rebase-*` branches) and by
+2026-10-30 the two sides sat 1219/1221 commits apart with **identical
+trees**. `publish()` reconciles with `git rebase origin/main`, and that
+rebase replays the duplicate commits: they conflict with their own
+counterparts on every renamed file (rename/rename, rename/delete) and it
+cannot converge.
+
+**Do not rebase to reconcile a rewritten pair of clones.** Compare the trees
+instead — `git diff --name-status origin/main HEAD` — and publish the
+difference as a single fast-forward commit on top of `origin/main`. That
+keeps whatever the other clone published (`who-pays-for-the-ai-buildout.md`,
+the zlib-kindle script fixes) and adds only what is missing. A force-push
+would delete the other clone's work; a rebase fights itself.
+
 ## Content generation
 
 `minimax_generate()` in `_minimax_helper.py` takes an optional `model=`.

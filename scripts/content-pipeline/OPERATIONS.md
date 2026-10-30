@@ -755,3 +755,63 @@ them have two `<h1>` elements and 173 repeat the title as a bold
 paragraph. The fix is mechanical (drop the first body line when it
 normalises to the title) but it touches 361 files, so it needs a
 decision, not a cron run.
+
+## `tool-spotlight.py` pasted an unrelated dev.to article into every review (fixed 2026-10-30)
+
+The weekly spotlight wants a line of social proof, so it fetches a dev.to
+article about the tool it is reviewing and asks the model to mention it.
+The fetch never worked.
+
+**The dev.to `/api/articles` endpoint has no text-search parameter.** A `q`
+param is silently ignored — there is no error, no empty result, just the
+same list back. Verified on 2026-10-30: `?q=Claude%20Code`, `?q=Cursor`
+and no query at all returned byte-identical five-article lists. The old
+code sent `q` and took `articles[0]`, which meant every single spotlight
+pasted in whatever AI-tagged article happened to be newest that minute,
+and the prompt then told the model to mention it. The model obligingly
+shoehorned it in:
+
+| post | spotlighted tool | dev.to article it cited |
+|---|---|---|
+| 2026-10-30 | Claude Code | "Ghost in the Shell: Can a Log File Hijack an AI?" |
+| 2026-09-11 | MiniMax | "AI Is Already Better at Coding Than Most Software Developers" |
+| 2026-08-14 | MiniMax | "I Stopped Trusting AI Agents With Tools. So I Built a Gatekeeper." |
+
+The 2026-10-30 post is the clearest example: a Claude Code review that ends
+with a paragraph about log files hijacking an AI. Factually it is fine, and
+it is exactly the kind of tangential filler that reads like padding.
+
+**The lesson is the general one:** a query param that the endpoint ignores
+is indistinguishable from a filter that matched nothing. Nothing in the log
+said "no results" — it said "dev.to: '…' — 45 reactions", which looks like
+a successful match. When a filter is supposed to narrow a result set,
+change it and check the results actually change. A filter that cannot make
+a difference is not a filter.
+
+**The fix:** filter client-side. Pull the 30 most recent `ai`-tagged
+articles and keep only ones whose title or description mentions the tool,
+matched on word boundaries against a per-tool term list (`TOOL_SEARCH_TERMS`,
+with "claude code" preferred over a loose "claude"). When nothing matches,
+the dev.to sentence is dropped entirely rather than filled with something
+else. A missing paragraph beats a wrong one.
+
+After the fix, Claude Code correctly matches *"A trojanized Claude Code
+extension plants an SSH backdoor: the 7-point audit for your machine"*, and
+the other seven tools in the rotation correctly get no dev.to line at all.
+
+**Still open on this script** — both predate the fix above:
+
+- **The prompt asks for the metadata echo.** The rating, tagline and
+  verdict are passed in as body instructions, so every post opens with
+  `**Title: …**`, `**Rating: …**` and `**Tagline:**` as visible text. This
+  is a different cause from the regional spec-block echo described above:
+  there the model copied a block it should have ignored, here the prompt
+  tells it to write the lines. The 2026-10-30 post has all four, and the
+  title line duplicates the front-matter title that the layout already
+  renders as `<h1>`.
+- **The word budget is still unenforced.** The prompt asks for 350-500
+  words. The 2026-10-30 post came in at 581 body words, 550 of them prose
+  once the four metadata-echo lines are excluded — measured the way
+  `run-daily.py` is measured above, so the numbers are comparable. There is
+  still no `_trim_to_words` equivalent in this script.
+

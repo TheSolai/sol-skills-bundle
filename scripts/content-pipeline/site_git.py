@@ -32,6 +32,7 @@ Usage:
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -195,7 +196,48 @@ def _og_png_for(cwd, post_path):
         return None
     if rel.parts[0] != "_posts":
         return None
+    if not _is_renderable_post(p):
+        return None
     return Path(cwd) / OG_DIR / (p.stem + ".png")
+
+
+# The same front-matter rule the OG generator uses. Kept identical so the
+# generator and the publish-time guard always agree on what a post is.
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
+
+# Jekyll only treats a file in `_posts/` as a post when the name starts with
+# a date prefix. `clawhub-guide-2026-06-28.md` is not a post.
+JEKYLL_POST_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
+
+
+def _is_renderable_post(path):
+    """True when Jekyll will render this file as a post.
+
+    Two conditions, and both matter:
+
+      * the filename starts with a `YYYY-MM-DD-` prefix — Jekyll only
+        treats a file in `_posts/` as a post when it does
+      * the file carries front matter — without it there is no layout,
+        so there is no `og:image` and no social card that could 404
+
+    A file failing either test is not a post and must not be allowed to
+    demand an OG image. Demanding one used to wedge every publish: a
+    stray draft dropped into `_posts/` made the publish-time guard fail
+    for good, because the OG generator skips exactly those same files
+    for exactly the same reason. The guard asked for an image that no
+    generator would ever write, so the pipeline could not recover.
+
+    The drafts belong in `blog-posts/` (excluded from the build) or the
+    workspace's `blog/content/` holding area.
+    """
+    p = Path(path)
+    if not JEKYLL_POST_NAME_RE.match(p.name):
+        return False
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return FRONTMATTER_RE.match(text) is not None
 
 
 def _og_png_paths(cwd, content_paths):
@@ -482,7 +524,15 @@ def _verify_og_images(cwd, content_paths):
     silent miss into a loud one.
     """
     missing = []
+    stray = []
     for p in content_paths:
+        pp = Path(p)
+        try:
+            rel_post = pp.relative_to(Path(cwd))
+        except ValueError:
+            continue
+        if rel_post.parts[0] == "_posts" and not _is_renderable_post(pp):
+            stray.append(rel_post.name)
         og = _og_png_for(cwd, p)
         if og is None:
             continue
@@ -494,11 +544,18 @@ def _verify_og_images(cwd, content_paths):
         if r.returncode != 0:
             missing.append(rel.name)
     if missing:
-        raise PublishError(
+        detail = (
             "post published without its OG image: "
             + ", ".join(missing[:5])
             + " — social cards would 404"
         )
+        if stray:
+            detail += (
+                ". Also in _posts/ but not renderable as posts (no front matter"
+                " or no YYYY-MM-DD- name prefix), so no OG image is generated"
+                " for them: " + ", ".join(stray[:5])
+            )
+        raise PublishError(detail)
 
 
 def publish(message, paths=None, cwd=SITE_DIR, allow_empty=False):

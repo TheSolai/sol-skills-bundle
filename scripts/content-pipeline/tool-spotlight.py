@@ -8,7 +8,7 @@ Cronsetup: launchd StartCalendarInterval Friday 08:00
 Or: 0 8 * * 5 python3 scripts/content-pipeline/tool-spotlight.py >> logs/sol-tool-spotlight.log 2>&1
 """
 
-import sys, os, json, datetime, urllib.request
+import sys, os, json, datetime, urllib.request, re
 from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
@@ -138,22 +138,62 @@ def pick_tool() -> dict:
     return TOOLS[idx]
 
 
+# Search terms per tool, in priority order. The first term that matches an
+# article wins, so "claude code" is preferred over a loose "claude".
+TOOL_SEARCH_TERMS = {
+    "Claude Code": ["claude code", "claude"],
+    "OpenClaw": ["openclaw", "open claw"],
+    "MiniMax": ["minimax"],
+    "Cursor": ["cursor"],
+    "Warp": ["warp"],
+    "dev.to API": ["dev.to", "devto"],
+    "Hacker News API": ["hacker news"],
+    "GitHub Actions": ["github actions"],
+}
+
+
+def _mentions(text: str, term: str) -> bool:
+    """True when `text` mentions `term` as a whole word or phrase."""
+    pattern = r"\b" + re.escape(term).replace(r"\ ", r"\s+") + r"\b"
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
 def fetch_devto_reactions(tool_name: str) -> dict:
-    """Check dev.to for posts about this tool."""
+    """Find a dev.to article that actually mentions this tool.
+
+    WHY THIS IS FILTERED CLIENT-SIDE: the dev.to `/api/articles` endpoint has
+    no text-search parameter. A `q` param is silently ignored — `?q=Claude
+    Code` and `?q=Cursor` return byte-identical lists, and so does no query
+    at all. The old code sent `q` and took `articles[0]`, which meant every
+    spotlight pasted in whatever AI-tagged article happened to be newest,
+    then asked the model to shoehorn it into the review. The 2026-10-30
+    Claude Code post opened with a dev.to thread about log files hijacking
+    an AI; the 2026-08-14 MiniMax post cited "I Stopped Trusting AI Agents
+    With Tools. So I Built a Gatekeeper."
+
+    Now we pull the recent `ai` articles and keep only ones whose title or
+    description actually mentions the tool. No genuine match means no dev.to
+    sentence — a missing paragraph is better than a wrong one.
+    """
     try:
-        query = tool_name.replace(" ", "%20")
-        url = f"https://dev.to/api/articles?tag=ai&per_page=5&q={query}"
+        url = "https://dev.to/api/articles?tag=ai&per_page=30"
         req = urllib.request.Request(url, headers={"User-Agent": "SolAI/1.0"})
         with urllib.request.urlopen(req, timeout=10) as r:
             articles = json.loads(r.read())
-        if articles:
-            top = articles[0]
-            return {
-                "title": top["title"],
-                "reactions": top.get("public_reactions_count", 0),
-                "comments": top.get("comments_count", 0),
-                "url": top["url"],
-            }
+
+        terms = TOOL_SEARCH_TERMS.get(tool_name, [tool_name])
+        for term in terms:
+            for art in articles:
+                haystack = f"{art.get('title', '')} {art.get('description', '')}"
+                if _mentions(haystack, term):
+                    print(f"[tool-spotlight] dev.to match on '{term}': {art['title']}")
+                    return {
+                        "title": art["title"],
+                        "reactions": art.get("public_reactions_count", 0),
+                        "comments": art.get("comments_count", 0),
+                        "url": art["url"],
+                    }
+        print(f"[tool-spotlight] no dev.to article mentions {tool_name} — skipping that line")
     except Exception as e:
         print(f"[tool-spotlight] dev.to check failed: {e}")
     return {}

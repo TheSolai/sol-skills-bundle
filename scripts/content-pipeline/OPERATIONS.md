@@ -815,3 +815,85 @@ the other seven tools in the rotation correctly get no dev.to line at all.
   `run-daily.py` is measured above, so the numbers are comparable. There is
   still no `_trim_to_words` equivalent in this script.
 
+## The SEO audit never looked at the metadata a crawler reads first (2026-10-30)
+
+`seo-health.py` compared post **bodies** for duplicates and checked that a
+description **existed**, but it never checked that the title or the
+description was **unique**. Two posts with different bodies but the same
+`<title>`, `<h1>` and `<meta name="description">` are one page to a search
+engine, and the audit reported them as fine.
+
+The state on 2026-10-30:
+
+- 246 posts shared a title with another post and had no canonical
+- 249 posts shared a meta description with another post and had no canonical
+- the worst description was on 87 posts: `"Sol's opinion on today's AI landscape."`
+- the worst title was on 102 posts: `"AI Bloopers: The Most Absurd AI Fails This Week"`
+
+The duplicate-*content* check had counted source-story families and called
+them healthy because a canonical pointed at the original. That is the right
+rule for a body, and the wrong rule for a title: a canonical tells Google
+which URL to keep, so a consolidated group is one page. But a group where
+two or more members carry **no** canonical is two pages claiming to be the
+same thing.
+
+**The audit now checks both**, and a group is only an error when two or more
+members lack a canonical. A consolidated group is reported as a note, the
+same way the regional-series case already was. This was check [5], inserted
+where it belongs rather than appended, and the later steps renumbered to
+match.
+
+**The cause is in the generators, not the posts.** Every recurring series
+publishes from a fixed template:
+
+| series | posts | generator |
+|---|---|---|
+| AI Bloopers | 102 | `run-daily.py` |
+| Sol's Take | 87 | `sols-take.py` |
+| Quick Hits | 59 | `quick-hits.py` |
+| AI Digest | 22 | `midweek-news.py` |
+| The Week in AI | 12/month | `weekly-roundup.py` |
+| Trending | 23 | `trending-topics.py` |
+| Tool Spotlight | 5 | `tool-spotlight.py` |
+
+The fix belongs in the generator, because a backfill of 500 descriptions
+would be undone by the next publish. `sols-take.py`, `quick-hits.py` and
+`more-bloopers.py` already append the post date to the title and the
+description; `run-daily.py` (the AI Bloopers series — the largest group) does
+not, and `midweek-news.py` still writes one fixed description. `weekly-
+roundup.py` uses a month-level date, so every roundup in a month shares a
+title and a description.
+
+## The SEO audit reported drafts in `_posts/` as broken posts (2026-10-30)
+
+The 08:00 run reported three `clawhub-guide-*.md` files as republications
+carrying no canonical, and the live check reported three of the day's own
+posts as `HTTP 404 — the site may not be deploying`. By 10:00 both were
+gone and the site was fully deployed.
+
+Both were the same transient state: the timed-out content job leaves drafts
+in `_posts/`, and the 07:00 publish moves them. At 08:00 the audit sampled
+the tree mid-publish.
+
+- the drafts are **not posts**. `site_git.publish()` was fixed earlier the
+  same morning to agree with the OG generator about what a post is (see
+  above), but `seo-health.py` had its own, looser idea of the word
+- today's posts were published but the GitHub Actions deploy had not
+  finished yet. The deploy routinely takes more than the hour between the
+  07:00 publish and the 08:00 check
+
+The audit now applies the same rule the publish guard uses: a file in
+`_posts/` is a post only if its name carries a `YYYY-MM-DD-` prefix **and**
+it has front matter. Everything else is listed as a note and excluded from
+every post-level check. Verified against the old script with the same two
+drafts in place — it reported `No frontmatter` and `missing og/…png` for
+files Jekyll never publishes.
+
+**Still open:** the audit is scheduled at 08:00, one hour after the 07:00
+publish. The deploy regularly takes longer than that, so the "not live"
+false alarm will return on any day the publish runs long. Moving the check
+to 10:00 would put it clear of both the publish and the deploy.
+
+**Also open:** `scripts/content-pipeline/logs/sol-seo-health.log` is 29 MB
+over 789 runs and `logs/sol-seo.log` is 1.8 MB over 84 runs. Neither is
+rotated.

@@ -57,6 +57,10 @@ MIN_DESCRIPTION_LENGTH = 20
 
 FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
 
+# Jekyll only treats a file in `_posts/` as a post when its name starts with
+# a date prefix. `clawhub-guide-2026-07-05.md` is a draft, not a post.
+JEKYLL_POST_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
+
 
 # ─────────────────────────── helpers ───────────────────────────
 
@@ -109,6 +113,32 @@ def head_status(url, timeout=15):
         return -1
 
 
+def is_renderable_post(path):
+    """True when Jekyll will actually publish this file as a post.
+
+    Two conditions, both required:
+
+      * the filename starts with a `YYYY-MM-DD-` prefix — Jekyll ignores
+        any other name in `_posts/`
+      * the file carries front matter — without it there is no layout,
+        so no URL, no `<title>` and no social card
+
+    A file failing either test is not a post. It is a draft parked in the
+    wrong directory, and it has no URL to check. `site_git.publish()` uses
+    the same rule to decide which files may demand an OG image; this
+    audit has to agree with it, or the two disagree about what a post is.
+
+    Without this filter the audit flagged `clawhub-guide-*.md` drafts as
+    republications carrying no canonical — a file Jekyll never publishes
+    cannot be a republication of anything.
+    """
+    if not JEKYLL_POST_NAME_RE.match(path.name):
+        return False
+    text = path.read_text(encoding="utf-8", errors="replace")
+    fm, _ = split_front_matter(text)
+    return bool(fm.strip())
+
+
 def post_url(path):
     """The URL Jekyll gives a post: /blog/<front matter date>/<filename slug>/.
 
@@ -144,7 +174,14 @@ def post_body(path):
 
 def check_blog_posts():
     """Per-post front matter completeness. No author check — the layout
-    hardcodes it. No duplicate-title check — recurring series reuse titles."""
+    hardcodes it. Duplicate titles are checked separately, by
+    `check_duplicate_metadata`.
+
+    Only files Jekyll will actually publish are examined for
+    completeness. A draft parked in `_posts/` without a date prefix or
+    front matter is not a post, so a missing `description` in it is not a
+    missing description in the site.
+    """
     issues = []
     posts_dir = SITE_DIR / "_posts"
     if not posts_dir.exists():
@@ -155,6 +192,17 @@ def check_blog_posts():
         slug = post_file.name
         content = post_file.read_text(encoding="utf-8", errors="replace")
         fm, body = split_front_matter(content)
+
+        # A filename that does not start with a date is silently ignored by
+        # Jekyll — the post never gets published. That is worth saying, but
+        # it is a draft in the wrong directory, not a broken post.
+        if not JEKYLL_POST_NAME_RE.match(post_file.stem):
+            issues.append(
+                f"⚠️  {slug}: Filename must start with YYYY-MM-DD — "
+                f"Jekyll silently skips posts without a date prefix, so this "
+                f"file is not published at all"
+            )
+            continue
 
         if not fm:
             issues.append(f"❌ {slug}: No frontmatter")
@@ -182,13 +230,6 @@ def check_blog_posts():
             issues.append(f"❌ {slug}: Missing 'layout: post'")
         if len(body) < 100:
             issues.append(f"⚠️  {slug}: Very short body ({len(body)} chars)")
-        # A filename that does not start with a date is silently ignored by
-        # Jekyll — the post never gets published.
-        if not re.match(r"^\d{4}-\d{2}-\d{2}-", post_file.stem):
-            issues.append(
-                f"❌ {slug}: Filename must start with YYYY-MM-DD — "
-                f"Jekyll silently skips posts without a date prefix"
-            )
 
     return issues, {p: post_body(p) for p in posts}
 
@@ -930,7 +971,20 @@ def main():
 
     all_issues = []
     posts_dir = SITE_DIR / "_posts"
-    posts = sorted(posts_dir.glob("*.md")) if posts_dir.exists() else []
+    all_files = sorted(posts_dir.glob("*.md")) if posts_dir.exists() else []
+    # Jekyll only publishes a file in `_posts/` when its name carries a date
+    # prefix and it has front matter. Anything else is a draft parked in the
+    # wrong directory: it has no URL, so no post-level check applies to it.
+    posts = [p for p in all_files if is_renderable_post(p)]
+    strays = [p for p in all_files if not is_renderable_post(p)]
+    if strays:
+        print(
+            f"    ℹ️  {len(strays)} file(s) in _posts/ are not renderable as posts "
+            f"(no YYYY-MM-DD- name prefix or no front matter) and are excluded "
+            f"from every post-level check: "
+            f"{', '.join(p.name for p in strays[:5])}"
+            + (f" ... and {len(strays) - 5} more" if len(strays) > 5 else "")
+        )
 
     print("[1] Checking blog post front matter...")
     post_issues, bodies = check_blog_posts()

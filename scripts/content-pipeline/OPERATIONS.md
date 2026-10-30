@@ -889,10 +889,15 @@ every post-level check. Verified against the old script with the same two
 drafts in place — it reported `No frontmatter` and `missing og/…png` for
 files Jekyll never publishes.
 
-**Still open:** the audit is scheduled at 08:00, one hour after the 07:00
-publish. The deploy regularly takes longer than that, so the "not live"
-false alarm will return on any day the publish runs long. Moving the check
-to 10:00 would put it clear of both the publish and the deploy.
+**Resolved 2026-10-30 — the audit now runs at 10:00.** It was scheduled at
+08:00, one hour after the 07:00 publish, which is too tight. The daily
+content job commits at 08:00-08:01 on a normal day, so the check was firing
+in the same minute the publish finished, and the deploy that followed took
+longer than the gap. When the publish slipped — as it did on 2026-10-30,
+when a stray draft wedged it and the posts committed at 08:17 — the check
+read the gap as a broken site. Moving it to 10:00 puts it clear of the
+publish and the deploy; the plist is backed up beside it as
+`ai.sol.seo-health.plist.bak-*`.
 
 **Also open:** `scripts/content-pipeline/logs/sol-seo-health.log` is 29 MB
 over 789 runs and `logs/sol-seo.log` is 1.8 MB over 84 runs. Neither is

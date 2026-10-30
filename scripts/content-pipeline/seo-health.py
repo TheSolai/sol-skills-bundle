@@ -484,6 +484,105 @@ def check_duplicate_content(posts):
     return issues, notes
 
 
+def check_duplicate_metadata(posts):
+    """Titles and meta descriptions must be unique per post.
+
+    `check_duplicate_content` compares BODIES. It never looks at the
+    metadata a search engine reads first — the <title>, the <h1> and the
+    <meta name="description">. Two posts with different bodies but the
+    same title and description are, to a crawler, the same page.
+
+    A group is NOT an error when a canonical consolidates it: if every
+    member but one carries a `canonical:` pointing elsewhere, the group
+    is one page as far as Google is concerned and the shared metadata
+    never appears in a SERP. The error is a group where two or more
+    members have no canonical — those are competing pages with
+    identical titles and descriptions.
+
+    The recurring series (AI Bloopers, Sol's Take, Quick Hits, the week
+    in AI) publish on a fixed template, so a shared description is the
+    normal state of a series unless the generator varies it. The fix
+    belongs in the generator, not in a backfill.
+    """
+    issues = []
+    notes = []
+
+    titles = defaultdict(list)
+    descriptions = defaultdict(list)
+    for p in posts:
+        text = p.read_text(encoding="utf-8", errors="replace")
+        fm, _ = split_front_matter(text)
+        title = field(fm, "title").strip()
+        description = field(fm, "description").strip()
+        canonical = field(fm, "canonical").strip()
+        if title:
+            titles[title].append((p, canonical))
+        if description:
+            descriptions[description].append((p, canonical))
+
+    def offenders(groups):
+        """Groups whose members are not consolidated by a canonical."""
+        out = []
+        for value, members in groups.items():
+            if len(members) < 2:
+                continue
+            unconsolidated = [p for p, canonical in members if not canonical]
+            if len(unconsolidated) > 1:
+                out.append((value, len(members), len(unconsolidated), unconsolidated))
+        return sorted(out, key=lambda r: -r[2])
+
+    title_offenders = offenders(titles)
+    desc_offenders = offenders(descriptions)
+
+    if title_offenders:
+        total = sum(n for _, _, n, _ in title_offenders)
+        issues.append(
+            f"❌ {total} post(s) share a title with another post and have no "
+            f"canonical to consolidate them — search engines cannot tell "
+            f"them apart ({len(title_offenders)} group(s))"
+        )
+        for value, total_in_group, unconsolidated, members in title_offenders[:8]:
+            names = ", ".join(p.name for p in members[:3])
+            issues.append(
+                f"   ❌ title shared by {total_in_group} posts, "
+                f"{unconsolidated} without canonical: {value[:60]!r} "
+                f"(e.g. {names})"
+            )
+        if len(title_offenders) > 8:
+            issues.append(
+                f"   ❌ ... and {len(title_offenders) - 8} more shared-title group(s)"
+            )
+
+    if desc_offenders:
+        total = sum(n for _, _, n, _ in desc_offenders)
+        issues.append(
+            f"❌ {total} post(s) share a meta description with another post "
+            f"and have no canonical to consolidate them ({len(desc_offenders)} group(s))"
+        )
+        for value, total_in_group, unconsolidated, members in desc_offenders[:8]:
+            names = ", ".join(p.name for p in members[:3])
+            issues.append(
+                f"   ❌ description shared by {total_in_group} posts, "
+                f"{unconsolidated} without canonical: {value[:60]!r} "
+                f"(e.g. {names})"
+            )
+        if len(desc_offenders) > 8:
+            issues.append(
+                f"   ❌ ... and {len(desc_offenders) - 8} more shared-description group(s)"
+            )
+
+    consolidated_titles = sum(
+        len(m) for m in titles.values() if len(m) > 1
+    ) - sum(t for _, _, t, _ in title_offenders)
+    if consolidated_titles > 0:
+        notes.append(
+            f"ℹ️  {consolidated_titles} post(s) share a title with another post "
+            f"but carry a canonical, so the duplicates are consolidated"
+        )
+
+    return issues, notes
+
+
 def check_seo_files():
     """robots.txt, favicon and leftover verification files."""
     issues = []
@@ -854,47 +953,54 @@ def main():
         print(f"    {note}")
     print(f"    {'✅ All good!' if not dupe_issues else f'{len(dupe_issues)} issue(s) found'}")
 
-    print("[5] Checking SEO infrastructure...")
+    print("[5] Checking for duplicate titles and meta descriptions...")
+    meta_issues, meta_notes = check_duplicate_metadata(posts)
+    all_issues.extend(meta_issues)
+    for note in meta_notes:
+        print(f"    {note}")
+    print(f"    {'✅ All good!' if not meta_issues else f'{len(meta_issues)} issue(s) found'}")
+
+    print("[6] Checking SEO infrastructure...")
     infra_issues = check_seo_files()
     all_issues.extend(infra_issues)
     print(f"    {'✅ All good!' if not infra_issues else f'{len(infra_issues)} issue(s) found'}")
 
-    print("[6] Checking skills...")
+    print("[7] Checking skills...")
     skill_issues = check_skills()
     all_issues.extend(skill_issues)
     print(f"    {'✅ All good!' if not skill_issues else f'{len(skill_issues)} issue(s) found'}")
 
-    print("[7] Checking nav consistency...")
+    print("[8] Checking nav consistency...")
     nav_issues = check_nav_consistency()
     all_issues.extend(nav_issues)
     print(f"    {'✅ All good!' if not nav_issues else f'{len(nav_issues)} issue(s) found'}")
 
-    print("[8] Checking comic-ui.css inclusion...")
+    print("[9] Checking comic-ui.css inclusion...")
     ui_issues = check_comic_ui()
     all_issues.extend(ui_issues)
     print(f"    {'✅ All good!' if not ui_issues else f'{len(ui_issues)} issue(s) found'}")
 
-    print("[9] Checking internal links...")
+    print("[10] Checking internal links...")
     link_issues = check_internal_links()
     all_issues.extend(link_issues)
     print(f"    {'✅ All good!' if not link_issues else f'{len(link_issues)} issue(s) found'}")
 
-    print("[10] Checking post bodies for generator metadata...")
+    print("[11] Checking post bodies for generator metadata...")
     artifact_issues = check_body_artifacts(posts)
     all_issues.extend(artifact_issues)
     print(f"    {'✅ All good!' if not artifact_issues else f'{len(artifact_issues)} issue(s) found'}")
 
-    print("[11] Checking the live site...")
+    print("[12] Checking the live site...")
     live_issues = check_live(posts)
     all_issues.extend(live_issues)
     print(f"    {'✅ All good!' if not live_issues else f'{len(live_issues)} issue(s) found'}")
 
-    print("[12] Checking that the newest post is deployed...")
+    print("[13] Checking that the newest post is deployed...")
     deploy_issues = check_deploy_freshness(posts)
     all_issues.extend(deploy_issues)
     print(f"    {'✅ All good!' if not deploy_issues else f'{len(deploy_issues)} issue(s) found'}")
 
-    print("[13] Checking published content for unescaped Liquid...")
+    print("[14] Checking published content for unescaped Liquid...")
     liquid_issues = check_liquid_in_content()
     all_issues.extend(liquid_issues)
     print(f"    {'✅ All good!' if not liquid_issues else f'{len(liquid_issues)} issue(s) found'}")

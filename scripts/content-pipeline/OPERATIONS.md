@@ -1071,3 +1071,26 @@ to fabricate. Grounding is not a prompt instruction; it is what the research
 step actually fetched. And any pipeline that writes prose containing quotes
 should verify those quotes against the source before publishing, not after a
 reader notices.
+
+### Dating every series' title broke the deep dive's rotation (2026-10-31)
+
+A side effect of "Every generator now dates its metadata" above. That fix
+appends "(October 31, 2026)" to the deep dive's `title`, so the stored title
+no longer equals the topic text in `TOPICS`.
+
+`pick_topic()` matched published titles to topics with exact equality, so
+every dated post silently dropped out of the rotation. The 2026-10-31 post was
+published, then looked unpublished — and the next run would have written the
+same topic a second time. All 14 published posts now match, and the next run
+correctly reaches "The synthetic data problem", which had never been
+published.
+
+`_match_topic_index()` matches on prefix instead, so it tolerates the date
+suffix and anything appended later. The lesson is general: a rotation keyed
+on exact title strings breaks the moment anything appends to those strings,
+and it breaks silently — the run still succeeds, it just repeats itself.
+
+**Both fixes in this commit are worth checking against the other rotating
+series.** `quick-hits.py`, `sols-take.py`, `more-bloopers.py` and the rest now
+also date their titles, so anything that keys on an exact title needs the same
+prefix treatment.

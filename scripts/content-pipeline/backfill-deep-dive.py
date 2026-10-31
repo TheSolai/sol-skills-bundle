@@ -46,22 +46,21 @@ def resolve_topic(date_str: str, arg: str | None):
     if arg is not None and arg.isdigit():
         return wdd.TOPICS[int(arg)]
     if arg:
-        for t in wdd.TOPICS:
-            if wdd._norm(t["topic"]) == wdd._norm(arg):
-                return t
+        i = wdd._match_topic_index(arg)
+        if i is not None:
+            return wdd.TOPICS[i]
         print(f"[backfill] no topic matches: {arg}")
         sys.exit(1)
     title = existing_title(date_str)
     if not title:
         print(f"[backfill] no existing post for {date_str} — pass a topic index")
         sys.exit(1)
-    # The stored title carries "(October 31, 2026)" — strip that before matching.
-    cleaned = title.split(" (")[0]
-    for t in wdd.TOPICS:
-        if wdd._norm(t["topic"]) == wdd._norm(cleaned):
-            return t
-    print(f"[backfill] no topic matches existing title: {title}")
-    sys.exit(1)
+    # The stored title carries "(October 31, 2026)" — the matcher tolerates it.
+    i = wdd._match_topic_index(title)
+    if i is None:
+        print(f"[backfill] no topic matches existing title: {title}")
+        sys.exit(1)
+    return wdd.TOPICS[i]
 
 
 def main():

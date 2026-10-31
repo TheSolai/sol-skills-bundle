@@ -395,6 +395,24 @@ def _norm(s: str) -> str:
     return "".join(ch for ch in s.lower() if ch.isalnum() or ch.isspace()).strip()
 
 
+def _match_topic_index(title: str) -> int | None:
+    """Which topic in the bank a published post's title belongs to.
+
+    Matching is by prefix, not equality. Since 2026-10-31 every series
+    dates its title ("... (October 31, 2026)"), so the stored title no
+    longer equals the topic text. An exact match silently dropped those
+    posts from the rotation and the same topic came round twice.
+    """
+    n = _norm(title)
+    if not n:
+        return None
+    for i, t in enumerate(TOPICS):
+        tn = _norm(t["topic"])
+        if n == tn or n.startswith(tn):
+            return i
+    return None
+
+
 def _published_deep_dive_titles() -> list:
     """Titles of this script's own posts already on disk, oldest first.
 
@@ -437,11 +455,9 @@ def pick_topic() -> dict:
     # Which topic indices have been published, in date order.
     used = []
     for _, _, title in published:
-        n = _norm(title)
-        for i, tn in enumerate(norm_topics):
-            if n == tn:
-                used.append(i)
-                break
+        i = _match_topic_index(title)
+        if i is not None:
+            used.append(i)
 
     if used:
         start = (used[-1] + 1) % len(TOPICS)

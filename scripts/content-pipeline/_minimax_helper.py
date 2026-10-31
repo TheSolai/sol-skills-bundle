@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import urllib.request
@@ -112,6 +113,26 @@ def load_minimax_key() -> str:
         return MINIMAX_KEY_PATH.read_text().strip()
     except Exception:
         return ""
+
+
+def load_minimax_key_candidates() -> list:
+    """Every known MiniMax key, most-preferred first.
+
+    The MINIMAX_API_KEY env var and the secrets file can drift apart: a key
+    gets rotated in one place but not the other, and the stale one answers
+    401 "invalid api key". Callers must try each candidate in turn instead of
+    trusting whichever comes first — on 2026-10-31 the env var was a dead key
+    while the file still held the live one, which silently degraded every
+    MiniMax call in the pipeline to a template fallback.
+    """
+    keys = []
+    env = os.environ.get("MINIMAX_API_KEY", "").strip()
+    if env:
+        keys.append(env)
+    file_key = load_minimax_key()
+    if file_key and file_key not in keys:
+        keys.append(file_key)
+    return keys
 
 
 def minimax_generate(prompt: str, api_key: str, max_tokens: int = 600, system: str = "",

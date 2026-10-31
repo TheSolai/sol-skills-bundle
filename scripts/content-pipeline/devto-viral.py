@@ -26,7 +26,7 @@ import time
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from devto_key import load_devto_key
-from _minimax_helper import minimax_generate, load_minimax_key
+from _minimax_helper import minimax_generate, load_minimax_key, load_minimax_key_candidates
 from post_identity import body_signature
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
@@ -72,39 +72,31 @@ def _load_minimax_key() -> str:
 
 
 def llm_generate(prompt: str, system: str = "", max_tokens: int = 800) -> str:
-    """Generate text via MiniMax, or return None for template fallback."""
-    key = _load_minimax_key()
-    if not key:
+    """Generate text via MiniMax, or return None for template fallback.
+
+    Delegates to the shared _minimax_helper so retries, thinking-block
+    stripping and key handling live in one place. Every known key is tried in
+    turn: a stale env var answers 401 "invalid api key", which used to fail
+    every call and silently downgrade every post to the template fallback.
+    """
+    candidates = load_minimax_key_candidates()
+    if not candidates:
         print("[llm] MiniMax key not found")
         return None
-    messages = [{"role": "user", "content": system + "\n\n" + prompt}] if system else [{"role": "user", "content": prompt}]
-    body = json.dumps({
-        "model": "MiniMax-Text-01",
-        "max_tokens": min(max_tokens, 8192),
-        "temperature": 0.7,
-        "messages": messages,
-    }).encode()
-    try:
-        req = urllib.request.Request(
-            "https://api.minimax.io/anthropic/v1/messages",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "anthropic-version": "2023-06-01",
-                "x-api-key": key,
-            },
-            method="POST"
+    for key in candidates:
+        text = minimax_generate(
+            prompt,
+            api_key=key,
+            max_tokens=max_tokens,
+            system=system,
+            temperature=0.7,
+            timeout=180,
+            retries=3,
         )
-        with urllib.request.urlopen(req, timeout=90) as r:
-            resp = json.loads(r.read())
-            for block in resp.get("content", []):
-                if block.get("type") == "text":
-                    text = block["text"].strip()
-                    if text:
-                        print("[llm] ✅ Generated via MiniMax")
-                        return text
-    except Exception as e:
-        print(f"[llm] MiniMax error: {e}")
+        if text:
+            print("[llm] ✅ Generated via MiniMax")
+            return text
+        print(f"[llm] MiniMax key rejected ({key[:6]}…) — trying next candidate")
     print("[llm] No LLM available")
     return None
 

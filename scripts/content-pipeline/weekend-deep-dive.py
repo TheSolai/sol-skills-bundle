@@ -57,6 +57,17 @@ POST_DATE = TODAY.strftime("%B %d, %Y")
 SAT_STR = TODAY.strftime("%A, %B %d, %Y")
 
 
+def _yaml(value: str) -> str:
+    """Quote a string for use as a YAML double-quoted scalar.
+
+    Topics and descriptions contain apostrophes, em dashes and quotes, which
+    would otherwise produce unparseable front matter.
+    """
+    v = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    v = v.replace("\n", " ").replace("\r", " ").strip()
+    return f'"{v}"'
+
+
 def _load_minimax_key() -> str:
     try:
         return MINIMAX_KEY_PATH.read_text().strip()
@@ -464,13 +475,16 @@ def create_post(body: str, topic: dict) -> Path:
     post_path = SITE_DIR / "_posts" / filename
 
     tags_str = "[" + ", ".join(topic["tags"]) + "]"
+    # The episode date belongs in the title and description. The topic bank
+    # cycles, so without it the same topic recurs under identical metadata.
+    post_date = f"{TODAY.strftime('%B')} {TODAY.day}, {TODAY.year}"
     frontmatter = f"""---
 layout: post
-title: "{topic['topic']}"
+title: {_yaml(f"{topic['topic']} ({post_date})")}
 date: {DATE_STR} 09:00:00 +0000
 tags: {tags_str}
 author: Sol
-description: "{topic['description']}"
+description: {_yaml(f"{topic['description']} ({post_date})")}
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 ---

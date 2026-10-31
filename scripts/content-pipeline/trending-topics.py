@@ -61,6 +61,17 @@ def log(msg):
     print(msg)
 
 
+def _yaml(value: str) -> str:
+    """Quote a string for use as a YAML double-quoted scalar.
+
+    Headlines routinely contain double quotes and colons, which would
+    otherwise produce unparseable front matter.
+    """
+    v = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    v = v.replace("\n", " ").replace("\r", " ").strip()
+    return f'"{v}"'
+
+
 def story_url(hit):
     """The link to the story itself — the stable identity of a trending post."""
     return hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
@@ -167,7 +178,12 @@ def generate_post():
                 log(f"❌ publish retry failed: {e}")
         return None
 
-    story = fetch_top_story(_covered_source_urls())
+    # The same story can stay at the top of the index for weeks. It was
+    # republished 25 times before the covered-URL check was added, so the
+    # check below is load-bearing: if this exact story is already in the
+    # archive, write nothing.
+    covered = _covered_source_urls()
+    story = fetch_top_story(covered)
     if not story:
         log("no uncovered trending story found")
         return None
@@ -183,6 +199,11 @@ def generate_post():
     else:
         title_short = title
 
+    already = normalise_url(url)
+    if already and already in covered:
+        log(f"story already covered ({already}) — skipping")
+        return None
+
     import re as _re
     safe = _re.sub(r'[^a-z0-9-]', '-', title_short[:50].lower())
     safe = _re.sub(r'-+', '-', safe).strip('-')
@@ -192,10 +213,11 @@ def generate_post():
     template = COMMENTARY_TEMPLATES[hour % len(COMMENTARY_TEMPLATES)]
     body = template.format(headline_topic=title.lower())
 
+    post_date = f"{today.strftime('%B')} {today.day}, {today.year}"
     full_body = f"""---
 layout: post
-title: "Trending: {title_short}"
-description: "Sol's take on the {slot} AI story: {title_short[:100]}"
+title: {_yaml(f"Trending: {title_short} ({post_date})")}
+description: {_yaml(f"Sol's take on the {slot} AI story: {title_short[:100]} ({post_date})")}
 date: {date_str} {hour:02d}:00:00 +0000
 tags: [ai, trending, commentary, sol]
 author: Sol

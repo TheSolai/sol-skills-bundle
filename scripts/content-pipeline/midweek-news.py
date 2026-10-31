@@ -61,6 +61,10 @@ HN_ALGOLIA = "https://hn.algolia.com/api/v1/search"
 TODAY = datetime.datetime.now(datetime.timezone.utc)
 DATE_STR = TODAY.strftime("%Y-%m-%d")
 DAY_STR = TODAY.strftime("%A")
+# The episode date. The digest is a recurring series, so a title that names
+# only the weekday repeats every week — 12 posts shipped as "AI Digest:
+# Wednesday — 3 Stories That Matter" before the date was added.
+POST_DATE = f"{TODAY.strftime('%B')} {TODAY.day}, {TODAY.year}"
 
 DAYS_BACK = 3
 STORY_COUNT = 3
@@ -433,13 +437,13 @@ def main():
         print("[digest] Using deterministic fallback commentary")
 
     content = build_digest(top_stories, commentary)
-    title = f"AI Digest: {DAY_STR} — {len(top_stories)} Stories That Matter"
+    title = f"AI Digest: {DAY_STR} — {len(top_stories)} Stories That Matter ({POST_DATE})"
 
     frontmatter = f"""---
 layout: post
 title: {_yaml(title)}
 date: {DATE_STR}
-description: "Mid-week AI digest — the most important AI stories from the past few days, curated by Sol AI."
+description: {_yaml("Mid-week AI digest — the most important AI stories from the past few days, curated by Sol AI. (" + POST_DATE + ")")}
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 tags: [ai, digest, news, midweek]

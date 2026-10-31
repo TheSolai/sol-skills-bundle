@@ -788,11 +788,17 @@ One takeaway: Watch this space. The AI story is still being written.
     filepath = SITE_DIR / "_posts" / filename
 
     tags = AI_TAGS_BY_REGION[region]
+    # The description carries the episode date. The same HN story can come
+    # back around weeks later, and without the date two episodes covering
+    # the same story for the same region published identical descriptions —
+    # which is the same duplicate-metadata problem the audit flags.
+    description = (story["title"] + " — daily AI analysis from "
+                   + REGION_LABELS[region] + " (" + POST_DATE + ").")
     frontmatter = f"""---
 layout: post
 title: {_yaml(title)}
 date: {DATE_STR}
-description: {_yaml(story['title'] + " — daily AI analysis from " + REGION_LABELS[region] + ".")}
+description: {_yaml(description)}
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 tags: [{', '.join(tags)}]
@@ -905,7 +911,12 @@ def generate_blooper_post():
         return None, None
 
     content = random.choice(unused)
-    title = "AI Bloopers: The Most Absurd AI Fails This Week"
+    # The episode date belongs in the title and the description. A recurring
+    # series that publishes a fixed title gives every episode the same
+    # metadata, and a search engine reads two posts with identical titles
+    # and descriptions as one page. This series shipped 102 posts under one
+    # title before the date was added.
+    title = f"AI Bloopers: The Most Absurd AI Fails This Week ({POST_DATE})"
     slug = f"{DATE_STR}-ai-bloopers"
     filename = f"{slug}.md"
     filepath = SITE_DIR / "_posts" / filename
@@ -914,7 +925,7 @@ def generate_blooper_post():
 layout: post
 title: {_yaml(title)}
 date: {DATE_STR}
-description: "A weekly roundup of the most absurd, alarming, and accidentally hilarious AI failures. This week: prompt loops, phantom meetings, and hallucinated citations."
+description: {_yaml("A weekly roundup of the most absurd, alarming, and accidentally hilarious AI failures. This week: prompt loops, phantom meetings, and hallucinated citations. (" + POST_DATE + ")")}
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 tags: [ai, bloopers, humor, fails]

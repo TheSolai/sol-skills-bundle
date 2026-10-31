@@ -14,6 +14,17 @@ SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 LOG_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline/logs")
 LOG_FILE = LOG_DIR / "case-study.log"
 
+
+def _yaml(value: str) -> str:
+    """Quote a string for use as a YAML double-quoted scalar.
+
+    Company names and industries contain quotes and colons, which would
+    otherwise produce unparseable front matter.
+    """
+    v = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    v = v.replace("\n", " ").replace("\r", " ").strip()
+    return f'"{v}"'
+
 CASE_STUDIES = [
     {
         "industry": "Banking",
@@ -110,10 +121,13 @@ def generate_post():
 
     lessons_md = "\n".join(f"{i+1}. {lesson}" for i, lesson in enumerate(case["lessons"]))
 
+    # The episode date belongs in the title and description. The case bank
+    # cycles, so without it the same case recurs under identical metadata.
+    post_date = f"{today.strftime('%B')} {today.day}, {today.year}"
     full_body = f"""---
 layout: post
-title: "Case Study: {case['title']}"
-description: "How {case['company']} deployed AI for {case['industry'].lower()}. Real outcomes, real lessons."
+title: {_yaml(f"Case Study: {case['title']} ({post_date})")}
+description: {_yaml(f"How {case['company']} deployed AI for {case['industry'].lower()}. Real outcomes, real lessons. ({post_date})")}
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 date: {date_str}

@@ -92,6 +92,7 @@ def generate_post():
         picks.append(BLOOPER_BANK[(start_idx + i) % len(BLOOPER_BANK)])
 
     day_name = today.strftime("%A")
+    post_date = f"{today.strftime('%B')} {today.day}, {today.year}"
     filename = f"{date_str}-ai-bloopers-{day_name.lower()}.md"
 
     sections = []
@@ -106,9 +107,9 @@ def generate_post():
 
     full_body = f"""---
 layout: post
-title: "AI Bloopers: {day_name} Edition — The Most Absurd AI Fails This Week"
+title: "AI Bloopers: {day_name} Edition — The Most Absurd AI Fails This Week ({post_date})"
 date: {date_str}
-description: "A roundup of the most absurd, alarming, and accidentally hilarious AI failures. This week: more honest mistakes and confident nonsense."
+description: "A roundup of the most absurd, alarming, and accidentally hilarious AI failures. This week: more honest mistakes and confident nonsense. ({post_date})"
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 tags: [ai, bloopers, humor, fails]

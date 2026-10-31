@@ -864,6 +864,54 @@ not, and `midweek-news.py` still writes one fixed description. `weekly-
 roundup.py` uses a month-level date, so every roundup in a month shares a
 title and a description.
 
+### Every generator now dates its metadata (2026-10-31)
+
+The remaining generators were fixed. Each recurring series now appends the
+episode date to the title **and** the description, so two episodes of the
+same series are never the same page to a crawler:
+
+| generator | series | what it published before |
+|---|---|---|
+| `run-daily.py` | AI Bloopers | one fixed title, 102 posts |
+| `run-daily.py` | regional UK/EU/US | one fixed description per story+region |
+| `midweek-news.py` | AI Digest | weekday-only title, one fixed description |
+| `trending-topics.py` | Trending | headline-only title and description |
+| `tool-spotlight.py` | Tool Spotlight | tool name and tagline only |
+| `quick-take.py` | Quick Take | topic only |
+| `deep-dive.py` | Deep Dive | topic only |
+| `weekend-deep-dive.py` | Weekend Deep Dive | topic only |
+| `case-study.py` | Case Study | case title only |
+| `analysis-deep.py` | Analysis | topic only |
+
+Two details worth remembering:
+
+- **The regional series needed the date in the *description*, not the
+  title.** Its title already carries the generated headline, so two
+  episodes of the same series never shared a title. The description was
+  `"{story title} — daily AI analysis from {region}."` — and when the same
+  HN story came back around weeks later, the second episode published a
+  byte-identical description. 62 regional posts were in that state.
+- **The topic-bank series rotate, so "the topic" is not a unique key.**
+  `quick-take.py` picks from a bank by day-of-year, `deep-dive.py` and
+  `weekend-deep-dive.py` the same way. The same topic recurs on a later
+  date, so the date is what makes the episode distinct.
+
+Each generator that did not already have one gained a `_yaml()` helper,
+copied from `run-daily.py`: titles and taglines contain quotes, colons and
+apostrophes, and interpolating them raw produced unparseable front matter.
+
+`trending-topics.py` also got a second guard. `fetch_top_story()` already
+skips covered source URLs, but one story sat at the top of the HN index for
+a month and was republished 25 times (2026-09-29 to 2026-10-27) before the
+covered-URL check existed. The generator now re-checks the chosen story
+against the archive before writing, so a story that is already covered
+produces nothing rather than a near-duplicate.
+
+The 2026-10-30 audit findings are historical and are **not** backfilled. The
+audit still reports them, and will keep reporting them, until the affected
+posts are given a canonical — that is the `seo-repair-canonicals.py` job,
+not a title rewrite. What changed is that no *new* post joins the list.
+
 ## The SEO audit reported drafts in `_posts/` as broken posts (2026-10-30)
 
 The 08:00 run reported three `clawhub-guide-*.md` files as republications

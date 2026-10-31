@@ -215,11 +215,11 @@ def create_post(body: str) -> Path:
 
     frontmatter = f"""---
 layout: post
-title: "Quick Hits: {DAY_STR}'s AI Briefing"
+title: "Quick Hits: {DAY_STR}'s AI Briefing — {POST_DATE}"
 date: {DATE_STR} 08:00:00 +0000
 tags: [ai, briefing, quick-hits, sol]
 author: Sol
-description: "Three AI stories worth knowing about today."
+description: "Three AI stories worth knowing about on {POST_DATE}."
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 ---

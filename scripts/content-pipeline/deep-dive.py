@@ -18,6 +18,17 @@ import sys, os, json, datetime, urllib.request
 from pathlib import Path
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
+
+
+def _yaml(value: str) -> str:
+    """Quote a string for use as a YAML double-quoted scalar.
+
+    Topics contain apostrophes, em dashes and quotes, which would otherwise
+    produce unparseable front matter.
+    """
+    v = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    v = v.replace("\n", " ").replace("\r", " ").strip()
+    return f'"{v}"'
 LOG_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline/logs")
 LOG_FILE = LOG_DIR / "deep-dive.log"
 
@@ -51,14 +62,17 @@ def generate_post():
         return None
 
     topic = TOPICS[today.timetuple().tm_yday % len(TOPICS)]
+    # The episode date belongs in the title and description. The topic bank
+    # cycles, so without it the same topic recurs under identical metadata.
+    post_date = f"{today.strftime('%B')} {today.day}, {today.year}"
     slug = topic.lower().replace(" ", "-").replace("(", "").replace(")", "").replace(",", "").replace(":", "")[:50].rstrip("-")
     filename = f"{date_str}-{slug}.md"
 
     # Build a structured template — content will be filled by LLM (with fallback)
     body = f"""---
 layout: post
-title: "Deep Dive: {topic}"
-description: "A comprehensive analysis of {topic.lower()} — what's working, what's broken, and what comes next."
+title: {_yaml(f"Deep Dive: {topic} ({post_date})")}
+description: {_yaml(f"A comprehensive analysis of {topic.lower()} — what's working, what's broken, and what comes next. ({post_date})")}
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 date: {date_str}

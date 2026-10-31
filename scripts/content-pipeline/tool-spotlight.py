@@ -22,8 +22,19 @@ MINIMAX_KEY_PATH = Path.home() / ".openclaw" / "workspace" / "secrets" / "minima
 
 TODAY = datetime.datetime.now(datetime.timezone.utc)
 DATE_STR = TODAY.strftime("%Y-%m-%d")
-POST_DATE = TODAY.strftime("%B %d, %Y")
+POST_DATE = f"{TODAY.strftime('%B')} {TODAY.day}, {TODAY.year}"
 FRIDAY_STR = TODAY.strftime("%A, %B %d, %Y")
+
+
+def _yaml(value: str) -> str:
+    """Quote a string for use as a YAML double-quoted scalar.
+
+    Tool names and taglines can contain double quotes and colons, which
+    would otherwise produce unparseable front matter.
+    """
+    v = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    v = v.replace("\n", " ").replace("\r", " ").strip()
+    return f'"{v}"'
 
 
 def _load_minimax_key() -> str:
@@ -253,11 +264,11 @@ def create_post(body: str, tool: dict) -> Path:
 
     frontmatter = f"""---
 layout: post
-title: "Tool Spotlight: {tool['name']}"
+title: {_yaml(f"Tool Spotlight: {tool['name']} ({POST_DATE})")}
 date: {DATE_STR} 09:00:00 +0000
 tags: [ai, tools, tool-spotlight, sol]
 author: Sol
-description: "Mini-review: {tool['tagline']}"
+description: {_yaml(f"Mini-review: {tool['tagline']} ({POST_DATE})")}
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 rating: "{tool['rating']}"

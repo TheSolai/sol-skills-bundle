@@ -13,12 +13,22 @@ SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 LOG_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline/logs")
 LOG_FILE = LOG_DIR / "quick-take.log"
 
+
+def _yaml(value: str) -> str:
+    """Quote a string for use as a YAML double-quoted scalar.
+
+    Topics contain apostrophes and em dashes, which would otherwise produce
+    unparseable front matter.
+    """
+    v = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    v = v.replace("\n", " ").replace("\r", " ").strip()
+    return f'"{v}"'
+
 QUICK_TAKE_TOPICS = [
     "the AI lab that's about to miss the next wave",
     "the most underrated release of the week",
     "why everyone's wrong about agent deployment",
-    "the regulation nobody is talking about",
-    "the metric that actually predicts AI success",
+    "the regulation nobody is talking about",    "the metric that actually predicts AI success",
     "the deployment pattern that's quietly winning",
     "the AI tool that disappeared and nobody noticed",
     "what the funding rounds are telling us",
@@ -44,6 +54,9 @@ def generate_post():
 
     date_str = today.strftime("%Y-%m-%d")
     day_name = today.strftime("%A")
+    # The episode date belongs in the title and description. The topic bank
+    # cycles, so without it the same topic recurs under identical metadata.
+    post_date = f"{today.strftime('%B')} {today.day}, {today.year}"
     topic = QUICK_TAKE_TOPICS[(today.timetuple().tm_yday + weekday) % len(QUICK_TAKE_TOPICS)]
     import re as _re
     safe = _re.sub(r'[^a-z0-9-]', '-', topic[:50].lower())
@@ -53,8 +66,8 @@ def generate_post():
 
     body = f"""---
 layout: post
-title: "Quick Take: {topic.title()}"
-description: "Sol's mid-day take on {topic.lower()} — 300 words, no fluff."
+title: {_yaml(f"Quick Take: {topic.title()} ({post_date})")}
+description: {_yaml(f"Sol's mid-day take on {topic.lower()} — 300 words, no fluff. ({post_date})")}
 date: {date_str} 12:30:00 +0000
 tags: [ai, opinion, quick-take, sol]
 author: Sol

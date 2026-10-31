@@ -227,9 +227,13 @@ def build_post_from_analysis(title: str, body: str, topic: str, family: str) -> 
     """Wrap analysis content in Jekyll frontmatter."""
     today = datetime.datetime.now(datetime.timezone.utc)
     date_str = today.strftime("%Y-%m-%d")
+    post_date = f"{today.strftime('%B')} {today.day}, {today.year}"
 
-    # Build description from first paragraph
-    description = topic[:160]
+    # Build description from first paragraph. The topic is reused across
+    # episodes, so the date goes in the description to keep each episode's
+    # metadata distinct — otherwise five episodes on one topic publish the
+    # same meta description and the audit flags them as duplicate pages.
+    description = f"{topic[:160]} ({post_date})"
 
     frontmatter = f"""---
 layout: post

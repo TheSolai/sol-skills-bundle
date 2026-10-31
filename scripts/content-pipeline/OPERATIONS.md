@@ -1090,7 +1090,12 @@ suffix and anything appended later. The lesson is general: a rotation keyed
 on exact title strings breaks the moment anything appends to those strings,
 and it breaks silently — the run still succeeds, it just repeats itself.
 
-**Both fixes in this commit are worth checking against the other rotating
-series.** `quick-hits.py`, `sols-take.py`, `more-bloopers.py` and the rest now
-also date their titles, so anything that keys on an exact title needs the same
-prefix treatment.
+**Checked against the other rotating series, and they are safe.** The only
+other rotation keyed on a title is `weekend-deep-dive.py` itself.
+`analysis-deep.py` has the same shape — a family/topic rotation that skips
+already-published topics — but it keys on a dedicated `analysis_topic:`
+front-matter field, which stores the raw topic text and is never dated, so
+the title change cannot reach it. `quick-hits.py`, `sols-take.py`,
+`more-bloopers.py`, `case-study.py` and `run-daily.py` write to a date-derived
+filename and do not compare titles at all. `seo-health.py` reads titles, but
+only to report duplicates, not to rotate.

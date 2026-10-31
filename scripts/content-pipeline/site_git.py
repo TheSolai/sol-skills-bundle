@@ -240,6 +240,77 @@ def _is_renderable_post(path):
     return FRONTMATTER_RE.match(text) is not None
 
 
+def _quarantine_drafts(cwd):
+    """Move non-post Markdown files out of `_posts/` into `blog-posts/`.
+
+    WHY (2026-10-31 incident)
+    -------------------------
+    Eleven ClawHub drafts were left in `_posts/` by a job that copied them
+    out of `blog-posts/`. The 07:00 daily pipeline then published with
+    `paths=None`, which stages the whole working tree (`git add -A`), so
+    the drafts were committed to origin/main. The CI front-matter gate
+    refused the build, and because a failed build deploys *nothing*, every
+    post on the site 404'd for 75 minutes — including the posts the
+    pipeline had just published.
+
+    The gate was right to refuse. A file without a `YYYY-MM-DD-` prefix or
+    without front matter is not a post; Jekyll will not render it. But one
+    stray draft must not be able to take the whole site down.
+
+    The repo already has a policy for exactly this. `_tests/test_site.py`
+    says a draft in `_posts/` belongs in `blog-posts/` (excluded from the
+    build), and `site_git._is_renderable_post` says the same thing about
+    what counts as a post. So quarantine them there before staging.
+
+    A draft modified in the last 10 seconds is left alone: a generator may
+    still be writing it, and it will be caught on the next publish.
+    """
+    posts_dir = Path(cwd) / "_posts"
+    drafts_dir = Path(cwd) / "blog-posts"
+    if not posts_dir.is_dir():
+        return []
+
+    moved = []
+    now = time.time()
+    for p in sorted(posts_dir.glob("*.md")):
+        if _is_renderable_post(p):
+            continue
+        try:
+            if now - p.stat().st_mtime < 10:
+                continue  # possibly mid-write
+        except OSError:
+            continue
+        try:
+            drafts_dir.mkdir(parents=True, exist_ok=True)
+            target = drafts_dir / p.name
+            if target.exists():
+                # A copy is already parked in blog-posts/. Keep the parked
+                # copy and drop the duplicate from _posts/, unless the two
+                # differ — then park this one under a free name.
+                try:
+                    same = target.read_text(encoding="utf-8") == p.read_text(
+                        encoding="utf-8", errors="replace")
+                except OSError:
+                    same = False
+                if same:
+                    p.unlink()
+                else:
+                    n = 2
+                    while (drafts_dir / f"{p.stem}-{n}.md").exists():
+                        n += 1
+                    shutil.move(str(p), str(drafts_dir / f"{p.stem}-{n}.md"))
+            else:
+                shutil.move(str(p), str(target))
+        except OSError:
+            continue
+        moved.append(p.name)
+
+    if moved:
+        print(f"[site_git] quarantined {len(moved)} draft(s) from _posts/ to "
+              f"blog-posts/: {', '.join(moved)}")
+    return moved
+
+
 def _og_png_paths(cwd, content_paths):
     """The OG images that belong with the given content files."""
     out = []
@@ -384,9 +455,18 @@ def _stage(cwd, content_paths, derived_paths, stage_all):
         return
 
     for p in list(content_paths) + list(derived_paths):
-        one = _git(["add", str(p)], cwd=cwd)
+        # `git add -A --`, not plain `git add`. Plain `git add` fails with
+        # "pathspec did not match any files" for a path that is in neither
+        # the index nor the working tree — which is exactly what happens
+        # when a caller publishes a file it has already deleted.
+        one = _git(["add", "-A", "--", str(p)], cwd=cwd)
         if one.returncode != 0:
-            raise PublishError(f"git add failed: {one.stderr.strip()[:300]}")
+            # The path may simply have nothing to stage: not tracked and
+            # not present. That is not an error.
+            tracked = _git(["ls-files", "--error-unmatch", "--", str(p)], cwd=cwd)
+            if tracked.returncode == 0 or Path(p).exists():
+                raise PublishError(f"git add failed: {one.stderr.strip()[:300]}")
+            continue
 
 
 def _assert_no_conflict_markers(cwd):
@@ -571,6 +651,12 @@ def publish(message, paths=None, cwd=SITE_DIR, allow_empty=False):
     """
     with publish_lock():
         ensure_main(cwd)
+
+        # Park any non-post Markdown that a job left in `_posts/` before
+        # anything is staged. A caller that publishes the whole working tree
+        # would otherwise commit the draft, and the CI front-matter gate
+        # would then refuse the build and 404 every post on the site.
+        _quarantine_drafts(cwd)
 
         # Must happen before staging so the new images are committed with the
         # post that needs them.

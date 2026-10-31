@@ -902,3 +902,76 @@ publish and the deploy; the plist is backed up beside it as
 **Also open:** `scripts/content-pipeline/logs/sol-seo-health.log` is 29 MB
 over 789 runs and `logs/sol-seo.log` is 1.8 MB over 84 runs. Neither is
 rotated.
+
+## One stray draft froze the whole site again (2026-10-31)
+
+The second occurrence of the pattern in "The workspace clone can break the
+site's build" above. The site did not deploy between **07:01 and 08:19** on
+2026-10-31 — every post on the site 404'd, including the three regional posts
+the 07:00 job had just published.
+
+The chain, end to end:
+
+1. Eleven `clawhub-guide-*.md` drafts sat in `blog-posts/`, where the repo's
+   own policy puts them (`_tests/test_site.py`: a draft in `_posts/` belongs in
+   `blog-posts/`, which is excluded from the build).
+2. Something copied them back into `_posts/` at **05:30**, with no front
+   matter. Ten of the eleven had never had front matter; one had a partial
+   block (title, date, tags — no `layout`, no `description`, no `hero_image`).
+   These are not new files: they are the pre-2026-06-30 versions of posts that
+   were published in June, fixed, and then correctly moved to `blog-posts/` on
+   2026-10-30.
+3. `run-daily.py` published with **no `paths=`**, which sets `stage_all` and
+   runs `git add -A` over the whole working tree. The drafts were swept into
+   the "Sol AI daily content: 2026-10-31" commit.
+4. The CI front-matter gate refused the build. A refused build deploys
+   **nothing**, so one commit's eleven drafts took every other post offline.
+
+The gate was right to refuse. The bug is that a draft nobody intended to
+publish could reach the repository at all.
+
+**Fixed in `site_git.publish()`:** `_quarantine_drafts()` now runs before
+anything is staged. Any `.md` file in `_posts/` that is not a renderable post
+— no `YYYY-MM-DD-` prefix, or no front matter — is moved to `blog-posts/`,
+which is excluded from the build. A copy already parked there is left alone
+and the duplicate is dropped; a differing copy is parked under a free name so
+nothing is overwritten. A file modified in the last 10 seconds is skipped, in
+case a generator is still writing it.
+
+So the pipeline now parks the draft instead of publishing it, and the build
+cannot be taken down by a draft again. The same rule is in `seo-health.py` and
+in the OG generator's idea of what a post is — all three now agree.
+
+**Also fixed:** `_stage()` used `git add <path>`, which fails with
+`pathspec did not match any files` for a path that is in neither the index
+nor the working tree — so publishing a *deleted* file raised `PublishError`
+instead of staging the deletion. It now uses `git add -A -- <path>`, and a
+path with nothing to stage is skipped rather than treated as an error.
+
+**Still open (not fixed here):** five scripts publish with no `paths=` and
+therefore stage the entire working tree — `run-daily.py`, `quick-hits.py`,
+`sols-take.py`, `tool-spotlight.py` and `weekly-roundup.py`. The quarantine
+makes that safe for drafts, but it still means an unrelated stray file in the
+clone can be published. Each of them should pass its own generated paths, the
+way `quick-take.py`, `midweek-news.py`, `case-study.py` and the rest already
+do.
+
+## `sol-blog.py` now publishes through the pipeline (2026-10-31)
+
+The defect in "Posts published with `sol-blog.py` skip the OG image generator"
+above is fixed. `sol-blog.py` writes the post into the site clone and
+publishes it with `site_git.publish()`, so it takes the publish lock, runs the
+OG generator and verifies the push landed. It falls back to the raw GitHub API
+if the clone is unavailable, so a post is still published either way.
+
+Two smaller fixes in the same file:
+
+- **YAML escaping.** `title` and `description` were interpolated into a
+  double-quoted YAML scalar without escaping. A quote, a colon or a backslash
+  in either produced unparseable front matter, and Jekyll then failed the
+  build. It now uses the same `_yaml()` helper as the pipeline.
+- **`input()` on a piped stdin.** The overwrite and delete prompts read from
+  stdin, which on the `publish` path is the post body — so `input()` either
+  swallowed the first line of the post or raised `EOFError` on a closed pipe.
+  Both prompts now treat anything that is not an explicit "y" as "no" and
+  never raise.

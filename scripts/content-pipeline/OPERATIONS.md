@@ -1023,3 +1023,51 @@ Two smaller fixes in the same file:
   swallowed the first line of the post or raised `EOFError` on a closed pipe.
   Both prompts now treat anything that is not an explicit "y" as "no" and
   never raise.
+
+## The deep dive fabricated a Hacker News quote (2026-10-31)
+
+The 2026-10-31 deep dive published this sentence, attributed to a commenter:
+
+> As one Hacker News commenter aptly put it, "OpenAI's models are like
+> Ferraris, while open-source models are more like reliable Hondas."
+
+It does not exist. Scanning all 401 comments across the four threads the post
+cited found zero matches for it, and for the Ferrari/Honda phrasing generally.
+
+**The cause was structural, not a one-off slip.** The research step fetched
+Hacker News story *titles* and URLs, and never a single comment. The writing
+prompt, however, asked the model to reference the discussions "directly,
+mentioning what each one argues". Given nothing to ground that in, MiniMax
+invented an argument and then attributed it to a person. It also produced
+"Commenters were quick to point out…" on the strength of nothing. The same
+prompt defect let the post cite a dev.to article about a Prime Video charge as
+evidence about model opacity, because only the article's title was passed
+through and the title was then stretched to fit.
+
+**Three changes, in `weekend-deep-dive.py`:**
+
+1. `fetch_hn_comments()` pulls real comment text from the Algolia items API.
+   `attach_comments()` runs it for every story, and the verbatim excerpts are
+   handed to the model with their author names.
+2. The prompt now states that the listed excerpts are the *only* comments that
+   may be quoted, forbids attributing opinions that are not in front of it, and
+   says to fall back to describing a discussion's title. dev.to article
+   *descriptions* are passed too, so an article can be characterised by what it
+   actually says.
+3. `find_unsupported_quotes()` checks every quoted passage in the finished
+   draft against the corpus that was actually fetched. A quote survives if any
+   8-word window of it appears in the corpus, which tolerates a trimmed quote
+   while catching a wholly invented one. If a draft fails, the pipeline
+   regenerates once with a stricter prompt and **aborts without publishing**
+   if it still fails. A missing post is better than a fabricated one.
+
+`backfill-deep-dive.py` now regenerates any past deep dive through the same
+hardened path — `python3 backfill-deep-dive.py 2026-10-31 5` — and writes the
+same dated title and description the live run uses.
+
+**The general lesson:** a prompt that asks a model to describe what a source
+says, when the pipeline never fetched the source's content, is an invitation
+to fabricate. Grounding is not a prompt instruction; it is what the research
+step actually fetched. And any pipeline that writes prose containing quotes
+should verify those quotes against the source before publishing, not after a
+reader notices.

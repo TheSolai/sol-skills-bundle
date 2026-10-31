@@ -34,9 +34,22 @@ Also: `llm_generate` built a request body and then threw it away,
 ignoring both the system prompt and the caller's max_tokens (hardcoded
 to 600 → posts landed around 500 words). Fixed, and an Ollama fallback
 now prevents 123-word stub posts from ever reaching production.
+
+── Fix applied 2026-10-31 ─────────────────────────────────────────────────
+4. The pipeline fabricated a Hacker News quote.
+   Research fetched story TITLES only, but the writing prompt asked the
+   model to explain "what each one argues". With no comment text to
+   ground it, MiniMax invented a quote — published verbatim as "As one
+   Hacker News commenter aptly put it, 'OpenAI's models are like Ferraris,
+   while open-source models are more like reliable Hondas.'" Scanning all
+   401 comments across the four cited threads found zero matches.
+   → Now fetches real comment text via the Algolia items API, feeds the
+   verbatim excerpts to the model, and forbids attributing any opinion
+   it cannot see. dev.to summaries are passed too, so articles are
+   described by what they actually say.
 """
 
-import sys, os, json, datetime, urllib.request, urllib.error, urllib.parse, time, re
+import sys, os, json, datetime, urllib.request, urllib.error, urllib.parse, time, re, html
 from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
@@ -204,6 +217,7 @@ def fetch_hn_stories(topic: dict, limit: int = 4, days: int = 120) -> list:
             if oid in merged:
                 continue
             merged[oid] = {
+                "oid": oid,
                 "title": h["title"],
                 "url": h.get("url") or f"https://news.ycombinator.com/item?id={oid}",
                 "score": h.get("points") or 0,
@@ -235,6 +249,81 @@ def fetch_hn_stories(topic: dict, limit: int = 4, days: int = 120) -> list:
 
     stories = sorted(merged.values(), key=score, reverse=True)
     return stories[:limit]
+
+
+# ── Research: actual Hacker News comment text ─────────────────────────────
+# 2026-10-31: the pipeline only ever fetched story TITLES, yet the writing
+# prompt asked the model to explain "what each discussion argues". With no
+# comment text to ground it, the model invented one — it published a quote
+# ("OpenAI's models are like Ferraris, while open-source models are more like
+# reliable Hondas") attributed to a Hacker News commenter. Scanning all 401
+# comments across the four cited threads found zero matches: the quote was
+# fabricated. So the model now gets the real comments, and is forbidden from
+# attributing opinions it cannot see.
+
+
+def _strip_html(raw: str) -> str:
+    """HN comment bodies arrive as HTML fragments."""
+    if not raw:
+        return ""
+    t = re.sub(r"<p>", "\n\n", raw)
+    t = re.sub(r"<[^>]+>", "", t)
+    t = html.unescape(t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def fetch_hn_comments(oid: str, limit: int = 6) -> list:
+    """Pull real comment text for a story so the writer can cite it honestly.
+
+    Returns a list of {"author", "text"} dicts. Only comments with enough
+    substance to be worth quoting are kept, and they are ordered by how many
+    replies they drew (a proxy for the community taking them seriously).
+    """
+    url = f"https://hn.algolia.com/api/v1/items/{oid}"
+    try:
+        data = _http_json(url, timeout=25)
+    except Exception as e:
+        print(f"[deep-dive] HN comments fetch failed for {oid}: {e}")
+        return []
+
+    found = []
+
+    def walk(node, depth=0):
+        for child in node.get("children") or []:
+            text = _strip_html(child.get("text") or "")
+            if len(text) >= 90:
+                found.append({
+                    "author": child.get("author") or "anonymous",
+                    "text": text[:700],
+                    "replies": len(child.get("children") or []),
+                    "depth": depth,
+                })
+            walk(child, depth + 1)
+
+    walk(data)
+
+    # Shallow, long, well-replied-to comments carry the most argument.
+    found.sort(key=lambda c: (c["replies"], len(c["text"])), reverse=True)
+    picked = []
+    seen_authors = set()
+    for c in found:
+        if c["depth"] > 2:
+            continue
+        if c["author"] in seen_authors:
+            continue
+        seen_authors.add(c["author"])
+        picked.append({"author": c["author"], "text": c["text"]})
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def attach_comments(stories: list, per_story: int = 6) -> None:
+    """Fetch comment text for each story, in place. Never raises."""
+    for s in stories:
+        s["excerpts"] = fetch_hn_comments(s.get("oid", ""), limit=per_story) if s.get("oid") else []
+        if s["excerpts"]:
+            print(f"[deep-dive]   {len(s['excerpts'])} real comments from: {s['title'][:55]}")
 
 
 # ── Research: dev.to ─────────────────────────────────────────────────────
@@ -290,6 +379,11 @@ def fetch_devto_articles(topic: dict, limit: int = 4) -> list:
             "title": a["title"],
             "url": a.get("url", ""),
             "reactions": a.get("public_reactions_count", 0),
+            # The description matters: without it the model only sees a title
+            # and stretches it to fit the argument, which is how a piece about
+            # a Prime Video charge ended up cited as evidence about model
+            # opacity.
+            "summary": (a.get("description") or "").strip()[:300],
         }
         for _, a in scored[:limit]
     ]
@@ -414,21 +508,114 @@ def ollama_generate(prompt: str, system: str = "", max_tokens: int = 2500) -> st
 
 # ── Post generation ──────────────────────────────────────────────────────
 
-def generate_deep_dive(topic: dict, hn_stories: list, devto_articles: list) -> str | None:
+def _norm_text(s: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace."""
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def find_unsupported_quotes(body: str, hn_stories: list, devto_articles: list) -> list:
+    """Find quoted passages in the body that do not appear in the research.
+
+    The model has a strong pull toward inventing a quote when asked to
+    "reference the discussion" — it has happened before. So every quoted
+    passage in the finished draft is checked against the material we
+    actually fetched. A quote survives if any 8-word window of it appears
+    in the corpus, which tolerates a trimmed or lightly-edited quote
+    while still catching a wholly invented one.
+    """
+    corpus_parts = []
+    for s in hn_stories:
+        corpus_parts.append(s.get("title", ""))
+        for c in s.get("excerpts") or []:
+            corpus_parts.append(c.get("text", ""))
+    for a in devto_articles:
+        corpus_parts.append(a.get("title", ""))
+        corpus_parts.append(a.get("summary", ""))
+    corpus = _norm_text(" ".join(corpus_parts))
+    if not corpus:
+        return []
+
+    unsupported = []
+    for m in re.finditer(r'[""]([^""]{40,})[""]', _strip_front_matter(body)):
+        q = _norm_text(m.group(1))
+        if not q:
+            continue
+        words = q.split()
+        if len(words) < 8:
+            continue
+        supported = any(
+            " ".join(words[i:i + 8]) in corpus
+            for i in range(len(words) - 7)
+        )
+        if not supported:
+            unsupported.append(m.group(1).strip()[:140])
+    return unsupported
+
+
+def _strip_front_matter(body: str) -> str:
+    """Drop YAML front matter — its quoted title/description are not prose."""
+    if body.startswith("---"):
+        end = body.find("\n---", 3)
+        if end != -1:
+            return body[end + 4:].lstrip("\n")
+    return body
+
+
+def _comment_excerpts(hn_stories: list) -> list:
+    """Build the verbatim comment excerpts the writer is allowed to quote."""
+    blocks = []
+    for s in hn_stories:
+        for c in s.get("excerpts") or []:
+            blocks.append(
+                f"  On \"{s['title']}\" — HN user {c['author']} wrote:\n"
+                f"    \"{c['text']}\""
+            )
+    return blocks
+
+
+def _excerpts_text(hn_stories: list) -> str:
+    blocks = _comment_excerpts(hn_stories)
+    if not blocks:
+        return "  (no comment text available — do not quote anyone)"
+    return "\n".join(blocks)
+
+
+def _build_prompt(topic: dict, hn_stories: list, devto_articles: list, strict: bool = False) -> str:
+    """Build the writing prompt.
+
+    `strict=True` is the retry used when the first draft quoted something
+    that could not be traced back to the research.
+    """
     hn_txt = "\n".join(
         f"- [{s['title']}]({s['url']}) (HN: {s['score']} pts, {s['comments']} comments)"
         for s in hn_stories
     ) if hn_stories else "No recent HN discussions found."
+
+    hn_quotes_txt = _excerpts_text(hn_stories)
+
     devto_txt = "\n".join(
-        f"- [{a['title']}]({a['url']}) ({a['reactions']} reactions)"
+        f"- [{a['title']}]({a['url']}) ({a['reactions']} reactions)\n"
+        f"  Summary: {a.get('summary', '') or '(no summary available)'}"
         for a in devto_articles
     ) if devto_articles else "No recent dev.to articles found."
 
-    prompt = f"""Write a Weekend Deep Dive — a long-form researched blog post, 600-800 words.
+    strict_block = """
+IMPORTANT — your previous attempt quoted something that does not exist in the
+material below. Every quotation marks below will be checked against the
+research, and the draft will be discarded if any of them cannot be found.
+Write WITHOUT quotation marks entirely if you are unsure. It is far better
+to describe what a discussion says in your own words than to put words in
+someone's mouth. Only the HN users whose real words are printed above may
+be quoted, and only verbatim.
+""" if strict else ""
+
+    return f"""Write a Weekend Deep Dive — a long-form researched blog post, 600-800 words.
 
 Topic: {topic['topic']}
 Description: {topic['description']}
-
+{strict_block}
 Structure:
 1. Hook — open with the core question or tension (1-2 sentences)
 2. Background — what's the actual situation (2-3 paragraphs)
@@ -442,13 +629,25 @@ Rules:
 - No bullet points in the body
 - No hedging. Take a clear position.
 - Ground claims in specifics, not platitudes
-- Cite relevant discussions from the community, by name, in the prose.
-  You MUST reference at least two of the linked discussions below directly,
-  mentioning what each one argues. Do not invent quotes or statistics.
 - Aim for 700-750 words. Do not stop early.
+
+CITATION RULES — these are absolute:
+- You may ONLY quote a Hacker News user if their exact words appear in the
+  "Real HN comment excerpts" section below. Quote them verbatim, in quotation
+  marks, and name them.
+- NEVER invent a quote, a paraphrase of a commenter's opinion, or a claim about
+  what "commenters said" / "the community argued" / "readers noted".
+  If you did not read a comment, you do not know what it said.
+- If no comment text is available for a discussion, describe only what its
+  TITLE says. That is still a real, checkable fact.
+- Use the dev.to summaries below to describe those articles accurately.
+  Do not cite an article for a claim its summary does not support.
 
 Recent HN discussions:
 {hn_txt}
+
+Real HN comment excerpts (the ONLY comments you may quote):
+{hn_quotes_txt}
 
 Recent dev.to articles:
 {devto_txt}
@@ -457,6 +656,14 @@ Date: {POST_DATE}
 Author: Sol
 Tags: {', '.join(topic['tags'])}
 """
+
+
+def _strict_prompt(topic: dict, hn_stories: list, devto_articles: list) -> str:
+    return _build_prompt(topic, hn_stories, devto_articles, strict=True)
+
+
+def generate_deep_dive(topic: dict, hn_stories: list, devto_articles: list) -> str | None:
+    prompt = _build_prompt(topic, hn_stories, devto_articles)
     system = (
         "You are Sol AI. You're a researcher and writer. You go deep, not wide. "
         "You have strong opinions and you support them with evidence. "
@@ -469,19 +676,29 @@ Tags: {', '.join(topic['tags'])}
     return llm_generate(prompt, system, max_tokens=2500)
 
 
-def create_post(body: str, topic: dict) -> Path:
-    slug = f"{DATE_STR}-weekend-deep-dive"
+def create_post(body: str, topic: dict, date_str: str | None = None) -> Path:
+    """Write the post to `_posts/`.
+
+    `date_str` overrides today's date, so a backfill or repair reproduces
+    the same dated title/description format the live run uses.
+    """
+    date_str = date_str or DATE_STR
+    slug = f"{date_str}-weekend-deep-dive"
     filename = f"{slug}.md"
     post_path = SITE_DIR / "_posts" / filename
 
     tags_str = "[" + ", ".join(topic["tags"]) + "]"
     # The episode date belongs in the title and description. The topic bank
     # cycles, so without it the same topic recurs under identical metadata.
-    post_date = f"{TODAY.strftime('%B')} {TODAY.day}, {TODAY.year}"
+    try:
+        d = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        d = TODAY
+    post_date = f"{d.strftime('%B')} {d.day}, {d.year}"
     frontmatter = f"""---
 layout: post
 title: {_yaml(f"{topic['topic']} ({post_date})")}
-date: {DATE_STR} 09:00:00 +0000
+date: {date_str} 09:00:00 +0000
 tags: {tags_str}
 author: Sol
 description: {_yaml(f"{topic['description']} ({post_date})")}
@@ -496,6 +713,54 @@ hero_image: /images/sol-avatar.png
     return post_path
 
 
+def generate_verified_body(topic: dict, hn_stories: list, devto_articles: list) -> str | None:
+    """Generate a draft and refuse to return one with unverifiable quotes.
+
+    Used by both the live run and backfills. Returns None when the draft
+    cannot be made honest, so the caller aborts instead of publishing.
+    """
+    body = generate_deep_dive(topic, hn_stories, devto_articles)
+
+    if not body or len(body.split()) < 400:
+        if body:
+            print(f"[deep-dive] MiniMax output too thin ({len(body.split())} words), trying Ollama")
+        else:
+            print("[deep-dive] MiniMax unavailable, trying Ollama")
+        body = ollama_generate(
+            _build_prompt(topic, hn_stories, devto_articles),
+            system="You are Sol AI. You go deep, not wide. You don't waste the reader's time.",
+            max_tokens=2500,
+        )
+
+    if not body or len(body.split()) < 300:
+        return None
+
+    unsupported = find_unsupported_quotes(body, hn_stories, devto_articles)
+    if unsupported:
+        print(f"[deep-dive] ⚠️  {len(unsupported)} quote(s) not found in the research:")
+        for q in unsupported:
+            print(f"    - {q[:110]}")
+        print("[deep-dive] Regenerating with a stricter instruction...")
+        body = llm_generate(
+            _strict_prompt(topic, hn_stories, devto_articles),
+            "You are Sol AI. You are a researcher and writer. You never invent a "
+            "quotation. If you did not read it, you do not quote it.",
+            max_tokens=2500,
+        )
+        if not body or len(body.split()) < 300:
+            print("[deep-dive] ❌ Regeneration failed. Aborting without publishing.")
+            return None
+        unsupported = find_unsupported_quotes(body, hn_stories, devto_articles)
+        if unsupported:
+            print(f"[deep-dive] ❌ Still {len(unsupported)} unverifiable quote(s). Aborting without publishing.")
+            for q in unsupported:
+                print(f"    - {q[:110]}")
+            return None
+        print("[deep-dive] ✅ Regenerated draft passes quote verification.")
+
+    return body
+
+
 def main():
     topic = pick_topic()
     print(f"[deep-dive] Deep diving: {topic['topic']} ({SAT_STR})")
@@ -504,54 +769,21 @@ def main():
     print(f"[deep-dive] Found {len(hn_stories)} relevant HN stories")
     for s in hn_stories:
         print(f"  - {s['title'][:70]}")
+    # Pull the real comment text before writing. Without it the model
+    # invents quotes (see the note above fetch_hn_comments).
+    attach_comments(hn_stories)
 
     devto_articles = fetch_devto_articles(topic)
     print(f"[deep-dive] Found {len(devto_articles)} relevant dev.to articles")
     for a in devto_articles:
         print(f"  - {a['title'][:70]}")
 
-    body = generate_deep_dive(topic, hn_stories, devto_articles)
+    body = generate_verified_body(topic, hn_stories, devto_articles)
 
-    # MiniMax down or produced something too thin → try local Ollama.
-    if not body or len(body.split()) < 400:
-        if body:
-            print(f"[deep-dive] MiniMax output too thin ({len(body.split())} words), trying Ollama")
-        else:
-            print("[deep-dive] MiniMax unavailable, trying Ollama")
-        body = ollama_generate(
-            f"""Write a Weekend Deep Dive — a long-form researched blog post, 600-800 words.
-
-Topic: {topic['topic']}
-Description: {topic['description']}
-
-Structure:
-1. Hook — open with the core question or tension (1-2 sentences)
-2. Background — what's the actual situation (2-3 paragraphs)
-3. Analysis — take a position, back it up with specifics (3-4 paragraphs)
-4. What this means in practice — concrete examples (1-2 paragraphs)
-5. Closing — one sharp takeaway sentence
-
-Rules:
-- Conversational, slightly wry tone. Direct, opinionated, honest.
-- No bullet points in the body. No hedging. Take a clear position.
-- Aim for 700-750 words. Do not stop early.
-- You MUST reference at least two of the linked discussions below directly,
-  mentioning what each one argues. Do not invent quotes or statistics.
-
-Recent HN discussions:
-{chr(10).join(f"- [{s['title']}]({s['url']})" for s in hn_stories) or "No recent HN discussions found."}
-
-Recent dev.to articles:
-{chr(10).join(f"- [{a['title']}]({a['url']})" for a in devto_articles) or "No recent dev.to articles found."}
-""",
-            system="You are Sol AI. You go deep, not wide. You don't waste the reader's time.",
-            max_tokens=2500,
-        )
-
-    if not body or len(body.split()) < 300:
+    if not body:
         # Do NOT publish a stub. An unreferenced placeholder tells readers to
         # "check back tomorrow", which is worse than no post.
-        print("[deep-dive] ❌ All generation backends failed or returned too little. Aborting without publishing.")
+        print("[deep-dive] ❌ Generation failed or draft failed quote verification. Aborting without publishing.")
         sys.exit(2)
 
     wc = len(body.split())

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-One-off backfill: regenerate a Weekend Deep Dive that was generated but
-never published.
+Regenerate a Weekend Deep Dive for a given date and publish it to main.
 
-The 2026-10-17 deep dive ("How AI changes what 'learning' means") was
-committed to the `roundup/2026-10-17` branch instead of main, so it never
-reached the site. The orphaned copy also had three defects:
-
-  * it was truncated mid-sentence ("...provides targeted exercises")
-  * it used "His experience" for Amre (she/her)
-  * it had no `hero_image`, which the CI front-matter gate requires
-
-Rather than patch a truncated draft, this regenerates the piece with the
-fixed research + generation path and publishes it to main.
+Originally a one-off for the orphaned 2026-10-17 post. Now a general
+repair/regeneration tool, used when a published deep dive needs to be
+rewritten — most recently the 2026-10-31 post, which shipped a fabricated
+Hacker News quote ("OpenAI's models are like Ferraris, while open-source
+models are more like reliable Hondas"). Regenerating it with the hardened
+research path produces a draft whose every quotation traces back to a
+comment we actually fetched.
 
 Usage:
-    python3 backfill-deep-dive.py 2026-10-17
+    python3 backfill-deep-dive.py 2026-10-31 [topic-index]
+    python3 backfill-deep-dive.py 2026-10-31 "The closed-source vs. open-source AI divide"
+
+If no topic is given, the topic is matched against the existing post's
+title in `_posts/`.
 """
 
 import sys, subprocess, importlib.util
@@ -30,96 +30,75 @@ spec.loader.exec_module(wdd)
 
 SITE_DIR = wdd.SITE_DIR
 
-ORPHAN_COMMIT = "d972f52"
-ORPHAN_PATH = "_posts/2026-10-17-weekend-deep-dive.md"
 
-
-def orphan_title() -> str | None:
-    out = subprocess.run(
-        ["git", "-C", str(SITE_DIR), "show", f"{ORPHAN_COMMIT}:{ORPHAN_PATH}"],
-        capture_output=True, text=True,
-    ).stdout
-    for line in out.split("\n"):
+def existing_title(date_str: str) -> str | None:
+    """Read the title of the post already on disk for this date."""
+    path = SITE_DIR / "_posts" / f"{date_str}-weekend-deep-dive.md"
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8").split("\n"):
         if line.startswith("title:"):
             return line.split("title:", 1)[1].strip().strip('"').strip("'")
     return None
 
 
+def resolve_topic(date_str: str, arg: str | None):
+    if arg is not None and arg.isdigit():
+        return wdd.TOPICS[int(arg)]
+    if arg:
+        for t in wdd.TOPICS:
+            if wdd._norm(t["topic"]) == wdd._norm(arg):
+                return t
+        print(f"[backfill] no topic matches: {arg}")
+        sys.exit(1)
+    title = existing_title(date_str)
+    if not title:
+        print(f"[backfill] no existing post for {date_str} — pass a topic index")
+        sys.exit(1)
+    # The stored title carries "(October 31, 2026)" — strip that before matching.
+    cleaned = title.split(" (")[0]
+    for t in wdd.TOPICS:
+        if wdd._norm(t["topic"]) == wdd._norm(cleaned):
+            return t
+    print(f"[backfill] no topic matches existing title: {title}")
+    sys.exit(1)
+
+
 def main():
     if len(sys.argv) < 2:
-        print("usage: backfill-deep-dive.py YYYY-MM-DD [topic-index]")
+        print("usage: backfill-deep-dive.py YYYY-MM-DD [topic-index|topic]")
         sys.exit(1)
 
     date_str = sys.argv[1]
-
-    if len(sys.argv) > 2:
-        topic = wdd.TOPICS[int(sys.argv[2])]
-    else:
-        title = orphan_title()
-        if not title:
-            print("[backfill] could not read orphaned title")
-            sys.exit(1)
-        matches = [t for t in wdd.TOPICS if wdd._norm(t["topic"]) == wdd._norm(title)]
-        if not matches:
-            print(f"[backfill] no topic matches orphaned title: {title}")
-            sys.exit(1)
-        topic = matches[0]
+    topic = resolve_topic(date_str, sys.argv[2] if len(sys.argv) > 2 else None)
 
     print(f"[backfill] Regenerating {date_str}: {topic['topic']}")
 
     hn = wdd.fetch_hn_stories(topic)
+    print(f"[backfill] {len(hn)} HN stories")
+    wdd.attach_comments(hn)
     dt = wdd.fetch_devto_articles(topic)
-    print(f"[backfill] {len(hn)} HN stories, {len(dt)} dev.to articles")
+    print(f"[backfill] {len(dt)} dev.to articles")
 
-    body = wdd.generate_deep_dive(topic, hn, dt)
-    if not body or len(body.split()) < 400:
-        print("[backfill] MiniMax weak, trying Ollama")
-        body = wdd.ollama_generate(
-            f"Write a Weekend Deep Dive — 600-800 words on: {topic['topic']}\n\n"
-            f"Description: {topic['description']}\n\n"
-            "Conversational, opinionated, direct. No bullet points. No hedging. "
-            "Reference at least two of these discussions by name:\n"
-            + "\n".join(f"- [{s['title']}]({s['url']})" for s in hn)
-            + "\n".join(f"- [{a['title']}]({a['url']})" for a in dt),
-            system="You are Sol AI. You go deep, not wide.",
-            max_tokens=2500,
-        )
-
-    if not body or len(body.split()) < 300:
-        print("[backfill] generation failed; refusing to publish a stub")
+    body = wdd.generate_verified_body(topic, hn, dt)
+    if not body:
+        print("[backfill] ❌ generation failed or draft failed quote verification; refusing to publish")
         sys.exit(2)
 
-    # Amre is she/her. The orphaned draft used "His experience".
+    # Amre is she/her.
     body = body.replace("His experience", "Her experience")
     body = body.replace("his experience", "her experience")
-    # Guard against invented biography — Amre is in Belfast with a theology
-    # degree; the model invented "college sophomore" on the first pass.
+    # Guard against invented biography.
     body = body.replace("Amre, a college sophomore,", "Amre")
     body = body.replace("a college sophomore", "a self-taught developer")
 
     wc = len(body.split())
     print(f"[backfill] Body length: {wc} words")
 
-    tags_str = "[" + ", ".join(topic["tags"]) + "]"
-    frontmatter = f"""---
-layout: post
-title: "{topic['topic']}"
-date: {date_str} 09:00:00 +0000
-tags: {tags_str}
-author: Sol
-description: "{topic['description']}"
-image: /images/sol-avatar.png
-hero_image: /images/sol-avatar.png
----
-
-{body}
-"""
-    post_path = SITE_DIR / "_posts" / f"{date_str}-weekend-deep-dive.md"
-    post_path.write_text(frontmatter, encoding="utf-8")
-    print(f"[backfill] Wrote {post_path.name}")
+    post_path = wdd.create_post(body, topic, date_str=date_str)
 
     from site_git import publish
-    sha = publish(f"Weekend Deep Dive (backfill): {topic['topic'][:50]}",
+    sha = publish(f"Weekend Deep Dive (regenerated): {topic['topic'][:50]}",
                   cwd=SITE_DIR, paths=[str(post_path)])
     print(f"[backfill] Pushed to origin/main ({sha[:12] if sha else 'nothing new'})")
 

@@ -8,21 +8,48 @@ Cronsetup: launchd StartCalendarInterval 09:00 daily
 Or: 0 8 * * * python3 scripts/content-pipeline/sols-take.py >> logs/sol-take.log 2>&1
 """
 
+from __future__ import annotations
+
+# PEP 604 unions (`str | None`) are evaluated at def-time on Python < 3.10,
+# which breaks this module under /usr/bin/python3 (3.9.6). The future import
+# above makes them strings, so the module imports on every interpreter the
+# pipeline might use. `_minimax_helper.py` has the same guard for the same
+# reason.
+
 import sys, os, json, datetime, urllib.request
 from pathlib import Path
+import contextlib, fcntl
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from devto_key import load_devto_key
 from _minimax_helper import minimax_generate, load_minimax_key_candidates
 
+# Sentence-aware trimming, shared with weekly-roundup.py and midweek-news.py so
+# the generators cannot drift apart — see text_utils.py.
+from text_utils import (
+    ends_cleanly as _ends_cleanly,
+    split_sentences as _split_sentences,
+    trim_to_words as _trim_to_words,
+)
+
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 DEVTO_API_KEY = load_devto_key()
 
-TODAY = datetime.datetime.now(datetime.timezone.utc)
-DATE_STR = TODAY.strftime("%Y-%m-%d")
-POST_DATE = TODAY.strftime("%B %d, %Y")
-DAY_STR = TODAY.strftime("%A")
+# Only one run at a time. The Mavis cron fires this script, and a launchd
+# fallback can fire it too; without a lock both could pass the
+# "does today's post exist?" check before either wrote, and the second would
+# overwrite the first with a different body.
+LOCK_FILE = Path("/tmp/sol-sols-take.lock")
+
+
+def today_utc() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def date_fields(d: datetime.datetime) -> tuple[str, str, str]:
+    """(date_str, post_date, day_str) for a target date."""
+    return d.strftime("%Y-%m-%d"), d.strftime("%B %d, %Y"), d.strftime("%A")
 
 
 def llm_generate(prompt: str, system: str = "", max_tokens: int = 6000) -> str | None:
@@ -68,9 +95,13 @@ TAKE_TEMPLATES = [
 ]
 
 
-def pick_topic() -> str:
-    """Pick a topic using day-of-year for variety."""
-    day_of_year = TODAY.timetuple().tm_yday
+def pick_topic(d: datetime.datetime) -> str:
+    """Pick a topic using day-of-year for variety.
+
+    The topic is derived from the date the post is FOR, not the date it is
+    written, so a backfilled day gets the topic its rotation intended.
+    """
+    day_of_year = d.timetuple().tm_yday
     idx = day_of_year % len(TAKE_TEMPLATES)
     return TAKE_TEMPLATES[idx]
 
@@ -97,9 +128,48 @@ TOPIC_PROMPTS = {
 }
 
 
-def generate_take() -> str:
-    topic_key = pick_topic()
+def post_path_for(date_str: str, day_str: str) -> Path:
+    """Where the post for a given day lives."""
+    return SITE_DIR / "_posts" / f"{date_str}-sols-take-{day_str.lower()}.md"
+
+
+def existing_post_is_degraded(path: Path) -> bool:
+    """True when the published post for today is the deterministic fallback.
+
+    A degraded post is worth regenerating; a real one is not.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "More coming tomorrow" in text or "**The take:**" in text
+
+
+@contextlib.contextmanager
+def run_lock():
+    """Serialise runs so two schedulers cannot both write today's post."""
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("[sols-take] Another run holds the lock — skipping")
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def generate_take(d: datetime.datetime) -> str:
+    topic_key = pick_topic(d)
     topic_prompt = TOPIC_PROMPTS[topic_key]
+
+    _, post_date, _ = date_fields(d)
 
     prompt = f"""Write a 'Sol's Take' — a single hot opinion piece, 150-200 words.
 
@@ -114,31 +184,49 @@ Rules:
 
 Topic: {topic_prompt}
 
-Date: {POST_DATE}
+Date: {post_date}
 Author: Sol
 """
     system = "You are Sol AI. Direct, opinionated, slightly wry. You have strong views and you state them. No corporate speak, no hedging. You're not cruel — but you're honest."
     body = llm_generate(prompt, system, max_tokens=600)
     if not body:
-        topic_key = pick_topic()
-        topic_prompt = TOPIC_PROMPTS[topic_key]
         body = f"**The take:** {topic_prompt}\n\nAI is doing a lot of things right now. Most of them are oversold. Some of them are genuinely useful. Figuring out which is which is the actual skill — not knowing everything, but knowing what to pay attention to.\n\nMore coming tomorrow."
         print("[sols-take] Using template fallback")
-    return body
+        return body
+
+    # Enforce the word budget in code. The prompt alone does not hold it —
+    # published posts have ranged from 187 to 248 words against a 150-200
+    # brief. The trim cuts at sentence boundaries, never mid-sentence.
+    trimmed = _trim_to_words(body.strip(), limit=200)
+    if trimmed != body.strip():
+        print(f"[sols-take] Trimmed {len(body.split())} -> {len(trimmed.split())} words")
+
+    # Never publish text that stops mid-sentence.
+    if not _ends_cleanly(trimmed):
+        paragraphs = [p.strip() for p in trimmed.split("\n\n") if p.strip()]
+        if paragraphs:
+            sentences = _split_sentences(paragraphs[-1])
+            if sentences and not _ends_cleanly(sentences[-1]):
+                sentences = sentences[:-1]
+            paragraphs[-1] = " ".join(sentences)
+            trimmed = "\n\n".join(p for p in paragraphs if p).strip()
+
+    return trimmed
 
 
-def create_post(body: str) -> Path:
-    slug = f"{DATE_STR}-sols-take-{DAY_STR.lower()}"
+def create_post(body: str, d: datetime.datetime) -> Path:
+    date_str, post_date, day_str = date_fields(d)
+    slug = f"{date_str}-sols-take-{day_str.lower()}"
     filename = f"{slug}.md"
     post_path = SITE_DIR / "_posts" / filename
 
     frontmatter = f"""---
 layout: post
-title: "Sol's Take: {DAY_STR} — {POST_DATE}"
-date: {DATE_STR} 09:00:00 +0000
+title: "Sol's Take: {day_str} — {post_date}"
+date: {date_str} 09:00:00 +0000
 tags: [ai, opinion, sols-take, sol]
 author: Sol
-description: "Sol's opinion on the AI landscape of {POST_DATE}."
+description: "Sol's opinion on the AI landscape of {post_date}."
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 ---
@@ -150,29 +238,66 @@ hero_image: /images/sol-avatar.png
     return post_path
 
 
-def main():
-    print(f"[sols-take] Running for {DAY_STR}, {POST_DATE}")
+def parse_target_date(argv: list[str]) -> datetime.datetime:
+    """The date this run publishes for.
 
-    body = generate_take()
+    Defaults to today. `--date YYYY-MM-DD` publishes for a specific day,
+    which is how a day the scheduler missed gets backfilled.
+    """
+    if "--date" in argv:
+        idx = argv.index("--date")
+        if idx + 1 >= len(argv):
+            raise SystemExit("--date needs a YYYY-MM-DD argument")
+        raw = argv[idx + 1]
+        try:
+            d = datetime.datetime.strptime(raw, "%Y-%m-%d")
+        except ValueError:
+            raise SystemExit(f"could not parse --date {raw!r}; expected YYYY-MM-DD")
+        return d.replace(tzinfo=datetime.timezone.utc)
+    return today_utc()
 
-    post_path = create_post(body)
 
-    try:
-        import subprocess
-        cwd = SITE_DIR
-        # Stage only the post file we just created
-        rel_path = post_path.relative_to(cwd)
-        subprocess.run(["git", "add", str(rel_path)], cwd=cwd, check=False, capture_output=True)
-        # Check if there are staged changes
-        diff = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=cwd, capture_output=True, text=True)
-        if not diff.stdout.strip():
-            print("[sols-take] No changes to commit — post already published?")
+def main(argv: list[str] | None = None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    target = parse_target_date(argv)
+    date_str, post_date, day_str = date_fields(target)
+    print(f"[sols-take] Running for {day_str}, {post_date}")
+
+    with run_lock() as got_lock:
+        if not got_lock:
             return
-        from site_git import publish
-        sha = publish(f"Sol's Take: {DAY_STR}", cwd=cwd)
-        print(f"[sols-take] Committed and pushed to origin/main ({sha[:12] if sha else 'nothing new'}).")
-    except Exception as e:
-        print(f"[sols-take] Git push failed: {e}")
+
+        post_path = post_path_for(date_str, day_str)
+
+        # Idempotency: check for the existing output BEFORE doing the
+        # expensive work (the LLM call).
+        #
+        # WHY (2026-11-04): this series is driven by BOTH a Mavis cron task
+        # and a launchd agent. When both fired on the same day, the second run
+        # generated a fresh body and overwrote the first — same URL, different
+        # prose, and the site's own commit history shows two "Sol's Take"
+        # commits in a single morning. The first body was the one that shipped.
+        #
+        # A degraded (template-fallback) post is the one case worth
+        # regenerating, because it is not real content at all.
+        if post_path.exists() and not existing_post_is_degraded(post_path):
+            print(f"[sols-take] Already published: {post_path.name} — skipping")
+            return
+
+        body = generate_take(target)
+
+        post_path = create_post(body, target)
+
+        try:
+            cwd = SITE_DIR
+            # Stage ONLY this post. `publish()` without `paths` stages the
+            # entire working tree, which is how one job's commit ends up
+            # carrying another job's half-finished files.
+            from site_git import publish
+            sha = publish(f"Sol's Take: {day_str}", cwd=cwd, paths=[str(post_path)])
+            print(f"[sols-take] Committed and pushed to origin/main ({sha[:12] if sha else 'nothing new'}).")
+        except Exception as e:
+            print(f"[sols-take] Git push failed: {e}")
 
 
 if __name__ == "__main__":

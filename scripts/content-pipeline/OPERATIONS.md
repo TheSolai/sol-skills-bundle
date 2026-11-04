@@ -1119,3 +1119,81 @@ the title change cannot reach it. `quick-hits.py`, `sols-take.py`,
 `more-bloopers.py`, `case-study.py` and `run-daily.py` write to a date-derived
 filename and do not compare titles at all. `seo-health.py` reads titles, but
 only to report duplicates, not to rotate.
+
+## `sols-take.py` published a second time over the first (fixed 2026-11-04)
+
+Sol's Take is driven by BOTH a Mavis cron task (`sols-take`, `0 9 * * *`
+Europe/London) and, historically, a launchd agent. When both fired on the
+same day the second run generated a *fresh* body and overwrote the first —
+same URL, different prose. The site's history shows it: `2026-10-24`,
+`2026-10-26` and `2026-10-27` each carry two or three "Sol's Take" commits
+on one day. The body that shipped was whichever run wrote last, so the
+second run silently discarded the first.
+
+Three fixes, all in the generator:
+
+- **Idempotency before the expensive work.** The script now checks whether
+  today's post already exists *before* calling the LLM, and skips. A
+  template-fallback post is the one case worth regenerating, because it is
+  not real content at all. This follows the rule already in this file:
+  "check for an existing output before doing expensive work".
+- **A run lock.** `flock` on `/tmp/sol-sols-take.lock`, so two schedulers
+  cannot both pass the existence check before either writes.
+- **`paths=` on `publish()`.** The old code called `publish(msg, cwd=cwd)`
+  with no `paths`, which stages the *entire* working tree — so this job's
+  commit could carry another job's half-finished files. It now stages only
+  its own post (and, via `publish()`, that post's OG image and the manifest).
+
+`--date YYYY-MM-DD` publishes for a specific day, which is how a day the
+scheduler missed gets backfilled. The topic rotation is keyed on the day of
+year of the *target* date, so a backfilled day gets the topic its rotation
+intended rather than today's.
+
+## Three days of Sol's Take went missing because the Mac was asleep
+
+2026-11-01, 11-02 and 11-03 had no posts of any kind. The machine was
+powered off or asleep — `pmset -g log` has no entries at all for 11-01 and
+11-02, and the boot time was Nov 3 13:58. The MiniMax Code app (which hosts
+the cron scheduler) started at Nov 3 13:59:42, and its cron tasks for
+09:00 that day had already been missed. The launchd agents with
+`RunAtLoad: true` fired on boot and caught up; the MiniMax cron tasks did
+not.
+
+So the two schedulers fail in different ways, and the site needs both:
+
+- launchd agents survive sleep (they run at next boot), but they do not
+  know which series they own, so they cannot backfill a *past* day.
+- MiniMax cron tasks need the app running at the scheduled minute, and they
+  silently skip a day that was missed.
+
+Neither one backfills a gap on its own. The `--date` flag above is the
+missing half for Sol's Take: once the machine is awake, the missed days can
+be regenerated deterministically. Nov 1, 2 and 3 were backfilled that way.
+
+The general lesson: **a scheduler that only ever runs "now" cannot recover a
+missed day.** Any series that can legitimately be skipped needs a dated
+entry point so the gap is fillable after the fact.
+
+## The 150-200 word brief was never enforced in code
+
+Published Sol's Take bodies ranged from 187 to 248 words against a 150-200
+brief — the prompt alone does not hold a word count. `sols-take.py` now
+enforces the ceiling with `trim_to_words()` from `text_utils.py`, the same
+helper `weekly-roundup.py` and `midweek-news.py` use, so the trim cuts at
+sentence boundaries and never mid-sentence. `run-daily.py` still has no
+equivalent and its published lengths still drift (see the note above).
+
+## `sols-take.py` could not be imported under Python 3.9
+
+The module used a PEP 604 union (`str | None`) in a return annotation with
+no `from __future__ import annotations`. Python evaluates annotations at
+def-time, so under `/usr/bin/python3` (3.9.6) the module raised
+`TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'` on
+import — before any of its work could start. The future import makes the
+annotations strings, and the module now imports under 3.9.6, 3.13 and 3.15.
+`_minimax_helper.py` already carried this guard for the same reason.
+
+This only ever bit under a scheduler that pinned `/usr/bin/python3`. The
+cron runs `python3` from PATH, which resolves to a 3.13 interpreter here —
+but `install-cron.sh` writes `/usr/bin/python3` into the crontab, so the
+crash was one config change away.

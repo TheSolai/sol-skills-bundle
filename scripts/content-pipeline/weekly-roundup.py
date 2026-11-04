@@ -140,11 +140,13 @@ def is_ai_story(title):
 # is unreachable. The fallback still names the real stories, so the section is
 # never generic filler.
 
-# A reasoning model gives markedly better commentary than MiniMax-Text-01:
+# A reasoning model gives markedly better commentary than the old text model:
 # sharper opinions, no "underscores a shift towards" filler, and honest when
-# a story is too thin to judge. Text-01 stays as the fallback tier.
+# a story is too thin to judge. M2.7-highspeed stays as the fallback tier.
+# (The previous fallback, MiniMax-Text-01, was retired from MiniMax's
+# catalogue on 2026-11-04 — the API answered 404 for it.)
 TAKE_MODEL = "MiniMax-M2.7"
-TAKE_MODEL_FALLBACK = "MiniMax-Text-01"
+TAKE_MODEL_FALLBACK = "MiniMax-M2.7-highspeed"
 
 SOL_TAKE_SYSTEM = """You are Sol AI, writing the commentary section of a weekly AI news roundup.
 
@@ -230,14 +232,15 @@ def generate_sol_take(stories):
         "position a reader could disagree with."
     )
 
-    # Reasoning models give markedly better commentary than MiniMax-Text-01
-    # here — sharper opinions, no "underscores a shift towards" filler, and
-    # honest when a story is too thin to judge. They need a big token
-    # budget because most of it goes on thinking before any text appears.
-    # Text-01 stays as the fallback tier, then the deterministic template.
+    # Reasoning models give markedly better commentary here — sharper
+    # opinions, no "underscores a shift towards" filler, and honest when a
+    # story is too thin to judge. They need a big token budget because most
+    # of it goes on thinking before any text appears, so both tiers get 6000:
+    # the fallback tier is a reasoning model too, and a small cap would buy
+    # an empty completion instead of prose.
     attempts = [
         (TAKE_MODEL, 6000),
-        (TAKE_MODEL_FALLBACK, 900),
+        (TAKE_MODEL_FALLBACK, 6000),
     ]
     for model, max_tokens in attempts:
         try:

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -28,7 +29,34 @@ from pathlib import Path
 
 MINIMAX_KEY_PATH = Path.home() / ".openclaw" / "workspace" / "secrets" / "minimax-key.txt"
 MINIMAX_URL = "https://api.minimax.io/anthropic/v1/messages"
-MINIMAX_MODEL = "MiniMax-Text-01"
+
+# The default model, and the fallbacks tried after it.
+#
+# WHY THE MODEL LIST EXISTS (2026-11-04 incident)
+# -----------------------------------------------
+# `MiniMax-Text-01` was the default here until MiniMax retired it from the
+# catalogue. The API answered `404 not_found_error: The model
+# "MiniMax-Text-01" is no longer available` — but `minimax_generate()` caught
+# the HTTPError, stashed it in `last_err` and returned None, and the caller
+# quietly fell back to its deterministic template. The posts still published
+# and still looked plausible on the page: six scripts' worth of them shipped
+# as link dumps with no prose at all. A retired model must never be a silent
+# failure, so every call now tries the preferred model and then these in
+# order, and prints the reason when all of them fail.
+MINIMAX_MODEL = "MiniMax-M2.7"
+MINIMAX_MODEL_FALLBACKS = ("MiniMax-M2.7-highspeed", "MiniMax-M3.1-Flash")
+
+# Every current MiniMax model is a reasoning model: it spends much of its
+# token budget thinking before it produces any text. Asked for a small cap it
+# returns an EMPTY completion rather than prose — the thinking consumed the
+# whole budget — which looks identical to a failed call. So the cap is raised
+# to a floor for these models. 600 tokens, the old default, is always too few.
+REASONING_MIN_TOKENS = 6000
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """True for models that spend their token budget on thinking first."""
+    return model.startswith(("MiniMax-M1", "MiniMax-M2", "MiniMax-M3"))
 
 
 # ── Thinking-block stripping ────────────────────────────────────────────────
@@ -135,7 +163,81 @@ def load_minimax_key_candidates() -> list:
     return keys
 
 
-def minimax_generate(prompt: str, api_key: str, max_tokens: int = 600, system: str = "",
+def _key_candidates(api_key: str = "") -> list:
+    """Every key worth trying, preferred first.
+
+    The env var and the secrets file drift apart — a key gets rotated in one
+    place but not the other. On 2026-11-04 the env var was a dead key (401)
+    while the file still held the live one. Callers must try each in turn
+    instead of trusting whichever comes first.
+    """
+    keys = []
+    if api_key:
+        keys.append(api_key)
+    for k in load_minimax_key_candidates():
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
+def _model_candidates(model: str = "") -> list:
+    """The preferred model first, then the live fallbacks."""
+    models = []
+    for m in ([model] if model else [MINIMAX_MODEL]) + list(MINIMAX_MODEL_FALLBACKS):
+        if m and m not in models:
+            models.append(m)
+    return models
+
+
+def _call_once(body: bytes, key: str, timeout: int):
+    """One API attempt. Returns (text, error, retryable, truncated)."""
+    try:
+        req = urllib.request.Request(
+            MINIMAX_URL,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01",
+                "x-api-key": key,
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            resp = json.loads(r.read())
+        for block in resp.get("content", []):
+            if block.get("type") == "text":
+                text = strip_thinking(block["text"])
+                if text:
+                    if resp.get("stop_reason") == "max_tokens":
+                        # The answer was cut off by the token limit. It is
+                        # still usable, but a larger budget almost always
+                        # produces a complete one, so the caller is told.
+                        return text, "truncated at the token limit", True, True
+                    return text, "", True, False
+        return None, "empty content", True, False
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        err = f"HTTP {e.code} {e.reason} {detail}".strip()
+        if e.code == 404:
+            # The model is gone from the catalogue — trying it again is
+            # pointless, move on to the next model.
+            return None, err, False, False
+        if e.code in (401, 403):
+            # The key is bad — trying it again is pointless, move on to the
+            # next key.
+            return None, err, False, False
+        if e.code in (429, 500, 502, 503, 504):
+            return None, err, True, False
+        return None, err, False, False
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}", True, False
+
+
+def minimax_generate(prompt: str, api_key: str = "", max_tokens: int = 600, system: str = "",
                     temperature: float = 0.7, timeout: int = 180, retries: int = 3,
                     model: str = "") -> str | None:
     """
@@ -144,11 +246,24 @@ def minimax_generate(prompt: str, api_key: str, max_tokens: int = 600, system: s
     `model` defaults to MINIMAX_MODEL so every existing caller is unchanged.
     Pass a model id explicitly to opt into a different one.
 
+    The call is resilient in three ways, because each of these has already
+    cost the pipeline a day of good content:
+
+      * every known API key is tried in turn (the env var and the secrets
+        file drift apart, and one of them goes stale),
+      * every known model is tried in turn (MiniMax retires models without
+        warning), and
+      * the reason for a total failure is printed, so a degraded run is
+        visible in the log instead of showing up as a bland template post.
+
     NOTE: reasoning models (e.g. MiniMax-M2.7) spend a large part of their
-    token budget on thinking before producing any text — they need a much
-    larger max_tokens than MiniMax-Text-01 to return a complete answer.
+    token budget on thinking before producing any text — the requested
+    `max_tokens` is raised to REASONING_MIN_TOKENS for them, because a small
+    cap yields an empty completion rather than prose.
     """
-    if not api_key:
+    keys = _key_candidates(api_key)
+    if not keys:
+        print("[minimax] no API key available", file=sys.stderr)
         return None
 
     if system:
@@ -156,48 +271,46 @@ def minimax_generate(prompt: str, api_key: str, max_tokens: int = 600, system: s
     else:
         messages = [{"role": "user", "content": prompt}]
 
-    body = json.dumps({
-        "model": model or MINIMAX_MODEL,
-        "max_tokens": min(max_tokens, 8192),
-        "temperature": temperature,
-        "messages": messages,
-    }).encode()
+    last_err = ""
+    for m in _model_candidates(model):
+        budget = max_tokens
+        if _is_reasoning_model(m):
+            budget = max(budget, REASONING_MIN_TOKENS)
+        body = json.dumps({
+            "model": m,
+            "max_tokens": min(budget, 8192),
+            "temperature": temperature,
+            "messages": messages,
+        }).encode()
 
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            req = urllib.request.Request(
-                MINIMAX_URL,
-                data=body,
-                headers={
-                    "Content-Type": "application/json",
-                    "anthropic-version": "2023-06-01",
-                    "x-api-key": api_key,
-                },
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                resp = json.loads(r.read())
-                for block in resp.get("content", []):
-                    if block.get("type") == "text":
-                        text = strip_thinking(block["text"])
-                        if text:
-                            return text
-                last_err = "empty content"
-        except urllib.error.HTTPError as e:
-            last_err = f"HTTP {e.code}: {e.reason}"
-            if e.code in (429, 500, 502, 503, 504):
-                # Transient — retry
-                pass
-            else:
-                # Non-transient — don't retry
-                return None
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
+        for k in keys:
+            for attempt in range(1, retries + 1):
+                text, err, retryable, truncated = _call_once(body, k, timeout)
+                if text is not None and not truncated:
+                    return text
+                last_err = f"{m} with key ...{k[-4:]}: {err}"
+                if truncated:
+                    # The model ran out of budget mid-article. Give it the
+                    # full allowance and ask again — a short post is worse
+                    # than a slow one. If it truncates again, the partial
+                    # text is returned rather than thrown away: the callers
+                    # that care about length have their own repair step.
+                    if budget < 8192:
+                        budget = 8192
+                        body = json.dumps({
+                            "model": m,
+                            "max_tokens": min(budget, 8192),
+                            "temperature": temperature,
+                            "messages": messages,
+                        }).encode()
+                        continue
+                    return text
+                if not retryable:
+                    break
+                if attempt < retries:
+                    time.sleep(2 ** attempt)  # 2, 4 seconds
 
-        # Backoff before next attempt
-        if attempt < retries:
-            backoff = 2 ** attempt  # 2, 4 seconds
-            time.sleep(backoff)
-
+    # A failure here used to be invisible: the caller fell back to a
+    # template and the log said nothing at all.
+    print(f"[minimax] generation failed: {last_err}", file=sys.stderr)
     return None

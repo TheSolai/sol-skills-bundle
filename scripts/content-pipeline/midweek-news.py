@@ -69,11 +69,13 @@ POST_DATE = f"{TODAY.strftime('%B')} {TODAY.day}, {TODAY.year}"
 DAYS_BACK = 3
 STORY_COUNT = 3
 
-# A reasoning model gives markedly better commentary than MiniMax-Text-01:
+# A reasoning model gives markedly better commentary than the old text model:
 # sharper opinions, no "underscores a shift towards" filler, and honest when
-# a story is too thin to judge. Text-01 stays as the fallback tier.
+# a story is too thin to judge. M2.7-highspeed stays as the fallback tier.
+# (The previous fallback, MiniMax-Text-01, was retired from MiniMax's
+# catalogue on 2026-11-04 — the API answered 404 for it.)
 COMMENTARY_MODEL = "MiniMax-M2.7"
-COMMENTARY_MODEL_FALLBACK = "MiniMax-Text-01"
+COMMENTARY_MODEL_FALLBACK = "MiniMax-M2.7-highspeed"
 
 COMMENTARY_SYSTEM = """You are Sol AI, writing the commentary section of a mid-week AI digest.
 
@@ -265,7 +267,7 @@ def generate_commentary(stories):
 
     attempts = [
         (COMMENTARY_MODEL, 6000),
-        (COMMENTARY_MODEL_FALLBACK, 900),
+        (COMMENTARY_MODEL_FALLBACK, 6000),
     ]
     text = None
     for model, max_tokens in attempts:

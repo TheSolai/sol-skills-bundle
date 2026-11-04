@@ -13,12 +13,11 @@ from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from devto_key import load_devto_key
-from _minimax_helper import minimax_generate, load_minimax_key
+from _minimax_helper import minimax_generate, load_minimax_key_candidates
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 DEVTO_API_KEY = load_devto_key()
-MINIMAX_KEY_PATH = Path.home() / ".openclaw" / "workspace" / "secrets" / "minimax-key.txt"
 
 TODAY = datetime.datetime.now(datetime.timezone.utc)
 DATE_STR = TODAY.strftime("%Y-%m-%d")
@@ -26,37 +25,23 @@ POST_DATE = TODAY.strftime("%B %d, %Y")
 DAY_STR = TODAY.strftime("%A")
 
 
-def _load_minimax_key() -> str:
-    try:
-        return MINIMAX_KEY_PATH.read_text().strip()
-    except Exception:
-        return ""
-
-
-def llm_generate(prompt: str, system: str = "", max_tokens: int = 600) -> str | None:
+def llm_generate(prompt: str, system: str = "", max_tokens: int = 6000) -> str | None:
     """Generate text via MiniMax, or return None for template fallback."""
-    key = _load_minimax_key()
-    if not key:
+    keys = load_minimax_key_candidates()
+    if not keys:
+        print("[llm] No MiniMax key available — using template fallback")
         return None
-    messages = [{"role": "user", "content": system + "\n\n" + prompt}] if system else [{"role": "user", "content": prompt}]
-    body = json.dumps({
-        "model": "MiniMax-Text-01",
-        "max_tokens": min(max_tokens, 8192),
-        "temperature": 0.7,
-        "messages": messages,
-    }).encode()
     try:
-
-        result = minimax_generate(prompt, api_key=key, max_tokens=600)  # uses helper with 180s timeout + retries
+        # The helper tries every known key and every known model in turn, and
+        # prints the reason when all of them fail — so a degraded run is
+        # visible in this log instead of silently shipping a template post.
+        result = minimax_generate(prompt, api_key=keys[0], max_tokens=max_tokens, system=system)
 
         if result:
-
-            print(f"[llm] ✅ MiniMax")
-
+            print(f"[llm] ✅ MiniMax ({len(result.split())} words)")
             return result
-
+        print("[llm] MiniMax returned nothing — using template fallback")
     except Exception as e:
-
         print(f"[llm] MiniMax error: {e}")
     return None
 

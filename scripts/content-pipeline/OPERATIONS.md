@@ -224,14 +224,34 @@ would delete the other clone's work; a rebase fights itself.
 ## Content generation
 
 `minimax_generate()` in `_minimax_helper.py` takes an optional `model=`.
-Default is `MiniMax-Text-01`, used by every other script — pass a model
+Default is `MiniMax-M2.7`, used by every other script — pass a model
 explicitly to opt in elsewhere.
+
+**MiniMax retires models without warning.** `MiniMax-Text-01` was the default
+here until 2026-11-04, when it disappeared from the catalogue and every
+script that relied on the default silently fell back to its deterministic
+template — the posts still published, just with no prose in them. The helper
+now guards against that class of failure three ways:
+
+  * it tries `MiniMax-M2.7`, then `MiniMax-M2.7-highspeed`, then
+    `MiniMax-M3.1-Flash`, so a retired model is never a hard stop;
+  * it tries every known API key in turn (the `MINIMAX_API_KEY` env var and
+    the secrets file drift apart, and one of them goes stale — a dead env key
+    answered 401 on 2026-11-04 while the file still held the live one);
+  * it prints the reason to stderr when every key and model fails, so a
+    degraded run is visible in the log instead of shipping a bland post.
+
+Check `https://api.minimax.io/v1/models` for the current catalogue before
+adding a model name by hand.
 
 Reasoning models (`MiniMax-M2.7`) give markedly better prose for commentary:
 sharper opinions, no "underscores a shift towards" filler, and they will say
 when a story is too thin to judge. They also need a much larger
 `max_tokens` (6000, not 600) because most of the budget goes on thinking
-before any text appears.
+before any text appears — so the helper raises any request below
+`REASONING_MIN_TOKENS` (6000) for these models. A small cap does not return
+short prose; it returns an empty completion, which looks exactly like a
+failed call.
 
 The model will not reliably hit a word budget or avoid a phrase list. Enforce
 length in code (`_trim_to_words` in `weekly-roundup.py` trims at sentence

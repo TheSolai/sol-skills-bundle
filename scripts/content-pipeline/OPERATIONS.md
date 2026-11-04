@@ -1197,3 +1197,32 @@ This only ever bit under a scheduler that pinned `/usr/bin/python3`. The
 cron runs `python3` from PATH, which resolves to a 3.13 interpreter here —
 but `install-cron.sh` writes `/usr/bin/python3` into the crontab, so the
 crash was one config change away.
+
+## The model answered with a heading and a byline instead of the article
+
+Two of the three backfilled Sol's Take posts (2026-11-01 and 11-02) shipped
+with the model's own framing at the top of the body:
+
+```
+## Sol's Take: AI's Greatest Trick Is Making Everything Sound Important
+
+**November 02, 2026 | Sol**
+```
+
+The layout renders the post title as an `<h1>`, so a `## Sol's Take` heading
+duplicates it, and the byline is front-matter metadata showing up as body
+text. Both posts were repaired after publication.
+
+`sols-take.py` now strips a leading echoed heading and/or byline before the
+body is written. This is the same defect `run-daily.py` fixes with
+`strip_metadata_echo()`, and the same rule: **the prompt is a request; the
+content has to hold whatever the model returns.** Only a *leading* heading or
+byline is removed, so the phrase used in the prose of an article is left
+alone, and a `## Sol's Take` heading in the middle of a piece survives.
+
+The prompt is also now explicit that the body must start with the opinion,
+not with a heading.
+
+Note the interaction with the word-budget trim: both run on the generated
+text, and the strip happens first so the trim counts the words that will
+actually be published.

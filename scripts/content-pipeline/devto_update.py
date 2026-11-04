@@ -45,6 +45,7 @@ devto_tags = _devto_poster.devto_tags
 
 DEVTO_API = "https://dev.to/api/articles"
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
+SITE_BASE = "https://thesolai.github.io"
 
 
 def devto_update(article_id, title, body, tags, description, api_key, canonical_url="",
@@ -143,6 +144,14 @@ def _old_canonicals(post_path):
                 if line.startswith("redirect_from:"):
                     val = line.split(":", 1)[1].strip().strip('"').strip("'")
                     if val:
+                        # The frontmatter holds a site-relative path
+                        # ("/blog/2026/11/04/old-slug/") but the tracker
+                        # stores absolute URLs. Comparing the two as-is never
+                        # matched, so a regenerated post could not find its
+                        # own dev.to article and the cross-post kept the
+                        # stale body and a dead canonical.
+                        if val.startswith("/"):
+                            val = SITE_BASE.rstrip("/") + val
                         urls.append(val)
     return urls
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 # pipeline might use. `_minimax_helper.py` has the same guard for the same
 # reason.
 
-import sys, os, json, datetime, urllib.request
+import sys, os, json, datetime, urllib.request, re
 from pathlib import Path
 import contextlib, fcntl
 import sys as _sys
@@ -133,6 +133,60 @@ def post_path_for(date_str: str, day_str: str) -> Path:
     return SITE_DIR / "_posts" / f"{date_str}-sols-take-{day_str.lower()}.md"
 
 
+# The model sometimes answers with a heading and a byline instead of the
+# article, e.g.
+#
+#     ## Sol's Take: AI's Greatest Trick Is Making Everything Sound Important
+#     **November 02, 2026 | Sol**
+#
+# The layout already renders the post title as an <h1>, so a "## Sol's Take"
+# heading duplicates it, and the byline is metadata that belongs in the front
+# matter. This is the same defect `run-daily.py` fixes with
+# `strip_metadata_echo()`: the prompt is a request, so the content has to hold
+# whatever the model returns. Stripping happens here, where the content is
+# known to be good.
+#
+# Only a leading heading/byline is removed. A "Sol's Take" phrase used in
+# the prose of an article is left alone.
+_ECHO_HEADING = re.compile(
+    r"^\s*#{1,6}\s*Sol['’]?s\s+Take\b.*$",
+    re.IGNORECASE,
+)
+_ECHO_BYLINE = re.compile(
+    r"^\s*\*{0,2}\s*(?:"
+    r"\w+\s+\d{1,2},\s+\d{4}"          # November 02, 2026
+    r"|\d{4}-\d{2}-\d{2}"              # 2026-11-02
+    r")\s*(?:\|\s*Sol(?:\s+AI)?\s*)?\*{0,2}\s*$",
+    re.IGNORECASE,
+)
+
+
+def strip_metadata_echo(body: str) -> str:
+    """Remove a leading echoed heading and/or byline from the body."""
+    if not body:
+        return body
+
+    lines = body.split("\n")
+
+    # The heading and the byline can appear in either order, so peel whichever
+    # one is currently first, then look again. Stopping after two removals
+    # keeps this from eating real prose.
+    for _ in range(2):
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if not lines:
+            break
+        if _ECHO_HEADING.match(lines[0]):
+            lines.pop(0)
+            continue
+        if _ECHO_BYLINE.match(lines[0]):
+            lines.pop(0)
+            continue
+        break
+
+    return "\n".join(lines).strip()
+
+
 def existing_post_is_degraded(path: Path) -> bool:
     """True when the published post for today is the deterministic fallback.
 
@@ -193,6 +247,12 @@ Author: Sol
         body = f"**The take:** {topic_prompt}\n\nAI is doing a lot of things right now. Most of them are oversold. Some of them are genuinely useful. Figuring out which is which is the actual skill — not knowing everything, but knowing what to pay attention to.\n\nMore coming tomorrow."
         print("[sols-take] Using template fallback")
         return body
+
+    # Strip an echoed heading/byline before anything else.
+    stripped = strip_metadata_echo(body)
+    if stripped != body.strip():
+        print("[sols-take] Stripped echoed heading/byline from the body")
+        body = stripped
 
     # Enforce the word budget in code. The prompt alone does not hold it —
     # published posts have ranged from 187 to 248 words against a 150-200

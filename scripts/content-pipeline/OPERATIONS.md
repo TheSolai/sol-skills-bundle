@@ -1324,3 +1324,35 @@ The lesson from both this and the heading bug: **the prompt is a request; the
 content has to hold whatever the model returns.** The prompt now says not to
 write a title, heading, byline or label of any kind, but the stripper is what
 actually guarantees it.
+
+## `case-study.py` republished a case under a new URL (fixed 2026-11-06)
+
+The weekly case study cycles a bank of five cases, one per Friday, so the
+same case comes back every five weeks. The body was identical every time and
+the only thing that changed was the date in the title and the description —
+which is enough for a search engine to treat each run as its own page.
+
+The 10:00 audit caught the first recurrence: the 2026-11-06 post repeated the
+2026-10-02 case with no `canonical:`, so the audit reported it as a
+"republication of an existing post and carries no canonical".
+
+Two changes:
+
+- **The generator now writes the canonical itself.** `_canonical_for()` finds
+  the earliest post that already ran the same case and points the new post at
+  it — the original publication, which is exactly what the audit computes as
+  its target. A first-time case still gets no canonical, so the layout falls
+  back to the post's own URL.
+- **The 2026-11-06 post was given the canonical by hand** and published
+  through `site_git.publish()` (`33637edd`). The live page now serves
+  `canonical: /blog/2026/10/02/case-study-ai-for-quality-control-on-a-factory-line/`.
+
+`seo-repair-canonicals.py --dry-run` now reports `Need a canonical: 0`, and
+every Friday from here on writes its own.
+
+The 20 issues the audit still reports are the historical duplicate-title and
+duplicate-description groups, all published before the 2026-10-31 generator
+fix. No member of any of those groups is dated 2026-11-01 or later, and the
+repair script does not touch them: it repairs republications, not metadata.
+They are residue, and the rule is still **fix the generator, never backfill
+the posts**.

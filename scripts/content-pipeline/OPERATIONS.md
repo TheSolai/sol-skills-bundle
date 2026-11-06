@@ -1276,3 +1276,51 @@ not with a heading.
 Note the interaction with the word-budget trim: both run on the generated
 text, and the strip happens first so the trim counts the words that will
 actually be published.
+
+## The model answered with a bold label instead of the article
+
+The heading fix above only knew one shape. The model also answers with the
+same framing in bold:
+
+```
+**Sol's Take: The Context Window Size Wars Are a Fool's Errand**
+**Sol's Take**
+```
+
+The stripper matched `## Sol's Take` but not the bold form, so the label
+shipped as a stray bold line under the `<h1>`. It was on **54 published
+posts**, from 2026-06-30 onward — and on the 2026-11-06 post, which is how
+it was found: the run looked fine, the post was on the site, and the body
+just started with `**Sol's Take**`.
+
+The trap is that the label is not always junk. On most of those 54 posts the
+front matter title is the generic `Sol's Take: <weekday>` and the label
+carries the **only headline the article has**:
+
+```
+title: "Sol's Take: Wednesday"
+body:  **Sol's Take: The Great AI Agent Sham**
+```
+
+Deleting that line would leave the post with no title at all. So the rule is
+now:
+
+- a bare label (`**Sol's Take**`) is removed — the `<h1>` already says it
+- a label carrying a date (`**Sol's Take: October 30, 2026**`) is removed —
+  a date is a byline, not a headline, and the front matter has the real date
+- a label carrying a headline keeps that headline, as a bold dek, with the
+  redundant `Sol's Take:` prefix dropped
+
+Front matter is never touched by this. Titles and descriptions are a separate
+question (the duplicate-title audit), and a body repair must not silently
+change them.
+
+`sols-take-label-repair.py` applies the same function to the 54 published
+posts. It is dry-run by default, `--apply` writes, and it refuses any repair
+that would drop more than the label's own words. All 54 were repaired and
+published in `ac76e03d`.
+
+The lesson from both this and the heading bug: **the prompt is a request; the
+content has to hold whatever the model returns.** The prompt now says not to
+write a title, heading, byline or label of any kind, but the stripper is what
+actually guarantees it.

@@ -148,10 +148,6 @@ def post_path_for(date_str: str, day_str: str) -> Path:
 #
 # Only a leading heading/byline is removed. A "Sol's Take" phrase used in
 # the prose of an article is left alone.
-_ECHO_HEADING = re.compile(
-    r"^\s*#{1,6}\s*Sol['’]?s\s+Take\b.*$",
-    re.IGNORECASE,
-)
 _ECHO_BYLINE = re.compile(
     r"^\s*\*{0,2}\s*(?:"
     r"\w+\s+\d{1,2},\s+\d{4}"          # November 02, 2026
@@ -160,27 +156,106 @@ _ECHO_BYLINE = re.compile(
     re.IGNORECASE,
 )
 
+# A leading "Sol's Take" label, in the two shapes the model actually returns:
+#
+#     ## Sol's Take: The Context Window Size Wars Are a Fool's Errand
+#     **Sol's Take: The Context Window Size Wars Are a Fool's Errand**
+#     **Sol's Take**
+#
+# The first shape was already handled; the bold one was not, so it shipped as
+# a stray bold line under the <h1> on 54 posts (2026-06-30 onward), including
+# today's. The label is captured in two parts because the part after the colon
+# is the model's own headline for the piece.
+#
+# IMPORTANT: the headline is NOT thrown away with the label. On most of those
+# posts the front matter title is the generic "Sol's Take: <weekday>" and the
+# label carries the only headline the article has. Stripping the whole line
+# would leave a post with no title at all. So the label prefix is removed and
+# the headline is kept, as a bold dek.
+_ECHO_LABEL_HEADING = re.compile(
+    r"^\s*#{1,6}\s*Sol['’]?s\s+Take\b\s*(?P<rest>.*?)\s*$",
+    re.IGNORECASE,
+)
+_ECHO_LABEL_BOLD = re.compile(
+    r"^\s*(?P<mark>\*{1,2}|_{1,2})\s*Sol['’]?s\s+Take\b"
+    r"\s*(?P<rest>.*?)\s*(?P=mark)\s*$",
+    re.IGNORECASE,
+)
+
+# A bare date on the label, e.g. "Sol's Take: October 30, 2026". A date is a
+# byline, never a headline, and the front matter already carries the post's
+# real date — so the label line goes.
+_LABEL_DATE = re.compile(
+    r"^\s*(?:\w+\s+\d{1,2},\s+\d{4}|\d{4}-\d{2}-\d{2})\s*$"
+)
+
+
+def _label_headline(match: re.Match) -> str | None:
+    """The headline carried by a "Sol's Take" label, if it carries one.
+
+    The label is "Sol's Take", "Sol's Take: <headline>" or "Sol's Take" plus a
+    byline on the same line. The headline is whatever follows the colon.
+    """
+    rest = (match.groupdict().get("rest") or "").strip()
+    if rest.startswith(":"):
+        rest = rest[1:].strip()
+    # Drop a trailing byline: "Some Headline | Sol" -> "Some Headline".
+    rest = re.split(r"\s*\|\s*Sol(?:\s+AI)?\s*$", rest)[0].strip()
+    return rest or None
+
+
+def _strip_label(lines: list[str]) -> bool:
+    """Handle a leading "Sol's Take" label.
+
+    Returns True when the label was recognised (and so the caller should stop
+    looking). The label is removed entirely when it adds nothing to the
+    title; otherwise the label prefix is dropped and the headline it carries is
+    kept as a bold dek, so no content is lost.
+    """
+    match = _ECHO_LABEL_BOLD.match(lines[0]) or _ECHO_LABEL_HEADING.match(lines[0])
+    if not match:
+        return False
+
+    headline = _label_headline(match)
+    if not headline:
+        # Just the bare label — the <h1> already says "Sol's Take".
+        lines.pop(0)
+        return True
+
+    if _LABEL_DATE.match(headline):
+        # A date is a byline, not a headline. The front matter already carries
+        # the post's date, so this line adds nothing.
+        lines.pop(0)
+        return True
+
+    # Keep the headline, drop the redundant "Sol's Take:" prefix.
+    lines[0] = f"**{headline}**"
+    return True
+
 
 def strip_metadata_echo(body: str) -> str:
-    """Remove a leading echoed heading and/or byline from the body."""
+    """Remove a leading echoed heading, label and/or byline from the body."""
     if not body:
         return body
 
     lines = body.split("\n")
 
-    # The heading and the byline can appear in either order, so peel whichever
-    # one is currently first, then look again. Stopping after two removals
-    # keeps this from eating real prose.
-    for _ in range(2):
+    # The heading, the label and the byline can appear in either order, so
+    # peel whichever one is currently first, then look again. Stopping after
+    # three removals keeps this from eating real prose.
+    for _ in range(3):
         while lines and not lines[0].strip():
             lines.pop(0)
         if not lines:
             break
-        if _ECHO_HEADING.match(lines[0]):
-            lines.pop(0)
-            continue
         if _ECHO_BYLINE.match(lines[0]):
             lines.pop(0)
+            continue
+        if _strip_label(lines):
+            # A kept headline is real content — stop peeling, so the prose
+            # below it is never mistaken for more metadata.
+            if lines and lines[0].startswith("**"):
+                break
             continue
         break
 
@@ -219,6 +294,17 @@ def run_lock():
         os.close(fd)
 
 
+def post_title(d: datetime.datetime) -> str:
+    """The front matter title for a day's post.
+
+    Shared by the generator and the body stripper so the stripper can tell a
+    label that repeats the title (redundant) from a label carrying a real
+    headline (worth keeping).
+    """
+    _, post_date, day_str = date_fields(d)
+    return f"Sol's Take: {day_str} — {post_date}"
+
+
 def generate_take(d: datetime.datetime) -> str:
     topic_key = pick_topic(d)
     topic_prompt = TOPIC_PROMPTS[topic_key]
@@ -229,6 +315,7 @@ def generate_take(d: datetime.datetime) -> str:
 
 Rules:
 - Start with the opinion immediately. No warm-up paragraphs.
+- Do not write a title, heading, byline, or "Sol's Take" label of any kind.
 - Be direct, slightly provocative, slightly wry.
 - Ground it in something real — a specific experience, a pattern you've noticed, a claim that bugs you.
 - End with one sharp sentence.
@@ -248,10 +335,11 @@ Author: Sol
         print("[sols-take] Using template fallback")
         return body
 
-    # Strip an echoed heading/byline before anything else.
+    # Strip an echoed heading/byline/label before anything else. A label that
+    # carries a real headline keeps that headline, as a bold dek.
     stripped = strip_metadata_echo(body)
     if stripped != body.strip():
-        print("[sols-take] Stripped echoed heading/byline from the body")
+        print("[sols-take] Stripped echoed heading/byline/label from the body")
         body = stripped
 
     # Enforce the word budget in code. The prompt alone does not hold it —
@@ -282,7 +370,7 @@ def create_post(body: str, d: datetime.datetime) -> Path:
 
     frontmatter = f"""---
 layout: post
-title: "Sol's Take: {day_str} — {post_date}"
+title: "{post_title(d)}"
 date: {date_str} 09:00:00 +0000
 tags: [ai, opinion, sols-take, sol]
 author: Sol

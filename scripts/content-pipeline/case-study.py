@@ -7,7 +7,7 @@ Runs Fridays at 9am UK time.
 Format: real companies, real (anonymised) deployments, real lessons.
 """
 
-import os, datetime, json
+import os, datetime, json, re
 from pathlib import Path
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
@@ -106,6 +106,56 @@ def log(msg):
     print(msg)
 
 
+def _post_date(path):
+    """The date Jekyll uses for a post: its front-matter date, else its filename."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    m = re.search(r"^date:\s*(\d{4}-\d{2}-\d{2})", text, re.M)
+    if m:
+        return m.group(1)
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})-", path.name)
+    return m.group(1) if m else None
+
+
+def _slugify(text):
+    """The permalink slug Jekyll derives from a post's filename."""
+    s = re.sub(r"[^a-z0-9]+", "-", str(text).lower())
+    return re.sub(r"-+", "-", s).strip("-")
+
+
+def _canonical_for(slug, date_str):
+    """The canonical URL of the earliest post that already ran this case.
+
+    WHY (2026-11-06)
+    ----------------
+    The bank holds five cases and cycles every five Fridays, so the same
+    case is republished with a new date every five weeks. Same body under a
+    new URL is a duplicate, and the post layout supports a `canonical:`
+    front-matter field for exactly that case. Without it the SEO audit
+    flags every republication ("republication of an existing post and
+    carries no canonical").
+
+    The canonical always points at the EARLIEST post of that case — the
+    original publication — which is what the audit computes as its target.
+    """
+    posts_dir = SITE_DIR / "_posts"
+    if not posts_dir.is_dir():
+        return None
+    candidates = []
+    for p in posts_dir.glob(f"*-case-study-{slug}.md"):
+        d = _post_date(p)
+        if not d or d == date_str:
+            continue  # today's own file, when the generator re-runs
+        candidates.append((d, p))
+    if not candidates:
+        return None
+    date, path = min(candidates, key=lambda c: c[0])
+    stem = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", path.stem)
+    return f"/blog/{date[:4]}/{date[5:7]}/{date[8:10]}/{_slugify(stem)}/"
+
+
 def generate_post():
     """Generate a weekly case study."""
     today = datetime.datetime.now(datetime.timezone.utc)
@@ -121,6 +171,12 @@ def generate_post():
 
     lessons_md = "\n".join(f"{i+1}. {lesson}" for i, lesson in enumerate(case["lessons"]))
 
+    # A case that has already been published before is a republication: same
+    # body, new URL. Point the canonical at the original so the two are
+    # consolidated instead of competing in the index.
+    canonical = _canonical_for(slug, date_str)
+    canonical_line = f"\ncanonical: {canonical}" if canonical else ""
+
     # The episode date belongs in the title and description. The case bank
     # cycles, so without it the same case recurs under identical metadata.
     post_date = f"{today.strftime('%B')} {today.day}, {today.year}"
@@ -130,7 +186,7 @@ title: {_yaml(f"Case Study: {case['title']} ({post_date})")}
 description: {_yaml(f"How {case['company']} deployed AI for {case['industry'].lower()}. Real outcomes, real lessons. ({post_date})")}
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
-date: {date_str}
+date: {date_str}{canonical_line}
 tags: [ai, case-study, deployment, enterprise, {case['industry'].lower()}]
 author: Sol AI
 ---

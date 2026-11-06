@@ -113,3 +113,191 @@ def trim_to_words(text, limit=200):
     if len(trimmed.split()) < 80:
         return text
     return trimmed
+
+
+# ── Structure-aware trimming ───────────────────────────────────────────────
+
+# A regional post is not a wall of prose: it has a title line, section
+# headings, a "What this means" analysis, a takeaway and a source line.
+# `trim_to_words()` cuts from the end of a block of prose, which for one
+# of these bodies would eat the takeaway and the analysis — the parts the
+# prompt explicitly requires. The helpers below trim the *expendable*
+# prose instead, and never touch the structural lines.
+
+_HEADING_RE = re.compile(r"^#{1,6}\s")
+_DIVIDER_RE = re.compile(r"^---+$")
+_SOURCE_RE = re.compile(r"^\*Source:")
+# "**Takeaway:** ...", "**The takeaway**", "**One-sentence takeaway**".
+_TAKEAWAY_RE = re.compile(r"^\*\*[^*]{0,40}\btakeaway\b", re.IGNORECASE)
+
+
+def split_blocks(text):
+    """Split a post body into its blocks — paragraphs separated by blank lines."""
+    return text.split("\n\n")
+
+
+def _first_line(block):
+    for line in block.splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def classify_blocks(blocks):
+    """Label each block so the trim knows what it may cut.
+
+    Labels: `blank`, `divider`, `source`, `title`, `heading`, `takeaway`,
+    `prose`. The first non-blank block is the `title` — it is protected
+    whatever shape it takes (an H1, an H3 or a bold line).
+    """
+    kinds = []
+    seen_body = False
+    for block in blocks:
+        line = _first_line(block)
+        if not line:
+            kinds.append("blank")
+        elif _DIVIDER_RE.match(line):
+            kinds.append("divider")
+        elif _SOURCE_RE.match(line):
+            kinds.append("source")
+        elif not seen_body:
+            kinds.append("title")
+        elif _HEADING_RE.match(line):
+            kinds.append("heading")
+        elif _TAKEAWAY_RE.match(line):
+            kinds.append("takeaway")
+        else:
+            kinds.append("prose")
+        if kinds[-1] not in ("blank", "divider"):
+            seen_body = True
+    return kinds
+
+
+def budget_words(blocks, kinds):
+    """Words that count against the budget.
+
+    The measure is the one OPERATIONS.md uses when comparing published
+    posts: the title line, the section headings, the `---` dividers and
+    the `*Source:*` line are excluded, and everything else counts.
+    """
+    total = 0
+    for block, kind in zip(blocks, kinds):
+        if kind in ("title", "divider", "source", "heading", "blank"):
+            continue
+        total += len(block.split())
+    return total
+
+
+def trim_to_word_budget(body, limit=600, floor=400):
+    """Trim a structured post body to a word ceiling, keeping its structure.
+
+    WHY (2026-11-06): `run-daily.py` asks for 400-600 words and does not
+    enforce it — the prompt alone does not hold a word budget. Published
+    regional posts ran to 708 words. This is the structure-aware
+    equivalent of `trim_to_words()` for a body that has sections.
+
+    What is protected: the title line, every section heading, the
+    takeaway, the source line, and the final paragraph of the body (which
+    carries the conclusion). What is cut: whole sentences from the
+    expendable prose — the lead first, then the analysis — never
+    mid-sentence, and never below one sentence per paragraph.
+
+    Returns the body unchanged when it is already within the limit.
+    """
+    blocks = split_blocks(body)
+    kinds = classify_blocks(blocks)
+    total = budget_words(blocks, kinds)
+    if total <= limit:
+        return body
+
+    prose = [i for i, k in enumerate(kinds) if k == "prose"]
+    if not prose:
+        return body
+
+    # The first section heading splits the lead from the analysis.
+    first_heading = next((i for i, k in enumerate(kinds) if k == "heading"), None)
+    if first_heading is None:
+        lead, analysis = prose, []
+    else:
+        lead = [i for i in prose if i < first_heading]
+        analysis = [i for i in prose if i > first_heading]
+
+    # The last prose paragraph holds the conclusion — cut it only as a
+    # last resort, once the lead and the analysis have given up their
+    # expendable sentences.
+    final_prose = prose[-1]
+
+    cut_order = [i for i in reversed(lead) if i != final_prose]
+    cut_order += [i for i in reversed(analysis) if i != final_prose]
+    if final_prose not in cut_order:
+        cut_order.append(final_prose)
+
+    over = total - limit
+    current = total
+    dropped_blocks = set()
+
+    for i in cut_order:
+        if over <= 0:
+            break
+        sentences = split_sentences(blocks[i].strip())
+        if not sentences:
+            continue
+
+        # The paragraph's full word count, and how many of its words are
+        # already committed to being cut.
+        para_words = len(blocks[i].split())
+        shed = 0
+
+        # First, cut whole sentences from the end of the paragraph, keeping
+        # at least one sentence.
+        while len(sentences) > 1 and over - shed > 0:
+            dropped = len(sentences[-1].split())
+            # Never cut the body below the floor: a short post is a failed
+            # post, and the ceiling is the thing being fixed.
+            if current - shed - dropped < floor:
+                break
+            sentences.pop()
+            shed += dropped
+
+        if over - shed <= 0:
+            # This paragraph alone brings the body under the ceiling.
+            blocks[i] = " ".join(sentences)
+            current -= shed
+            over -= shed
+            continue
+
+        # Still over the ceiling and the paragraph cannot give up any more
+        # sentences (it is down to one). Dropping it whole is the only way
+        # to shed the rest. A heading whose only paragraph was dropped is
+        # removed further down, so no section is left dangling.
+        if current - para_words < floor:
+            # Cutting this paragraph would starve the post. Leave it and
+            # move on - a slightly long post beats a short one.
+            blocks[i] = " ".join(sentences)
+            current -= shed
+            over -= shed
+            continue
+        dropped_blocks.add(i)
+        current -= para_words
+        over -= para_words
+
+
+    if not dropped_blocks:
+        # Only sentences were cut; no paragraph was removed wholesale.
+        return "\n\n".join(blocks).strip()
+
+    kept = [b for i, b in enumerate(blocks) if i not in dropped_blocks]
+
+    # A section heading whose only paragraph was dropped would dangle, so
+    # drop the heading too — a heading with nothing under it reads as a
+    # formatting error rather than a section.
+    kept_kinds = classify_blocks(kept)
+    final = []
+    for i, (b, k) in enumerate(zip(kept, kept_kinds)):
+        if k == "heading":
+            following = kept_kinds[i + 1: i + 2]
+            if not following or following[0] not in ("prose", "takeaway"):
+                continue
+        final.append(b)
+
+    return "\n\n".join(final).strip()

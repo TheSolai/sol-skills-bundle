@@ -12,13 +12,14 @@ Or manually:
 LLM: MiniMax only. Falls back to structured templates if key is missing.
 """
 
-import sys, os, json, datetime, urllib.request, re
+import sys, os, json, datetime, urllib.request, re, contextlib, fcntl
 from html.parser import HTMLParser
 from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from _minimax_helper import minimax_generate, load_minimax_key
 from post_identity import body_signature, published_signatures
+from text_utils import trim_to_word_budget
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle")
@@ -26,6 +27,39 @@ TODAY = datetime.datetime.now(datetime.timezone.utc)
 DATE_STR = TODAY.strftime("%Y-%m-%d")
 POST_DATE = TODAY.strftime("%B %d, %Y")
 MINIMAX_KEY_PATH = Path.home() / ".openclaw" / "workspace" / "secrets" / "minimax-key.txt"
+RUN_LOCK_FILE = Path("/tmp/sol-daily-content.lock")
+
+# The word budget the regional prompts ask for. Enforced in code, because
+# the prompt alone does not hold it — see text_utils.trim_to_word_budget().
+WORD_LIMIT = 600
+WORD_FLOOR = 400
+
+
+@contextlib.contextmanager
+def run_lock():
+    """Serialise runs so two schedulers cannot both write today's posts.
+
+    WHY (2026-11-06): this series is driven by BOTH the 07:00 launchd
+    agent (`ai.sol.daily-content`) and an 08:00 cron task. Without a lock
+    both can pass the existence check before either writes. The lock is
+    held for the whole run, so the second scheduler skips rather than
+    racing the first.
+    """
+    RUN_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(RUN_LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("[lock] Another run holds the lock — skipping")
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _load_minimax_key() -> str:
@@ -606,14 +640,20 @@ def _post_region_and_url(path: Path):
     return region, hn_url
 
 
-def find_duplicate_post(region, hn_url, date_str=None):
-    """Find an existing post for this region/story that the pipeline already wrote.
+def find_post_for_region(region, date_str=None):
+    """Find ANY post already published for this region on this date.
 
-    The filename of a regional post is derived from the LLM-generated title,
-    so two runs on the same day produce two *different* filenames for the
-    same story. Checking `filepath.exists()` therefore never matched, and
-    every re-run published a duplicate post. Match on the stable keys
-    instead: date + region + source URL.
+    WHY (2026-11-06): the old check matched date + region + source URL, so
+    it only caught a re-run that picked the SAME story. This series is
+    driven by BOTH the 07:00 launchd agent (`ai.sol.daily-content`) and an
+    08:00 cron task. When Hacker News' top AI story changed between the
+    two runs, the 08:00 run saw a URL that was not in the archive and
+    published a SECOND set of three regional posts for the same day —
+    three more URLs carrying near-identical prose.
+
+    The day's post for a region is the unit of publication, not the
+    story. If the region already has a post for this date, the day's
+    work for that region is done, whatever story it covers.
     """
     date_str = date_str or DATE_STR
     posts_dir = SITE_DIR / "_posts"
@@ -621,12 +661,25 @@ def find_duplicate_post(region, hn_url, date_str=None):
         return None
 
     for path in sorted(posts_dir.glob(f"{date_str}-*.md")):
-        post_region, post_url = _post_region_and_url(path)
-        if post_region != region:
-            continue
-        if hn_url and post_url and post_url == hn_url:
+        post_region, _ = _post_region_and_url(path)
+        if post_region == region:
             return path
     return None
+
+
+def existing_post_is_degraded(path):
+    """True when the published post is the deterministic template fallback.
+
+    A degraded post is worth regenerating; a real one is not. The
+    fallback body is recognisable: its title carries the `[UK]`/`[EU]`/
+    `[US]` prefix that `build_jekyll_post()` only adds on the fallback
+    path, and its prose is the structured template rather than analysis.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(re.search(r'^title:\s*"?\[(UK|EU|US)\]\s', text, re.M))
 
 
 # A metadata line the model echoed instead of leaving in the front matter.
@@ -779,6 +832,17 @@ One takeaway: Watch this space. The AI story is still being written.
         # Strip markdown emphasis: the model often returns titles wrapped in
         # "**...**", which leaks into frontmatter and fails the site health test.
         title = _clean_title(lines[0]) if lines else story["title"]
+
+    # Enforce the word budget in code. The prompt asks for 400-600 words
+    # and does not enforce it — the model writes over the brief and the
+    # published length drifts with it. The trim cuts at sentence
+    # boundaries and keeps the structure the prompt requires (the title
+    # line, the section headings, the takeaway and the source line).
+    trimmed = trim_to_word_budget(content, limit=WORD_LIMIT, floor=WORD_FLOOR)
+    if trimmed != content:
+        print(f"[{region}] Trimmed {len(content.split())} -> "
+              f"{len(trimmed.split())} words")
+        content = trimmed
 
     # Truncating to 60 chars can leave a trailing hyphen (the strip above
     # happens before the cut). Jekyll's :title permalink drops that hyphen,
@@ -990,6 +1054,16 @@ def main():
     print(f"Sol AI Daily Content Pipeline — {DATE_STR}")
     print(f"{'='*60}\n")
 
+    # Serialise the run. The 07:00 launchd agent and this 08:00 task both
+    # drive this script; without the lock both can pass the "already
+    # published today" check before either writes.
+    with run_lock() as got_lock:
+        if not got_lock:
+            return
+        run_pipeline()
+
+
+def run_pipeline():
     api_key = os.getenv("DEVTO_API_KEY", "")
 
     # 1. Fetch news
@@ -1012,14 +1086,29 @@ def main():
             print(f"[{region}] No story available, skipping")
             continue
 
-        # Dedupe on date + region + source URL, checked *before* generating
-        # content. The generated title (and therefore the filename) changes
-        # between runs, so a filename check cannot detect that today's post
-        # for this region already exists.
-        duplicate = find_duplicate_post(region, story.get("url", ""))
-        if duplicate:
-            print(f"[{region}] ⚠️  Already published this story: {duplicate.name}")
+        # Idempotency: the day's post for a region is the unit of
+        # publication, not the story. Checked BEFORE the expensive LLM
+        # call.
+        #
+        # WHY (2026-11-06): the old check matched date + region + source
+        # URL, so it only caught a re-run that picked the SAME story. This
+        # series is driven by BOTH the 07:00 launchd agent and an 08:00
+        # cron task; when HN's top AI story changed between the two runs,
+        # the second run saw an unknown URL and published a SECOND set of
+        # three regional posts for the same day. Matching on date + region
+        # closes that gap.
+        existing = find_post_for_region(region)
+        stale = None
+        if existing and not existing_post_is_degraded(existing):
+            print(f"[{region}] ⚠️  Already published today: {existing.name} — skipping")
             continue
+        if existing:
+            # A degraded post is the deterministic template fallback, not
+            # real content. It is the one case worth regenerating. The old
+            # file has to go, or the region ends the day with two posts —
+            # the duplicate this check exists to prevent.
+            print(f"[{region}] ⚠️  Today's post is a template fallback — regenerating")
+            stale = existing
 
         content = generate_post(region, story)
         filepath, frontmatter = build_jekyll_post(region, content, story)
@@ -1030,6 +1119,9 @@ def main():
             filepath.write_text(frontmatter, encoding="utf-8")
             print(f"[{region}] ✅ Written: {filepath.name}")
             generated_posts.append((region, filepath, frontmatter, story))
+            if stale and stale != filepath:
+                stale.unlink()
+                print(f"[{region}] 🗑️  Removed the template fallback: {stale.name}")
 
     # 3. Generate bloopers post
     print("\n[bloopers] Generating weekly bloopers post...")

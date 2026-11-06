@@ -259,10 +259,41 @@ boundaries, never mid-sentence), and give style examples about a *different*
 topic than the stories in play — with a matching example, the model copies
 it verbatim.
 
-`run-daily.py` has **no** equivalent of `_trim_to_words`. "400-600 words"
-there is a prompt instruction only, so the published length drifts over —
-the 2026-10-27 posts came in at 582 (UK), 645 (EU) and 640 (US) body
-words. Add a sentence-boundary trim there if the range needs to hold.
+`run-daily.py` now enforces its range in code (see "The regional posts
+were not trimmed to their word budget" below).
+
+## The regional posts were not trimmed to their word budget (fixed 2026-11-06)
+
+`run-daily.py` asked for 400-600 words and did not enforce it — the prompt
+alone does not hold a word budget. The published length drifted with the
+model: 11 of the 311 published regional posts came in over 600 words on the
+measure used here (the title line, section headings, `---` dividers and the
+`*Source:*` line excluded), the worst at 708.
+
+A plain `_trim_to_words()` would have been the wrong fix. A regional post
+is not a wall of prose — it has a title line, section headings, a "What
+this means" analysis, a takeaway and a source line — and trimming from the
+end of the body would have eaten the analysis and the takeaway, the two
+parts the prompt explicitly requires. So `text_utils.py` grew
+`trim_to_word_budget()`, the structure-aware equivalent:
+
+- it classifies every block (title / heading / takeaway / source /
+  divider / prose) before cutting anything;
+- it cuts the **expendable** prose — the lead first, then the analysis —
+  and protects the title line, every heading, the takeaway, the source line
+  and the concluding paragraph;
+- it cuts at **sentence boundaries**, never mid-sentence, and never below
+  one sentence per paragraph;
+- a paragraph that cannot give up any more sentences is dropped whole, and
+  a heading left with nothing under it is dropped with it, so no section
+  dangles;
+- a **floor of 400 words** stops it cutting a post short rather than long.
+
+It was regression-tested against all 311 published regional posts: every
+one stays within the ceiling when trimmed, keeps its title, headings,
+takeaway and source line, and still ends on a complete sentence. The
+budget is measured the same way OPERATIONS.md has always measured a
+published body, so the numbers are comparable with the ones above.
 
 ## A generator must never publish content that already exists
 
@@ -318,27 +349,43 @@ is the single definition of "this post needs a canonical", and
 `seo-repair-canonicals.py` applies exactly what the audit prescribes —
 the repair can never disagree with the check that reports it.
 
-## The 08:00 cron duplicates the 07:00 launchd job
+## The 08:00 cron duplicates the 07:00 launchd job (fixed 2026-11-06)
 
 `ai.sol.daily-content` (launchd, 07:00) already runs `run-daily.py`, so the
-08:00 cron invocation of the same script is a **guaranteed no-op**: the
-day's posts exist, `find_duplicate_post()` matches them on date + region +
-source URL, and the run reports "Already published this story" for all
-three regions and exits without pushing. That is correct behaviour, not a
-failure — do not treat it as a broken pipeline.
+08:00 cron invocation of the same script is a **no-op**: the day's posts
+exist, `find_post_for_region()` matches them on date + region, and the run
+reports "Already published today: <file> — skipping" for all three regions
+and exits without pushing. That is correct behaviour, not a failure — do not
+treat it as a broken pipeline.
 
-The dedupe key is the **source URL**, so a re-run only skips when HN's top
-AI story is unchanged. If a different story takes the top slot between
-07:00 and 08:00, the 08:00 run publishes a *second* set of three regional
-posts for the same day, because nothing checks for a post that already
-exists for that date and region. If that ever happens, delete the
-duplicate set rather than keeping both.
+The dedupe key used to be the **source URL**, so a re-run only skipped when
+HN's top AI story was unchanged. If a different story took the top slot
+between 07:00 and 08:00, the 08:00 run published a *second* set of three
+regional posts for the same day, because nothing checked for a post that
+already existed for that date and region. That is fixed:
+
+- **The day's post for a region is the unit of publication, not the
+  story.** `find_post_for_region(region)` matches on date + region alone,
+  so a changed story no longer slips past the check. The old
+  `find_duplicate_post()` (date + region + source URL) was removed as dead
+  code.
+- **The check runs before the expensive LLM call**, so a duplicate is
+  skipped without paying for a generation.
+- **A run lock** (`flock` on `/tmp/sol-daily-content.lock`, the same
+  pattern `sols-take.py` uses) means the 07:00 and 08:00 runs cannot both
+  pass the check before either writes. The second run prints
+  "[lock] Another run holds the lock — skipping".
+- **A degraded post is the one case worth regenerating.** The structured
+  fallback is not real content, so a post whose title carries the
+  `[UK]`/`[EU]`/`[US]` prefix is rewritten rather than skipped.
 
 Note also that `python3` on PATH in this environment resolves to the
 Learnage venv (`/Users/amre/Projects/Learnage/.venv/bin/python3`), not
 `/usr/bin/python3` or `/opt/homebrew/bin/python3`. The launchd job pins
 `/opt/homebrew/bin/python3`; a bare `python3` in a cron entry depends on
-whatever the shell resolves first.
+whatever the shell resolves first. Both `run-daily.py` and `text_utils.py`
+import cleanly under `/usr/bin/python3` (3.9.6) as well as
+`/opt/homebrew/bin/python3` (3.15).
 
 ## The weekly roundup's "Sol's Take"
 
@@ -602,13 +649,16 @@ the facts, or the model will.
 
 ## A generator's word budget is a prompt instruction, not a constraint
 
-`run-daily.py` asks for 400-600 words and does not enforce it — there is no
-`_trim_to_words` equivalent to the one in `weekly-roundup.py`. The 2026-10-28
-posts came in at 591 (EU), 528 (UK) and 600 (US) body words after editing,
-and the 2026-10-27 set was 582/645/640. When editing a published post for
-accuracy, measure the body the same way both times (exclude the title line,
-`###` headings, `---` dividers and the `*Source:*` line) or the comparison
-is meaningless.
+`run-daily.py` used to ask for 400-600 words and not enforce it — there was
+no `_trim_to_words` equivalent to the one in `weekly-roundup.py`. The
+2026-10-28 posts came in at 591 (EU), 528 (UK) and 600 (US) body words
+after editing, and the 2026-10-27 set was 582/645/640. It now trims in
+code via `text_utils.trim_to_word_budget()` — see "The regional posts were
+not trimmed to their word budget" above.
+
+When editing a published post for accuracy, measure the body the same way
+both times (exclude the title line, `###` headings, `---` dividers and the
+`*Source:*` line) or the comparison is meaningless.
 
 ## The midweek digest was three different things from its own description
 

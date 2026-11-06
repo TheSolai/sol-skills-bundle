@@ -8,7 +8,7 @@ Cronsetup: launchd StartCalendarInterval Monday-Friday 07:00
 Or: 0 7 * * 1-5 python3 scripts/content-pipeline/quick-hits.py >> logs/sol-quick-hits.log 2>&1
 """
 
-import sys, os, json, datetime, urllib.request, urllib.parse
+import sys, os, json, datetime, urllib.request, urllib.parse, re
 from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
@@ -127,6 +127,28 @@ def fetch_devto_articles(limit=10):
         return []
 
 
+# A line that is nothing but a signature: optional dashes/markdown, the name,
+# optional "AI", optional markdown. "—Sol", "-- Sol" and "**Sol**" all match;
+# a sentence that merely ends in the word "Sol" does not, because the name has
+# to be alone on its line.
+_TRAILING_BYLINE = re.compile(
+    r"^\s*(?:[-—–_*]{0,4}\s*)?Sol(?:\s+AI)?\s*(?:[-—–_*]{0,4})\s*$",
+    re.IGNORECASE,
+)
+
+
+def strip_trailing_byline(body: str) -> str:
+    """Remove a model-added trailing byline from the body."""
+    if not body:
+        return body
+    lines = body.rstrip().split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and _TRAILING_BYLINE.match(lines[-1]):
+        lines.pop()
+    return "\n".join(lines).rstrip()
+
+
 def build_quick_hits(hn_stories, devto_articles):
     """Use LLM to pick best 3 stories and write the briefing."""
 
@@ -189,6 +211,16 @@ Candidate stories:
             lines.append(f"[{item['source']}]({item['url']}) — {item['score']} score")
             lines.append("")
         return "\n".join(lines)
+
+    # The model sometimes signs the post itself ("—Sol", "-- Sol", "**Sol**").
+    # The layout already renders "By Sol" in the header, so a trailing
+    # signature is a duplicate byline — the same defect sols-take.py and
+    # run-daily.py already strip. Only a line that is nothing but the
+    # signature is removed, so prose that merely ends in the word is safe.
+    stripped = strip_trailing_byline(body)
+    if stripped != body.strip():
+        print("[quick-hits] Stripped trailing byline from the body")
+        body = stripped
     return body
 
 

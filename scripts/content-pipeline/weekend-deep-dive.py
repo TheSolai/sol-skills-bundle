@@ -55,7 +55,12 @@ import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from devto_key import load_devto_key
 from _minimax_helper import minimax_generate, load_minimax_key, strip_thinking
-from text_utils import trim_to_words
+from text_utils import (
+    budget_words,
+    classify_blocks,
+    split_blocks,
+    trim_to_word_budget,
+)
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
@@ -786,21 +791,53 @@ def _enforce_max_words(body: str | None, topic: dict, hn_stories: list,
         print(f"[deep-dive] ⚠️  Still {cwc} words after condensing.")
 
     # Last resort: cut at sentence boundaries. This keeps the piece alive even
-    # when the model refuses to shorten it. `trim_to_words` preserves the
-    # paragraph breaks and never cuts mid-sentence.
+    # when the model refuses to shorten it.
     #
-    # It is asked for a slightly lower limit than the ceiling because it can
-    # overshoot by the length of the final sentence it keeps, and because a
-    # section heading at the very end would otherwise be left dangling with
-    # no body text under it.
-    trimmed = trim_to_words(condensed or body, limit=MAX_WORDS - 40)
-    trimmed = _drop_dangling_heading(trimmed)
+    # `trim_to_word_budget` is the structure-aware trimmer: it protects every
+    # section heading and the closing paragraph (which carries the takeaway)
+    # and cuts the expendable prose instead, dropping a heading whose only
+    # paragraph it had to remove. A plain `trim_to_words` would eat the
+    # closing from the end — see OPERATIONS.md, "The regional posts were not
+    # trimmed to their word budget".
+    #
+    # Its budget excludes the title line and the section headings, so it is
+    # asked for a lower limit than MAX_WORDS: the ceiling here counts the
+    # whole body, headings included.
+    source = condensed or body
+    overhead = _heading_overhead(source)
+    trimmed = trim_to_word_budget(source, limit=MAX_WORDS - overhead, floor=MIN_WORDS)
     t_wc = len(trimmed.split())
     if t_wc < MIN_WORDS:
         print(f"[deep-dive] ❌ Trim left only {t_wc} words. Aborting without publishing.")
         return None
+    if t_wc > MAX_WORDS:
+        # The trimmer stops short rather than cutting a paragraph it is
+        # protecting. Tighten the limit and go again rather than publish
+        # over the ceiling.
+        print(f"[deep-dive] ⚠️  Structure-aware trim left {t_wc} words; tightening.")
+        trimmed = trim_to_word_budget(trimmed, limit=MAX_WORDS - overhead, floor=MIN_WORDS)
+        t_wc = len(trimmed.split())
+        if t_wc < MIN_WORDS:
+            print(f"[deep-dive] ❌ Trim left only {t_wc} words. Aborting without publishing.")
+            return None
+        if t_wc > MAX_WORDS:
+            print(f"[deep-dive] ❌ Could not get the draft under {MAX_WORDS} words. Aborting without publishing.")
+            return None
     print(f"[deep-dive] ✅ Trimmed {wc} → {t_wc} words (mechanical fallback).")
     return trimmed
+
+
+def _heading_overhead(body: str) -> int:
+    """Words the body spends on the title line and its section headings.
+
+    `trim_to_word_budget` does not count those against its limit, but the
+    ceiling here counts the whole body. This is the difference between the
+    two measures, so the trimmer can be asked for the right limit.
+    """
+    total = len(body.split())
+    blocks = split_blocks(body)
+    kinds = classify_blocks(blocks)
+    return total - budget_words(blocks, kinds)
 
 
 def _drop_dangling_heading(body: str) -> str:
@@ -809,6 +846,10 @@ def _drop_dangling_heading(body: str) -> str:
     A sentence-level trim can end exactly on a section heading, leaving the
     reader with a promise ("## What Happens When the Well Runs Dry?") and no
     answer. The heading goes; the prose before it stands on its own.
+
+    `trim_to_word_budget` already drops a heading whose only paragraph it had
+    to remove, so this is the belt-and-braces version for any trim path that
+    does not classify blocks.
     """
     paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
     while paragraphs and paragraphs[-1].startswith("#"):

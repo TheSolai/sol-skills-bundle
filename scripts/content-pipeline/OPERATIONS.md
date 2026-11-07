@@ -647,6 +647,47 @@ The underlying lesson generalises past this pipeline: **a prompt that asks
 a model for a local angle will get one, whether or not one exists.** Supply
 the facts, or the model will.
 
+## The Weekend Deep Dive had a word floor but no word ceiling (fixed 2026-11-07)
+
+`weekend-deep-dive.py` asks for a 600-800 word piece and the prompt asks for
+700-750, but the script only ever enforced a **floor** — 400 words, below
+which the draft is a stub. There was no ceiling at all, so nothing stopped
+the model from writing long.
+
+MiniMax-M2.7 drifts long. The 2026-11-07 episode came in at **1050 words** —
+the longest ever published, against an 800-word brief. The preceding episodes
+ran 773, 806, 713 and 853, so the drift was real but gradual and only this
+one crossed the line badly enough to notice.
+
+Enforcement is now three-tiered, so a length overrun can never cost the site
+an episode:
+
+1. **Condense via the model**, with escalating pressure across three attempts.
+   The condenser edits the existing draft rather than regenerating, so the
+   argument, the citations and the closing takeaway survive. A single pass is
+   not dependable — a real condense of the 1050-word draft came back at 919
+   words, still over the line; the second attempt landed at **784 words** with
+   both citations, all four sections and the closing takeaway intact.
+2. **Trim mechanically** at sentence boundaries via
+   `text_utils.trim_to_word_budget()`. This is the structure-aware trimmer
+   `run-daily.py` uses, and it is the right one here: it protects the title
+   line, every section heading and the concluding paragraph, and cuts the
+   expendable prose instead. A plain `trim_to_words()` cuts from the end,
+   which eats the closing takeaway first — the exact failure OPERATIONS.md
+   warns about under "The regional posts were not trimmed to their word
+   budget". On the real 1050-word draft the structure-aware trim gives **831
+   words** with all four sections, both citations and the takeaway intact.
+3. **Abort** rather than publish a stub.
+
+One measure subtlety worth remembering: `trim_to_word_budget()` excludes the
+title line and the section headings from its budget, while this ceiling
+counts the whole body. The trimmer is therefore asked for `MAX_WORDS` minus
+the heading overhead, so the two measures agree.
+
+The hardened prompt also helps on its own. A fresh generation after the
+prompt change came in at **787 words**, inside the brief, with no condensing
+needed at all.
+
 ## A generator's word budget is a prompt instruction, not a constraint
 
 `run-daily.py` used to ask for 400-600 words and not enforce it — there was

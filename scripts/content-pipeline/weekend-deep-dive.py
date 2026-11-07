@@ -55,6 +55,7 @@ import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from devto_key import load_devto_key
 from _minimax_helper import minimax_generate, load_minimax_key, strip_thinking
+from text_utils import trim_to_words
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
@@ -68,6 +69,17 @@ TODAY = datetime.datetime.now(datetime.timezone.utc)
 DATE_STR = TODAY.strftime("%Y-%m-%d")
 POST_DATE = TODAY.strftime("%B %d, %Y")
 SAT_STR = TODAY.strftime("%A, %B %d, %Y")
+
+# Word budget for the piece. The brief says 600-800 words and the prompt asks
+# for 700-750, but the script only ever enforced a FLOOR (400 words) — never a
+# ceiling. Reasoning models on MiniMax-M2.7 keep drifting long: 2026-11-07 came
+# in at 1050 words, longer than any previous episode.
+#
+# 1050 words is a ~2x read against the brief, and the drift compounds because
+# the topic bank and the prompt are reused every week. So the ceiling is now
+# enforced in code rather than trusted to the prompt.
+MIN_WORDS = 400          # below this the draft is a stub, not an essay
+MAX_WORDS = 850          # hard ceiling; drafts above this are regenerated
 
 
 def _yaml(value: str) -> str:
@@ -646,6 +658,10 @@ Rules:
 - No hedging. Take a clear position.
 - Ground claims in specifics, not platitudes
 - Aim for 700-750 words. Do not stop early.
+- HARD LIMIT: 800 words. A draft over 800 words is rejected and rewritten,
+  so do not pad the analysis to reach a longer piece. Six tight paragraphs
+  beat eight loose ones. If you have more to say, cut the weakest section
+  instead of expanding every section.
 
 CITATION RULES — these are absolute:
 - You may ONLY quote a Hacker News user if their exact words appear in the
@@ -676,6 +692,128 @@ Tags: {', '.join(topic['tags'])}
 
 def _strict_prompt(topic: dict, hn_stories: list, devto_articles: list) -> str:
     return _build_prompt(topic, hn_stories, devto_articles, strict=True)
+
+
+def _condense_prompt(topic: dict, body: str, attempt: int = 1) -> str:
+    """Ask the model to cut an over-long draft back to the word budget.
+
+    Used when a draft comes in over `MAX_WORDS`. Editing the existing draft
+    beats a fresh generation: the argument, the citations and the closing
+    takeaway are already in there and a rewrite risks losing them.
+
+    `attempt` escalates the pressure. A first pass alone is not reliable — on
+    2026-11-07 a real condense of a 1050-word draft came back at 919 words,
+    still over the ceiling, so a first pass is not allowed to be the last word.
+    """
+    wc = len(body.split())
+    target = 700 if attempt == 1 else 620
+    escalation = (
+        "" if attempt == 1 else
+        "\nYour previous attempt to cut this draft was STILL too long. You "
+        "must cut deeper this time — cutting a single section is not enough. "
+        "Remove whole paragraphs and sections, not just clauses and phrases.\n"
+    )
+    return f"""The draft below is {wc} words. That is over the limit for this column.
+{escalation}
+Rewrite it to UNDER {target} words — target {target - 20} to {target} words — by
+CUTTING, not by summarizing loosely. A rewrite that is still over 800 words
+will be rejected.
+
+Preserve:
+- The argument and the position it takes
+- Every specific fact, citation, number and link that appears in the draft
+- The section structure and the closing takeaway
+
+Cut:
+- Redundant explanation of a point already made
+- Any section that adds atmosphere but no argument
+- Filler qualifiers and throat-clearing
+
+Do NOT add new facts, new citations, or new quotations. Do not introduce
+quotation marks that are not already in the draft. Keep the same voice.
+
+DRAFT TO CUT:
+{body}
+"""
+
+
+def _enforce_max_words(body: str | None, topic: dict, hn_stories: list,
+                       devto_articles: list) -> str | None:
+    """Bring a draft under the word ceiling, or refuse to return it.
+
+    Reasoning models on MiniMax-M2.7 drift long — the 2026-11-07 episode came
+    in at 1050 words against a 600-800 brief, longer than any before it. A
+    regeneration with an explicit cut instruction keeps the piece coherent,
+    where a mechanical truncation would drop the closing takeaway mid-thought.
+
+    Condensing is retried with escalating pressure because a single pass is
+    not dependable: a real condense of that 1050-word draft returned 919
+    words, still over the line. If the model cannot be brought under the
+    ceiling, a deterministic sentence-boundary trim is the last resort, so a
+    length overrun can never cost the site a whole episode.
+
+    Returns the corrected body, or None if it cannot be brought inside the
+    budget, so the caller aborts instead of publishing a runaway draft.
+    """
+    if not body:
+        return None
+    wc = len(body.split())
+    if wc <= MAX_WORDS:
+        return body
+
+    condensed = body
+    for attempt in (1, 2, 3):
+        print(f"[deep-dive] Draft is {len(condensed.split())} words, over the "
+              f"{MAX_WORDS}-word ceiling. Condensing (attempt {attempt}/3)...")
+        condensed = llm_generate(
+            _condense_prompt(topic, condensed, attempt=attempt),
+            "You are Sol AI. You are a researcher and writer. You edit ruthlessly. "
+            "You never invent a quotation and never add a citation that was not "
+            "already in the draft.",
+            max_tokens=2500,
+        )
+        if not condensed:
+            print("[deep-dive] ⚠️  Condensing failed; falling back to a mechanical trim.")
+            break
+
+        cwc = len(condensed.split())
+        if cwc <= MAX_WORDS:
+            if cwc < MIN_WORDS:
+                print(f"[deep-dive] ❌ Condensed draft is only {cwc} words. Aborting without publishing.")
+                return None
+            print(f"[deep-dive] ✅ Condensed {wc} → {cwc} words.")
+            return condensed
+        print(f"[deep-dive] ⚠️  Still {cwc} words after condensing.")
+
+    # Last resort: cut at sentence boundaries. This keeps the piece alive even
+    # when the model refuses to shorten it. `trim_to_words` preserves the
+    # paragraph breaks and never cuts mid-sentence.
+    #
+    # It is asked for a slightly lower limit than the ceiling because it can
+    # overshoot by the length of the final sentence it keeps, and because a
+    # section heading at the very end would otherwise be left dangling with
+    # no body text under it.
+    trimmed = trim_to_words(condensed or body, limit=MAX_WORDS - 40)
+    trimmed = _drop_dangling_heading(trimmed)
+    t_wc = len(trimmed.split())
+    if t_wc < MIN_WORDS:
+        print(f"[deep-dive] ❌ Trim left only {t_wc} words. Aborting without publishing.")
+        return None
+    print(f"[deep-dive] ✅ Trimmed {wc} → {t_wc} words (mechanical fallback).")
+    return trimmed
+
+
+def _drop_dangling_heading(body: str) -> str:
+    """Remove a trailing markdown heading that has no body text under it.
+
+    A sentence-level trim can end exactly on a section heading, leaving the
+    reader with a promise ("## What Happens When the Well Runs Dry?") and no
+    answer. The heading goes; the prose before it stands on its own.
+    """
+    paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
+    while paragraphs and paragraphs[-1].startswith("#"):
+        paragraphs.pop()
+    return "\n\n".join(paragraphs).strip()
 
 
 def generate_deep_dive(topic: dict, hn_stories: list, devto_articles: list) -> str | None:
@@ -737,7 +875,7 @@ def generate_verified_body(topic: dict, hn_stories: list, devto_articles: list) 
     """
     body = generate_deep_dive(topic, hn_stories, devto_articles)
 
-    if not body or len(body.split()) < 400:
+    if not body or len(body.split()) < MIN_WORDS:
         if body:
             print(f"[deep-dive] MiniMax output too thin ({len(body.split())} words), trying Ollama")
         else:
@@ -749,6 +887,13 @@ def generate_verified_body(topic: dict, hn_stories: list, devto_articles: list) 
         )
 
     if not body or len(body.split()) < 300:
+        return None
+
+    # Bring it inside the word ceiling BEFORE the quote check, so a long
+    # draft is condensed once and then verified once, rather than the
+    # condenser being asked to re-verify quotes it may have introduced.
+    body = _enforce_max_words(body, topic, hn_stories, devto_articles)
+    if not body:
         return None
 
     unsupported = find_unsupported_quotes(body, hn_stories, devto_articles)
@@ -765,6 +910,11 @@ def generate_verified_body(topic: dict, hn_stories: list, devto_articles: list) 
         )
         if not body or len(body.split()) < 300:
             print("[deep-dive] ❌ Regeneration failed. Aborting without publishing.")
+            return None
+        # The strict regeneration is a fresh draft, so it needs the ceiling
+        # re-applied — a strict rewrite can come back just as long.
+        body = _enforce_max_words(body, topic, hn_stories, devto_articles)
+        if not body:
             return None
         unsupported = find_unsupported_quotes(body, hn_stories, devto_articles)
         if unsupported:

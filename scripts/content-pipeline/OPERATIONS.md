@@ -1356,3 +1356,83 @@ fix. No member of any of those groups is dated 2026-11-01 or later, and the
 repair script does not touch them: it repairs republications, not metadata.
 They are residue, and the rule is still **fix the generator, never backfill
 the posts**.
+
+## The model shipped its own notes with the article (fixed 2026-11-07)
+
+The 2026-11-07 Sol's Take published with the model's scratchpad stapled to the
+end of the article:
+
+```
+Calling AI "not creative" because it has no consciousness confuses creativity
+with a séance. ...
+
+AI can be creative. The dangerous delusion is that anyone using it deserves
+the credit.
+
+Word count maybe 169. Good. Need date maybe no. "specific experience/pattern"
+claim grounded in every week maybe lacking. Real pattern noticed: meetings
+"AI-generated ideas" etc.
+
+Let's formulate.</[U+200B]mm:think>Calling AI "not creative" because it lacks
+consciousness confuses creativity with a séance.
+```
+
+The article itself was good — 167 words, the right take, in voice. The last
+three lines were the model thinking out loud about the draft it had just
+written, and the very last line was a *duplicate* of the opening sentence.
+
+The run looked clean. MiniMax returned 420 words, the trim took it to 206, the
+post was written, committed and pushed — and nothing anywhere said the body
+was broken. The 206 was itself a symptom: the trim counts words, and by then
+the scratchpad was part of the body.
+
+Three gaps let it through, and all three are in `_minimax_helper.py`:
+
+1. **`strip_thinking()` only handled reasoning that arrived BEFORE the
+   article.** It looked for a `Thinking...` preamble and, when there was none,
+   returned the text untouched (`if start is None: return text.strip()`).
+   Here the article came first and the reasoning followed it, so there was no
+   preamble to find and the whole body was kept.
+2. **The closing tag was malformed.** MiniMax emitted `</[U+200B]mm:think>` —
+   with a zero-width space inside the tag — so the `<think>.*?</think>` regex
+   never matched it and the tag shipped as literal text.
+3. **Nothing refused to publish tainted output.** There was no gate: a body
+   could carry the model's notes and still be written, committed and pushed.
+
+The fixes:
+
+- `strip_thinking()` now strips zero-width and invisible characters first,
+  cuts everything from a stray (unopened) think tag onward, and drops
+  trailing paragraphs that are unmistakably the model drafting its own
+  instructions (`Word count maybe…`, `Let's formulate.`,
+  `Real pattern noticed…`).
+- `looks_contaminated()` is the gate. `minimax_generate()` retries a
+  contaminated generation instead of returning it, and prints the reason if
+  every model and key is exhausted.
+- `sols-take.py` refuses to publish a template-fallback post at all. It exits
+  non-zero with a `DEGRADED:` line instead, and treats a contaminated existing
+  post as degraded, so it gets regenerated rather than skipped.
+
+The filters are deliberately conservative: only *trailing* paragraphs are
+dropped, and only when they are unmistakably meta. "Wait, the real problem
+is…", "Note: …" and "Let's write a better ending." are left alone — a
+legitimate sentence is not a drafting note.
+
+The 2026-11-07 post was repaired and republished in `330960ad`: the scratchpad
+and the duplicate are gone, the 167-word article is intact, and the live page
+serves the clean body. A scan of all 1,299 published posts found no other
+contamination.
+
+`test_minimax_helper.py` pins all of this and needs no test framework:
+
+```
+python3 scripts/content-pipeline/test_minimax_helper.py
+```
+
+The lesson repeats the one from the heading and bold-label bugs above: **the
+prompt is a request; the content has to hold whatever the model returns.** A
+prompt that says "no headings, no bylines" did not stop the model writing
+both. A prompt that says "150-200 words" did not stop it shipping 420. The
+guarantee has to be a gate in code — and the gate has to know what a broken
+body looks like, which is why the cleaner now carries a named list of the
+shapes the model actually produces.

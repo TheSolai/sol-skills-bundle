@@ -61,6 +61,19 @@ FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
 # a date prefix. `clawhub-guide-2026-07-05.md` is a draft, not a post.
 JEKYLL_POST_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
 
+# The date every recurring generator began dating its title and description
+# — commit 7439af4, "fix(generators): date every series' title and
+# description", 2026-10-31. A post published on or after this date must never
+# share a title or a meta description with another post: each episode of a
+# series now carries its own date. A collision that includes a post published
+# after this date is therefore a regression in a generator, not residue.
+#
+# Posts published BEFORE it can collide, because the generators used to
+# publish a fixed template. Those are separate articles that happen to carry
+# the same title, and they are reported as a note — see
+# `check_duplicate_metadata`.
+SERIES_METADATA_FIX_DATE = "2026-10-31"
+
 
 # ─────────────────────────── helpers ───────────────────────────
 
@@ -544,6 +557,25 @@ def check_duplicate_metadata(posts):
     in AI) publish on a fixed template, so a shared description is the
     normal state of a series unless the generator varies it. The fix
     belongs in the generator, not in a backfill.
+
+    Two different defects hide behind one shared title, and this check
+    tells them apart:
+
+    * A REPUBLICATION — two posts with the SAME body and no canonical.
+      These are genuinely the same article at two URLs. A canonical is
+      the fix, and `duplicate_offenders` (used by check [4] and by
+      `seo-repair-canonicals.py`) already reports them.
+    * A TEMPLATE COLLISION — posts with DIFFERENT bodies that share a
+      title. These are distinct articles that a fixed generator gave
+      the same headline to. A canonical would be wrong here: it would
+      tell Google to keep one URL and drop the others, de-indexing real
+      articles. The fix is a unique title per post.
+
+    A collision published on or after `SERIES_METADATA_FIX_DATE` means a
+    generator has regressed, and is an error. A collision published
+    before it is historical residue from the old templates: reported as
+    a note, never as an error, because there is no repair that does not
+    involve rewriting published titles.
     """
     issues = []
     notes = []
@@ -561,56 +593,107 @@ def check_duplicate_metadata(posts):
         if description:
             descriptions[description].append((p, canonical))
 
+    # A post is the canonical TARGET of another post's family when that
+    # post points at it. The target is the surviving URL and is expected
+    # to carry no canonical of its own, so it must not count as an
+    # offender.
+    urls = {}
+    for p in posts:
+        u = post_url(p)
+        if u:
+            urls[u] = p
+
     def offenders(groups):
-        """Groups whose members are not consolidated by a canonical."""
+        """Groups whose members are not consolidated by a canonical.
+
+        Returns (regressions, residue). A regression is a group holding
+        a post published on or after `SERIES_METADATA_FIX_DATE`; residue
+        is a group of older posts only.
+        """
         out = []
         for value, members in groups.items():
             if len(members) < 2:
                 continue
-            unconsolidated = [p for p, canonical in members if not canonical]
+            # A member is consolidated when it carries a canonical, or
+            # when it is the target another member's canonical points at.
+            targets = {
+                urls[canonical] for _, canonical in members
+                if canonical and canonical in urls
+            }
+            unconsolidated = [
+                (p, canonical) for p, canonical in members
+                if not canonical and p not in targets
+            ]
             if len(unconsolidated) > 1:
                 out.append((value, len(members), len(unconsolidated), unconsolidated))
-        return sorted(out, key=lambda r: -r[2])
+        return out
 
     title_offenders = offenders(titles)
     desc_offenders = offenders(descriptions)
 
-    if title_offenders:
-        total = sum(n for _, _, n, _ in title_offenders)
+    def split_by_age(groups):
+        """Separate a group list into regressions and historical residue.
+
+        The publication date is read from the filename's `YYYY-MM-DD-` prefix.
+        That prefix and the front-matter `date` agree on every published post
+        (checked across all 1,400+ of them), so either would do — but the
+        filename is what the filename-based dedupe already keys on.
+        """
+        regressions, residue = [], []
+        for value, total, unconsolidated, members in groups:
+            recent = [
+                (p, canonical) for p, canonical in members
+                if p.name[:10] > SERIES_METADATA_FIX_DATE
+            ]
+            if recent:
+                regressions.append((value, total, unconsolidated, recent))
+            else:
+                residue.append((value, total, unconsolidated, members))
+        return regressions, residue
+
+    title_regressions, title_residue = split_by_age(title_offenders)
+    desc_regressions, desc_residue = split_by_age(desc_offenders)
+
+    for label, regressions in (
+        ("title", title_regressions),
+        ("meta description", desc_regressions),
+    ):
+        if not regressions:
+            continue
+        total = sum(len(recent) for _, _, _, recent in regressions)
         issues.append(
-            f"❌ {total} post(s) share a title with another post and have no "
-            f"canonical to consolidate them — search engines cannot tell "
-            f"them apart ({len(title_offenders)} group(s))"
+            f"❌ {total} post(s) share a {label} with another post published "
+            f"since {SERIES_METADATA_FIX_DATE} and carry no canonical — a "
+            f"generator has regressed and is publishing a fixed {label} again"
         )
-        for value, total_in_group, unconsolidated, members in title_offenders[:8]:
-            names = ", ".join(p.name for p in members[:3])
+        for value, total_in_group, unconsolidated, recent in regressions[:8]:
+            names = ", ".join(p.name for p, _ in recent[:3])
             issues.append(
-                f"   ❌ title shared by {total_in_group} posts, "
-                f"{unconsolidated} without canonical: {value[:60]!r} "
+                f"   ❌ {label} shared by {total_in_group} posts, "
+                f"{len(recent)} published since the fix: {value[:60]!r} "
                 f"(e.g. {names})"
             )
-        if len(title_offenders) > 8:
+        if len(regressions) > 8:
             issues.append(
-                f"   ❌ ... and {len(title_offenders) - 8} more shared-title group(s)"
+                f"   ❌ ... and {len(regressions) - 8} more shared-{label} group(s)"
             )
 
-    if desc_offenders:
-        total = sum(n for _, _, n, _ in desc_offenders)
-        issues.append(
-            f"❌ {total} post(s) share a meta description with another post "
-            f"and have no canonical to consolidate them ({len(desc_offenders)} group(s))"
+    # Historical residue: distinct articles that a fixed template gave the
+    # same title to. There is no correct repair — a canonical would
+    # de-index real articles, and rewriting a published title changes a
+    # URL that search engines have already indexed. It is reported so the
+    # count stays visible, but it does not fail the audit.
+    residue_posts = sum(n for _, _, n, _ in title_residue) + sum(
+        n for _, _, n, _ in desc_residue
+    )
+    if residue_posts:
+        notes.append(
+            f"ℹ️  {residue_posts} post(s) published before {SERIES_METADATA_FIX_DATE} "
+            f"share a title or meta description with another post. These are "
+            f"distinct articles with different bodies that a fixed generator "
+            f"template gave the same headline to — a canonical would de-index "
+            f"them, so this is reported, not repaired."
         )
-        for value, total_in_group, unconsolidated, members in desc_offenders[:8]:
-            names = ", ".join(p.name for p in members[:3])
-            issues.append(
-                f"   ❌ description shared by {total_in_group} posts, "
-                f"{unconsolidated} without canonical: {value[:60]!r} "
-                f"(e.g. {names})"
-            )
-        if len(desc_offenders) > 8:
-            issues.append(
-                f"   ❌ ... and {len(desc_offenders) - 8} more shared-description group(s)"
-            )
 
     consolidated_titles = sum(
         len(m) for m in titles.values() if len(m) > 1

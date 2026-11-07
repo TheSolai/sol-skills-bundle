@@ -22,7 +22,7 @@ import contextlib, fcntl
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from devto_key import load_devto_key
-from _minimax_helper import minimax_generate, load_minimax_key_candidates
+from _minimax_helper import minimax_generate, load_minimax_key_candidates, looks_contaminated
 
 # Sentence-aware trimming, shared with weekly-roundup.py and midweek-news.py so
 # the generators cannot drift apart — see text_utils.py.
@@ -53,10 +53,10 @@ def date_fields(d: datetime.datetime) -> tuple[str, str, str]:
 
 
 def llm_generate(prompt: str, system: str = "", max_tokens: int = 6000) -> str | None:
-    """Generate text via MiniMax, or return None for template fallback."""
+    """Generate text via MiniMax, or return None when there is no usable text."""
     keys = load_minimax_key_candidates()
     if not keys:
-        print("[llm] No MiniMax key available — using template fallback")
+        print("[llm] No MiniMax key available", file=sys.stderr)
         return None
     try:
         # The helper tries every known key and every known model in turn, and
@@ -67,9 +67,9 @@ def llm_generate(prompt: str, system: str = "", max_tokens: int = 6000) -> str |
         if result:
             print(f"[llm] ✅ MiniMax ({len(result.split())} words)")
             return result
-        print("[llm] MiniMax returned nothing — using template fallback")
+        print("[llm] MiniMax returned nothing usable", file=sys.stderr)
     except Exception as e:
-        print(f"[llm] MiniMax error: {e}")
+        print(f"[llm] MiniMax error: {e}", file=sys.stderr)
     return None
 
 
@@ -271,7 +271,11 @@ def existing_post_is_degraded(path: Path) -> bool:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return False
-    return "More coming tomorrow" in text or "**The take:**" in text
+    if "More coming tomorrow" in text or "**The take:**" in text:
+        return True
+    # A post carrying the model's own notes is just as broken as a template
+    # one, and is worth regenerating.
+    return looks_contaminated(text)
 
 
 @contextlib.contextmanager
@@ -331,9 +335,26 @@ Author: Sol
     system = "You are Sol AI. Direct, opinionated, slightly wry. You have strong views and you state them. No corporate speak, no hedging. You're not cruel — but you're honest."
     body = llm_generate(prompt, system, max_tokens=600)
     if not body:
-        body = f"**The take:** {topic_prompt}\n\nAI is doing a lot of things right now. Most of them are oversold. Some of them are genuinely useful. Figuring out which is which is the actual skill — not knowing everything, but knowing what to pay attention to.\n\nMore coming tomorrow."
-        print("[sols-take] Using template fallback")
-        return body
+        # A template post looks fine on the page and hides the failure:
+        # nothing on the published site says the generation broke. Publishing
+        # nothing is better than publishing a placeholder — a missing post is
+        # visible, a fake one is not.
+        print(
+            "[sols-take] DEGRADED: the model produced no usable text — "
+            "refusing to publish a template post",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    if looks_contaminated(body):
+        # The article may be fine with the model's notes stapled to the end,
+        # but a reader sees the notes. Do not ship them.
+        print(
+            "[sols-take] DEGRADED: the generated text still carries the "
+            "model's own notes — refusing to publish it",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     # Strip an echoed heading/byline/label before anything else. A label that
     # carries a real headline keeps that headline, as a bold dek.

@@ -95,14 +95,129 @@ def _is_scratch(line: str) -> bool:
     return bool(_SCRATCH.match(s))
 
 
+# ── Contamination: the model's own notes inside the article ──────────────
+#
+# The 2026-11-07 run published a post whose body ended with the model talking
+# to itself about the draft:
+#
+#     "Word count maybe 169. Good. Need date maybe no. ... Let's formulate.
+#      <closing think tag>Calling AI "not creative" ..."
+#
+# Three things defeated the old stripper, and all three are fixed here:
+#
+#   1. The reasoning came AFTER the article, not before it. The old code
+#      looked for a "Thinking..." preamble; with no preamble it returned
+#      the text untouched.
+#   2. The closing tag was malformed, carrying an invisible character
+#      inside it, so the `<think>...</think>` regex never matched.
+#   3. The duplicate article that followed the tag read as ordinary prose,
+#      so nothing flagged the output as broken.
+#
+# The article underneath was fine. The defect was that a post with the
+# model's scratchpad attached shipped as though nothing were wrong.
+
+# Zero-width and invisible characters. They break tag matching, so they are
+# removed before any tag is looked for.
+_INVISIBLE_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+
+# A stray or malformed think tag with no opening half: "</think>", or a tag
+# with an invisible character wedged into it. Everything from such a tag to
+# the end of the text duplicates the article above it.
+_STRAY_THINK_TAG_RE = re.compile(r"</\s*[^>]{0,24}think[^>]{0,24}>", re.IGNORECASE)
+
+# The model drafting its own instructions. These never belong in a published
+# article. Each pattern is anchored to the start of a line so ordinary prose
+# is not caught by accident.
+_CONTAMINATION_PATTERNS = (
+    re.compile(r"^\s*word\s+count\b", re.IGNORECASE),
+    re.compile(r"^\s*length\s*[:=]\s*\d", re.IGNORECASE),
+    re.compile(r"^\s*real\s+pattern\s+noticed\b", re.IGNORECASE),
+    re.compile(r"^\s*goal\s*[:=]", re.IGNORECASE),
+    re.compile(r"^\s*(?:check|todo)\s*[:=]", re.IGNORECASE),
+    re.compile(r"^\s*note\s+to\s+self\b", re.IGNORECASE),
+    # The trailing group is a drafting verb, not a general "and then": real
+    # prose says "Wait, the real problem is...", and that must not match.
+    re.compile(
+        r"^\s*(?:good|ok|okay|great|nice)[.,!]\s+"
+        r"(?:need|now|let|check|write|fix|rewrite|revise)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?:hmm|wait)\b[,:]?\s+"
+        r"(?:need|now|let|check|write|fix|rewrite|revise)\b",
+        re.IGNORECASE,
+    ),
+)
+
+# A short drafting instruction ("Let's formulate.", "Let's write it.").
+_DRAFTING_VERB_RE = re.compile(
+    r"^\s*let(?:'s| us)\s+(?:formulate|write|draft|assemble|revise|rewrite|try|go)\b"
+    r"(?:\s+it)?[.!]?$",
+    re.IGNORECASE,
+)
+
+
+def _is_meta_paragraph(para: str) -> bool:
+    """True when a paragraph is the model talking to itself, not prose."""
+    first = ""
+    for line in para.splitlines():
+        if line.strip():
+            first = line.strip()
+            break
+    if not first:
+        return False
+    # The word limit keeps real sentences out of the trap: "Let's write a
+    # better ending." is six words and is left alone.
+    if _DRAFTING_VERB_RE.match(first) and len(first.split()) <= 4:
+        return True
+    return any(p.match(first) for p in _CONTAMINATION_PATTERNS)
+
+
+def _strip_trailing_meta(text: str) -> str:
+    """Drop trailing paragraphs of the model drafting its own instructions.
+
+    Only TRAILING paragraphs are dropped. A meta line in the middle of a
+    finished article is left alone — the prose around it is real, and
+    guessing where the draft began would risk eating it.
+    """
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    while paragraphs and _is_meta_paragraph(paragraphs[-1]):
+        paragraphs.pop()
+    return "\n\n".join(paragraphs).strip()
+
+
+def looks_contaminated(text: str) -> bool:
+    """True when generated text still carries the model's own notes.
+
+    A gate for callers: a contaminated generation should be retried rather
+    than published, because a post with the model's scratchpad attached
+    reads as broken even when the article underneath it is good.
+    """
+    if not text:
+        return False
+    if _STRAY_THINK_TAG_RE.search(text):
+        return True
+    return any(_is_meta_paragraph(p.strip()) for p in text.split("\n\n"))
+
+
 def strip_thinking(text: str) -> str:
     """Remove leaked model reasoning from generated text.
 
-    Returns the article only. If no preamble is detected the text is
-    returned unchanged — this must never eat legitimate content.
+    Returns the article only. Handles reasoning that arrives BEFORE the
+    article (the usual shape) and reasoning that arrives AFTER it (the
+    2026-11-07 shape), including a malformed closing think tag.
+
+    The filters are deliberately conservative: only trailing paragraphs are
+    dropped, and only when they are unmistakably the model talking to
+    itself. Legitimate prose must never be eaten.
     """
     if not text:
         return text
+
+    # Invisible characters break tag matching: MiniMax emitted a closing
+    # think tag with a zero-width space inside it, which defeated the
+    # `<think>...</think>` regex and let the reasoning ship.
+    text = _INVISIBLE_RE.sub("", text)
 
     # Fenced form: ```\nThinking Process: ... ```
     text = re.sub(r"```\s*\n?\s*Thinking Process:.*?```", "", text, flags=re.DOTALL)
@@ -110,29 +225,41 @@ def strip_thinking(text: str) -> str:
 
     lines = text.split("\n")
     start = next((i for i, l in enumerate(lines) if _PREAMBLE_START.match(l)), None)
-    if start is None:
-        return text.strip()
+    if start is not None:
+        # Use the LAST terminator: models often write "Let's write it." mid-scratchpad
+        # and only close with "...done thinking."
+        terms = [i for i in range(start + 1, len(lines)) if _TERMINATOR.match(lines[i])]
+        if terms:
+            last = terms[-1]
 
-    # Use the LAST terminator: models often write "Let's write it." mid-scratchpad
-    # and only close with "...done thinking."
-    terms = [i for i in range(start + 1, len(lines)) if _TERMINATOR.match(lines[i])]
-    if not terms:
-        return text.strip()
-    last = terms[-1]
+            out = []
+            for line in lines[last + 1:]:
+                # Drop leading blank lines and residual scratchpad notes, but keep the
+                # byline and everything after it.
+                if not out:
+                    if _is_scratch(line):
+                        if line.strip().startswith("**By ") or line.strip().startswith("*By "):
+                            out.append(line)
+                        continue
+                out.append(line)
 
-    out = []
-    for line in lines[last + 1:]:
-        # Drop leading blank lines and residual scratchpad notes, but keep the
-        # byline and everything after it.
-        if not out:
-            if _is_scratch(line):
-                if line.strip().startswith("**By ") or line.strip().startswith("*By "):
-                    out.append(line)
-                continue
-        out.append(line)
+            result = "\n".join(out).strip()
+            if result:
+                text = result
 
-    result = "\n".join(out).strip()
-    return result if result else text.strip()
+    # A stray think tag with no opening half: the model closed a reasoning
+    # block it never opened and then restarted the article. Everything from
+    # the tag on duplicates the article above it.
+    stray = _STRAY_THINK_TAG_RE.search(text)
+    if stray:
+        text = text[:stray.start()].strip()
+
+    # Reasoning that follows the article with no preamble to detect it:
+    # "Word count maybe 169. Good. Need date maybe no..." is the model
+    # talking to itself about the draft, not prose for a reader.
+    text = _strip_trailing_meta(text)
+
+    return text.strip()
 
 
 def load_minimax_key() -> str:
@@ -287,6 +414,19 @@ def minimax_generate(prompt: str, api_key: str = "", max_tokens: int = 600, syst
             for attempt in range(1, retries + 1):
                 text, err, retryable, truncated = _call_once(body, k, timeout)
                 if text is not None and not truncated:
+                    if looks_contaminated(text):
+                        # The model shipped its own notes with the article.
+                        # Retry instead of publishing them: a post with the
+                        # model's scratchpad attached reads as broken even
+                        # when the article underneath it is good.
+                        last_err = (
+                            f"{m} with key ...{k[-4:]}: contaminated output "
+                            "(the model's own notes leaked into the text)"
+                        )
+                        if attempt < retries:
+                            time.sleep(2 ** attempt)
+                            continue
+                        break
                     return text
                 last_err = f"{m} with key ...{k[-4:]}: {err}"
                 if truncated:
@@ -304,6 +444,12 @@ def minimax_generate(prompt: str, api_key: str = "", max_tokens: int = 600, syst
                             "messages": messages,
                         }).encode()
                         continue
+                    if looks_contaminated(text):
+                        last_err = (
+                            f"{m} with key ...{k[-4:]}: contaminated output "
+                            "(truncated and carrying the model's own notes)"
+                        )
+                        break
                     return text
                 if not retryable:
                     break

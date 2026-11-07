@@ -1477,3 +1477,134 @@ both. A prompt that says "150-200 words" did not stop it shipping 420. The
 guarantee has to be a gate in code — and the gate has to know what a broken
 body looks like, which is why the cleaner now carries a named list of the
 shapes the model actually produces.
+
+## The SEO audit told you to canonical away real articles (fixed 2026-11-07)
+
+The 10:00 daily audit failed with 20 issues, all from check [5] (duplicate
+titles / meta descriptions): 246 posts sharing a title and 249 sharing a
+description. The message said to add a canonical to consolidate them.
+
+**That remedy would have de-indexed real articles.** Every one of those
+groups has distinct bodies. They are separate articles that happened to
+carry the same headline, not one article at two URLs. A canonical tells a
+search engine to keep one URL and drop the others — pointing 246 distinct
+articles at a single one would have thrown away the site's back catalogue.
+
+`seo-repair-canonicals.py --dry-run` already knew the difference: of 1,299
+scanned posts, **0** need a canonical. The 76 "regional families" (159
+posts) are consolidated by design. The check was reporting a defect the
+repair script had already ruled out.
+
+Two different things were hiding behind one shared title:
+
+- A **republication** — same body, two URLs, no canonical. That is what a
+  canonical is actually for, and `duplicate_offenders()` already reports
+  it (check [4]).
+- A **template collision** — different bodies, same headline, because the
+  generator used a fixed title. The fix is a unique title per post.
+
+The check was also counting a post that *is* a canonical **target** as an
+offender. The target is the surviving URL; it is supposed to carry no
+canonical of its own. 87 canonicals point at a post with a different body
+(85 match the documented rule — same source + region + day; 5 are the
+`trending-topics` republication case).
+
+So check [5] now:
+
+- consolidates a post that carries a canonical **or** is the target of one;
+- splits every group by age. The generators began dating each title and
+  description on **2026-10-31** (commit `7439af4`, 13 generator files). A
+  collision that includes a post published on or after that date means a
+  generator has regressed and is publishing a fixed title again — **that
+  is an error**. A collision published before it is residue from the old
+  templates — reported as an ℹ️ note, never as an error.
+
+The residue is a note because there is no repair that does not involve
+rewriting published titles, and rewriting a title changes a URL search
+engines have already indexed. It stays visible so the count cannot creep
+up unnoticed, and it ages out on its own.
+
+`test_seo_duplicate_metadata.py` pins all of this and needs no test
+framework:
+
+```
+python3 scripts/content-pipeline/test_seo_duplicate_metadata.py
+```
+
+It covers residue-not-error, a post-fix title regression, a post-fix
+description regression, a canonical target not being an offender, and
+distinct titles never reporting. 5/5 pass.
+
+**A check that never fails proves nothing.** The rewritten check was
+verified to actually fail by moving the cutoff to `2026-01-01` and
+re-running it against the real site: 20 issues, exactly as before. The
+cutoff was then restored to `2026-10-31`.
+
+The general lesson: **a check that names a remedy has to verify that the
+remedy is safe.** The check and the repair script disagreed about the
+same data — "246 posts need a canonical" against "0 posts need a
+canonical" — and the louder one was the wrong one. When two pieces of
+tooling disagree, the more confident one is not the more correct one.
+
+## A series stopped publishing for twelve days and nothing noticed (2026-11-07)
+
+The Monday weekly roundup has not published since **2026-10-26**. The
+2026-11-02 roundup does not exist — there is no
+`2026-11-02-week-in-ai-nov-2026.md` in `_posts/`, and no November
+roundup of any kind. One missed Monday, twelve days of silence, no alert.
+
+Two schedulers own this series and both missed it:
+
+- `ai.sol.weekly-roundup` (launchd, Monday 07:00) has **`RunAtLoad:
+  false`**. The Mac was powered off on Nov 2 (boot time Nov 3 13:58), so
+  the agent never ran — and because it does not run at load, launchd
+  cannot recover the missed Monday. `ai.sol.midweek-news` is the same.
+  The daily series have `RunAtLoad: true` and do catch up on boot;
+  `ai.sol.blog-cron` and `ai.sol.daily-briefing` are also `false`.
+- The `sol-weekly-roundup` cron task (Monday 08:00 Europe/London) needs
+  the MiniMax Code app running at the scheduled minute. The app started
+  Nov 3 13:59:42 — after the slot had passed.
+
+`logs/sol-weekly.log` confirms it: the last entry is from Oct 26 07:01,
+and `sol-weekly.err` is empty. The agent did not crash. It never ran.
+
+**`RunAtLoad: false` is correct here, and flipping it would be a bug.**
+A launchd agent that runs at load publishes a roundup for *today* —
+Tuesday, not the Monday that was missed — and both the slug and the title
+come from `now()`, so a catch-up run would publish a mis-dated duplicate.
+A weekly series cannot be recovered by re-running it "now"; it needs a
+dated entry point, and `weekly-roundup.py` has no `--date` flag. A missed
+Monday is currently unfillable. (For a *daily* series "now" is the right
+date, which is why those agents can safely catch up.)
+
+**The watchdog could not have caught this.**
+`~/.openclaw/workspace/scripts/site-cron-watchdog.sh` checks that every
+`ai.sol.*` agent is *loaded* and reloads the ones that are not. It never
+checks whether any of them produced a post. The agent was loaded, so the
+watchdog reported "all agents loaded" on its ten-minute tick for twelve
+days while the series was dead. `cron-health-check.py` reported "OK: No
+cron failures detected" over the same period.
+
+**The residue has a root cause too.** The roundup was published *daily*
+from 2026-10-11 to 2026-10-23 — 12 posts in thirteen days — because the
+plists were temporarily set to a daily cadence. `ai.sol.weekly-roundup`
+and `ai.sol.midweek-news` were both edited on Oct 23 17:14 to restore the
+weekly cadence, and the `ai-digest` series shows the identical pattern
+(daily Oct 11–23, then Wednesdays on Oct 28 and Nov 4). Every post in
+that burst carried the title "The Week in AI: October 2026" and the same
+description, which is where a large share of the 246 shared-title posts
+came from. The generator was dated on Oct 26 (`ROUNDUP_TITLE = f"The Week
+in AI: {POST_DATE}"`), so the next run on Monday Nov 9 will be unique.
+
+Two things are still open, and both are small:
+
+1. `weekly-roundup.py` needs a `--date` flag that sets the post date
+   **and** the HN window — the fetch currently looks back from `now()`, so
+   a backfill would pull the wrong week's stories.
+2. The watchdog needs an output check, not just a presence check: for
+   each series, the newest matching post in `_posts/` compared against the
+   cadence in that agent's plist.
+
+Also in the watchdog: the success branch prints `$LOADED_COUNT`, which is
+never assigned anywhere in the script, so it reports "all agents loaded"
+with a blank count.

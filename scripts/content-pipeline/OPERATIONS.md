@@ -1608,3 +1608,37 @@ Two things are still open, and both are small:
 Also in the watchdog: the success branch prints `$LOADED_COUNT`, which is
 never assigned anywhere in the script, so it reports "all agents loaded"
 with a blank count.
+
+## The AI story filter matches "ai" inside "Airplanes" (found 2026-11-10)
+
+`is_ai_story()` in `run-daily.py` (line 110) is a substring test:
+`return any(kw in t for kw in keywords)` against the lowercased title. The
+keyword list contains `"ai"`, which is not a word — it is a letter pair that
+appears inside ordinary English words.
+
+On **2026-11-10** the day's story was "Foldable Flight: The Best Paper
+Airplanes" (952 HN points). That is a website of paper-airplane diagrams, not
+an AI development. It was selected because **"Airplanes" contains "ai"**. The
+same defect matches "chained", "maintainers", "email", "available" and more.
+
+The filter is wrong in the other direction too. "Understanding Transformers
+from scratch" returns **False** — "transformers" is not in the keyword list —
+so a genuine AI story was rejected while a paper-airplane site was accepted.
+
+**Nothing false shipped.** The anti-fabrication rules in the prompt saved it:
+the model noticed the source never claimed AI and wrote the angle honestly —
+"Foldable Flight is not an AI development, and its 952-point Hacker News score
+does not make it one" — and the UK title was literally "The AI Story That
+Isn't". All three regional posts (UK, EU, US) said so in their first
+paragraph. The defect cost the series its intended subject, not its accuracy.
+
+**The fix is word-boundary matching, not a longer keyword list.**
+`re.search(rf"\b{re.escape(kw)}\b", t)` for each keyword, plus adding
+"transformers", "inference", "diffusion", "agentic" and "training" to cover
+the false negatives. A longer list alone would not help: "ai" would still
+match inside "Airplanes", and a list cannot match every AI story anyway.
+
+The filter's real weakness is that it is the only thing standing between the
+pipeline and a non-AI headline, and it is untested. A table-driven test over
+the ten highest-scoring HN titles of the day would catch both directions.
+

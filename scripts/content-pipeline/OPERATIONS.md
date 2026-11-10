@@ -1836,4 +1836,54 @@ This is the same lesson as "a watchdog that checks presence is not a
 watchdog — check the output": the push is not the publication, and the
 deployment is not the push.
 
+## The Pages deploy hung again — three runs, one root cause (2026-11-10)
+
+The three Sol's Take posts published on 2026-11-10 (the scheduled post
+plus the Nov 8 and Nov 9 backfills) all committed and pushed cleanly, and
+all three were 404 on the live site for the whole morning. The deploy
+workflow failed three times in a row with the SAME symptom as the
+Quick Hits incident above:
+
+```
+Current status: syncing_files      (repeated for ~10 minutes)
+##[error]Timeout reached, aborting!
+```
+
+The runs: "Sol's Take: Tuesday" failed after 701s, "Sol's Take: Sunday"
+was cancelled by the concurrency group, and "Sol's Take: Monday" — the
+one carrying the newest commit and therefore all three posts — failed
+after 1407s. Every one of them hung in `actions/deploy-pages@v4`, never
+in the Jekyll build. The validate job passed, the bundle installed, the
+site built, the artifact uploaded, and then the deploy step sat in
+`syncing_files` until GitHub gave up on it.
+
+Three consecutive failures of the same step is a property of the
+environment, not bad luck. `deploy-pages@v4` polls the Pages deployment
+until it reports a terminal state, and this repository's deploys are
+hitting the timeout repeatedly. The morning's successful runs (80-180s,
+and one at 915s) show the step CAN complete, so it is intermittent and
+possibly load-related rather than a permanent breakage.
+
+**What worked:** `gh run rerun <run-id> --failed`. The re-run of the
+Monday run (attempt 2) is the one that carries the newest commit, so it
+publishes all three posts at once. Re-running the *failed job* rather
+than the whole workflow matters here — the concurrency group
+(`group: pages`, `cancel-in-progress: false`) keeps at most one pending
+run, so a burst of pushes collapses to "the newest commit is queued".
+
+**Two things that were worth checking and were NOT the cause:**
+
+- A slow `bundle install` (the 08:01 run took 915s) looks like a slow
+  deploy but is not one. The failing runs all reached `deploy-pages` in
+  well under 180s.
+- The live site was serving fine throughout — an older post returned
+  HTTP 200 the whole time. "The site is up" and "my post is published"
+  are different questions.
+
+The general lesson extends the one above: **a push is not a publish, a
+publish is not a deploy, and a deploy is not a live page.** Four
+distinct states, each of which can fail on its own while the others
+succeed. Checking the live URL is the only check that covers the last
+one, because it is the only state a reader can observe.
+
 

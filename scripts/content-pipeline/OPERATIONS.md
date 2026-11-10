@@ -15,6 +15,7 @@ they overlap. Check before assuming a script runs once.
 | `ai.sol.daily-content` | launchd, daily 07:00 | `run-daily.py` |
 | `sol-daily-content` | cron `0 8 * * *` | `run-daily.py` |
 | `sol-quick-hits` | cron `0 8 * * 1-5` | `quick-hits.py` |
+| `ai.sol.quick-hits` | launchd, Mon-Fri 07:00 | `quick-hits.py` |
 | `sol-post-to-devto` | cron `30 7 * * *` | `devto-poster.py` |
 
 The 08:00 slot is crowded — five jobs start within the same minute, plus the
@@ -34,6 +35,15 @@ and 13:00), `ai.sol.midweek-news` (Wed 07:00), `ai.sol.more-bloopers` (Wed
 Scripts should be idempotent: check for an existing output **before** doing
 expensive work (an LLM call, a fetch). `weekly-roundup.py` now checks for the
 post file before building the body.
+
+**A series driven by BOTH schedulers needs a run lock as well as the
+existence check.** The existence check alone is not enough: two schedulers
+can both pass it before either writes. `quick-hits.py` and `sols-take.py`
+take an `flock` on `/tmp/sol-quick-hits.lock` and `/tmp/sol-sols-take.lock`
+so only one of them writes. `ai.sol.quick-hits` (Mon-Fri 07:00) and
+`sol-quick-hits` (cron 08:00) are one such pair — the launchd one fires an
+hour earlier on purpose, so the two never race for the lock and a skip
+means "the other scheduler already published", not "something failed".
 
 ### Never `git add -A` in this repo
 
@@ -1641,4 +1651,110 @@ match inside "Airplanes", and a list cannot match every AI story anyway.
 The filter's real weakness is that it is the only thing standing between the
 pipeline and a non-AI headline, and it is untested. A table-driven test over
 the ten highest-scoring HN titles of the day would catch both directions.
+
+**Fixed 2026-11-10.** The filter now lives in `ai_filter.py`, shared by
+`quick-hits.py` and `run-daily.py` (both had an inline copy of the same
+substring test), and `test_ai_filter.py` is the table-driven test this
+entry asked for — real titles, both directions, including the two that
+actually shipped.
+
+Two things were true of the fix that the note above did not anticipate:
+
+- The optional plural/gerund matters. Matching "LLMs" and "embeddings" is
+  safe; matching "Rags" and "bolts" is not, so the suffix is allowed only
+  for terms where the inflected form is still unambiguously the AI term.
+- A word-boundary filter still admits LOW-RANKING false positives — a
+  title like "Make Jev-like decision models up to 9.5x faster" matches on
+  bare "models" and is not an AI story. That is acceptable because the
+  filter runs before the stories are ranked and only the top five by
+  engagement reach the model as candidates. Measured over four real days
+  (2026-11-07 to 11-10), every one of those top-five windows contained
+  only genuine AI stories. The defect that mattered was a false positive
+  that RANKED FIRST.
+
+## Two briefs shipped "Payments Canada launches Canada's Real-Time Rail"
+
+**Found and fixed 2026-11-10.** The 2026-11-09 and 2026-11-10 Quick Hits
+briefs each carried "Payments Canada launches Canada's Real-Time Rail" as
+one of their three stories. It is a story about payment infrastructure, not
+AI. It matched the filter because "R**ai**l" contains "ai".
+
+Both posts were published and live before this was noticed. The Nov 10 post
+was caught by reading it; the Nov 9 post had been missed by the scheduler
+entirely and was only seen because the backfill that replaced it was
+checked against the filter.
+
+The regional series was NOT affected: `run-daily.py` had the same
+substring filter, but the anti-fabrication rules in the regional prompt
+caught the "Paper Airplanes" story (the top story of 2026-11-09, 952
+points) and all three regional posts said so in their first paragraph. No
+regional post ever carried a wrong story.
+
+Both generators now use the shared word-boundary filter, and the two
+affected briefs were regenerated with `--force`.
+
+## Quick Hits missed a day because the desktop app was not awake
+
+**Found 2026-11-10.** The 2026-11-09 episode was never published. The
+MiniMax cron task needs the desktop app running at 08:00; the app started
+at 19:10 that evening, so the Monday slot was silently skipped. The cron
+run history confirms it: there is no run for 2026-11-09 at all, while the
+launchd-driven series (`daily-content`, `weekly-roundup`, `deep-dive`,
+`skills-update`) all published that morning.
+
+This is the same failure documented above in "Three days of Sol's Take
+went missing because the Mac was asleep", and it has the same two-part
+fix.
+
+**A dated entry point.** `quick-hits.py` now takes `--date YYYY-MM-DD`,
+like `sols-take.py`. A backfill reads that day's Hacker News stories
+through the Algolia index (`created_at_i` between the start of that day
+and the start of the next) and that day's dev.to articles through
+`published_after`/`published_before`. The live front page would otherwise
+supply the WRONG day's news — a post dated Nov 9 describing Nov 10 is
+worse than no post. The dev.to side matters too: `top=1` only ever means
+"trending now".
+
+**A launchd agent.** `ai.sol.quick-hits` runs the script at 07:00 local,
+Monday to Friday, with `RunAtLoad: true`. `RunAtLoad` is correct for this
+series and NOT for the weekly ones: the Quick Hits slug and title come from
+the day the run happens, so "now" is always the right date. A catch-up
+run after a reboot publishes today's briefing rather than a mis-dated
+copy of last week's. (The weekly roundup and the midweek digest derive
+their date from the week they cover, so they stay on `RunAtLoad: false`.)
+
+The launchd agent fires an hour BEFORE the cron task, deliberately — two
+schedulers in the same minute would race, and the run lock would make one
+of them skip for the wrong reason. Whichever runs first publishes; the
+other finds the post already there and skips. The script now has the
+run lock and the idempotency check that make this safe, and the Mavis cron
+prompt says so, so a skip is not mistaken for a fault.
+
+**The general rule:** a series that can legitimately be skipped needs
+BOTH a dated entry point and a second scheduler. Neither alone is enough:
+launchd does not know which series it owns, so it cannot backfill a past
+day, and a cron task that only ever runs "now" cannot recover a missed one.
+
+## A committed post is not a published post
+
+**Found 2026-11-10.** The 2026-11-10 brief committed and pushed
+successfully, and `quick-hits.py` logged "Committed and pushed to
+origin/main". The GitHub Pages deploy then timed out —
+`deploy-pages@v4` sat in "syncing_files" until "Timeout reached,
+aborting!", and the deployment was cancelled. The post was 404 on the live
+site while the log read as a clean success.
+
+The Jekyll build itself had succeeded; only the deploy step failed. A
+re-run of the failed job deployed it.
+
+Two guards now exist. The cron prompt no longer treats the script's exit
+as proof of publication: it checks the live URL and, if it still 404s,
+looks at the deploy workflow and re-runs the failed job. And the script
+logs what it actually did, so a skip (already published) is
+distinguishable from a publish.
+
+This is the same lesson as "a watchdog that checks presence is not a
+watchdog — check the output": the push is not the publication, and the
+deployment is not the push.
+
 

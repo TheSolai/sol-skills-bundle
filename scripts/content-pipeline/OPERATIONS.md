@@ -1284,6 +1284,85 @@ helper `weekly-roundup.py` and `midweek-news.py` use, so the trim cuts at
 sentence boundaries and never mid-sentence. `run-daily.py` still has no
 equivalent and its published lengths still drift (see the note above).
 
+## The ceiling was not a ceiling, and there was no floor (2026-11-10)
+
+The section above added a ceiling to the 150-200 word brief. Two defects
+survived that fix, and both were found by measuring the posts rather than
+by reading the code.
+
+**The ceiling could be overrun.** `trim_to_words()` guarded each sentence
+with:
+
+```python
+if count + words > limit and kept:
+    break
+```
+
+The `and kept` made the limit conditional on the paragraph already holding
+a sentence. For a paragraph's FIRST sentence `kept` is empty, so the check
+never fired and the sentence was kept even when it pushed the body past
+the limit. The 2026-11-07 post shipped at **206 words against a 200-word
+brief** — and was only noticed because it also carried contamination and
+needed a repair commit, which is how the length came to light.
+
+The first sentence is now subject to the same limit as every other one.
+When it does not fit, the trim stops at the paragraph boundary rather
+than skipping ahead: skipping would leave a hole in the middle of the
+piece, and the body would no longer read as written.
+
+**There was no floor at all.** Only the ceiling was enforced, so a model
+that returned 90 words produced a 90-word post and nothing flagged it. A
+word budget needs BOTH ends — the floor stops a thin post, the ceiling
+stops a sprawling one. `sols-take.py` now enforces `MIN_WORDS = 150` and
+`MAX_WORDS = 200` as constants and checks the trimmed body against both.
+
+**A draft outside the band is regenerated, not published.** The prompt
+asks for 150-200 words, but a prompt asks; it does not constrain. A
+draft outside the band is regenerated once with the length stated as a
+hard requirement, and if the second attempt also misses the band the run
+aborts without publishing. A missing post is visible; a post outside its
+own brief is not.
+
+**The trim was eating the punchline.** The prompt asks the piece to "End
+with one sharp sentence", and a plain trim cuts from the END of the body —
+so the closing line was the first thing it lost. The closing paragraph is
+now held back and the rest of the body is trimmed to whatever budget is
+left over. The ceiling still wins: in the rare case where a single
+sentence is longer than the whole budget, the closing paragraph gives up
+its protection instead.
+
+**A body that is one unpunctuated fragment is no longer emptied.** The
+mid-sentence guard drops a trailing fragment (the model was cut off by
+the token limit). When the body IS that fragment, dropping it left
+nothing to publish. The fragment is now only dropped when something else
+is left.
+
+Regression tests live in `test_word_budget.py` (10 checks, runnable
+directly or under pytest) and pin all four behaviours.
+
+The general lesson: **a ceiling is only a ceiling if the code can
+actually exceed it.** The guard had a conditional clause in it, and every
+published post was checked against a limit the trimmer did not really
+enforce.
+
+## Two days of Sol's Take went missing because the Mac was asleep (2026-11-10)
+
+Nov 8 and Nov 9 had no posts. The machine booted at Nov 9 15:21 UTC
+(`kern.boottime`), after the 09:00 slot on both days, and the MiniMax
+Code app that hosts the cron scheduler was not running at 09:00 to
+publish on either. Nov 10's run published normally.
+
+This is the same failure as Nov 1-3 (see above), and the same fix
+applied: `sols-take.py --date YYYY-MM-DD` regenerates a missed day, and
+the topic rotation is keyed on the day-of-year of the *target* date, so a
+backfilled day gets the topic its rotation intended. Both days were
+backfilled this way and landed at 188 and 194 words.
+
+The general lesson repeats, and it is worth restating because it has now
+happened twice: **a scheduler that only ever runs "now" cannot recover a
+missed day.** The dated entry point is not a convenience — it is the only
+thing that makes a gap fillable.
+
 ## `sols-take.py` could not be imported under Python 3.9
 
 The module used a PEP 604 union (`str | None`) in a return annotation with

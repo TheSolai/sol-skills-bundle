@@ -32,6 +32,23 @@ from text_utils import (
     trim_to_words as _trim_to_words,
 )
 
+# The word budget, enforced in code.
+#
+# WHY BOTH ENDS (2026-11-10)
+# ---------------------------
+# The brief is 150-200 words, but only the ceiling was ever enforced: a
+# model that returned 90 words produced a 90-word post and nobody
+# noticed. A word budget needs a floor and a ceiling — the floor is what
+# stops a thin post, the ceiling is what stops a sprawling one.
+#
+# The ceiling alone is not enough either, because `trim_to_words` cuts
+# from the END of the body: the sharp closing line the prompt asks for
+# ("End with one sharp sentence") is the first thing it loses. So the
+# ceiling is applied to the body with its last paragraph protected, and
+# the floor is checked on the result.
+MIN_WORDS = 150
+MAX_WORDS = 200
+
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 DEVTO_API_KEY = load_devto_key()
@@ -309,6 +326,99 @@ def post_title(d: datetime.datetime) -> str:
     return f"Sol's Take: {day_str} — {post_date}"
 
 
+def _trim_to_budget(body: str, limit: int = MAX_WORDS) -> str:
+    """Trim prose to a word ceiling while protecting the closing paragraph.
+
+    The prompt asks for "one sharp sentence" at the end, and a plain
+    trim cuts from the END of the body — so the punchline is the first
+    thing it loses. The closing paragraph is therefore held back and the
+    rest of the body is trimmed to whatever budget is left over.
+
+    The ceiling is a hard one. In the rare case where a single sentence
+    is longer than the whole budget, that sentence is kept whole (cutting
+    mid-sentence is not an option) and the closing paragraph gives up its
+    protection instead — a published post is always inside the budget.
+    """
+    paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return body
+
+    if len(body.split()) <= limit:
+        return body.strip()
+
+    closing = paragraphs[-1]
+    closing_words = len(closing.split())
+
+    if closing_words >= limit:
+        # The closing paragraph alone busts the ceiling. Trim it as prose.
+        return _trim_to_words(closing, limit=limit)
+
+    # Trim the expendable paragraphs to whatever the closing one leaves.
+    budget = limit - closing_words
+    kept_head = []
+    count = 0
+    for para in paragraphs[:-1]:
+        if count >= budget:
+            break
+        kept_sentences = []
+        for sentence in _split_sentences(para):
+            words = len(sentence.split())
+            if count + words > budget and kept_sentences:
+                break
+            kept_sentences.append(sentence)
+            count += words
+        if kept_sentences:
+            kept_head.append(" ".join(kept_sentences))
+
+    result = "\n\n".join([p for p in kept_head + [closing] if p.strip()]).strip()
+    if len(result.split()) > limit:
+        # A single sentence was longer than the remaining budget, so the
+        # head still overflows. Fall back to trimming the whole body as
+        # prose: the ceiling wins over keeping the closing paragraph.
+        result = _trim_to_words(result, limit=limit)
+    return result
+
+
+def enforce_word_budget(body: str) -> tuple[str, str]:
+    """Apply the word budget to a generated body.
+
+    Returns (text, status) where status is "ok", "short" or "long".
+    "short" means the body is under the floor and needs regenerating;
+    "long" means the trim could not bring it under the ceiling.
+    """
+    trimmed = _trim_to_budget(body.strip(), limit=MAX_WORDS)
+    if trimmed != body.strip():
+        print(
+            f"[sols-take] Trimmed {len(body.split())} -> {len(trimmed.split())} words"
+        )
+
+    # Never publish text that stops mid-sentence.
+    #
+    # The guard drops a trailing fragment — the model was cut off by the
+    # token limit and the last sentence has no ending. But when the body
+    # IS that fragment (one long sentence with no terminal punctuation),
+    # dropping it empties the body, and an empty post is worse than one
+    # that ends abruptly. So the fragment is only dropped when something
+    # else is left to publish.
+    if not _ends_cleanly(trimmed):
+        paragraphs = [p.strip() for p in trimmed.split("\n\n") if p.strip()]
+        if paragraphs:
+            sentences = _split_sentences(paragraphs[-1])
+            if sentences and not _ends_cleanly(sentences[-1]):
+                sentences = sentences[:-1]
+                paragraphs[-1] = " ".join(sentences)
+            candidate = "\n\n".join(p for p in paragraphs if p).strip()
+            if candidate:
+                trimmed = candidate
+
+    words = len(trimmed.split())
+    if words < MIN_WORDS:
+        return trimmed, "short"
+    if words > MAX_WORDS:
+        return trimmed, "long"
+    return trimmed, "ok"
+
+
 def generate_take(d: datetime.datetime) -> str:
     topic_key = pick_topic(d)
     topic_prompt = TOPIC_PROMPTS[topic_key]
@@ -333,54 +443,95 @@ Date: {post_date}
 Author: Sol
 """
     system = "You are Sol AI. Direct, opinionated, slightly wry. You have strong views and you state them. No corporate speak, no hedging. You're not cruel — but you're honest."
-    body = llm_generate(prompt, system, max_tokens=600)
-    if not body:
-        # A template post looks fine on the page and hides the failure:
-        # nothing on the published site says the generation broke. Publishing
-        # nothing is better than publishing a placeholder — a missing post is
-        # visible, a fake one is not.
-        print(
-            "[sols-take] DEGRADED: the model produced no usable text — "
-            "refusing to publish a template post",
-            file=sys.stderr,
+
+    # The prompt asks for 150-200 words, but a prompt asks; it does not
+    # constrain. The model overshoots by ~60% as a rule, and it can also
+    # come back thin. So the draft is checked against the band, and a
+    # draft outside it is regenerated once with the length stated as a
+    # hard requirement. Two attempts, then the run gives up rather than
+    # publishing something outside the brief.
+    body = ""
+    for attempt in (1, 2):
+        body = llm_generate(prompt, system, max_tokens=600)
+        if not body:
+            # A template post looks fine on the page and hides the failure:
+            # nothing on the published site says the generation broke. Publishing
+            # nothing is better than publishing a placeholder — a missing post is
+            # visible, a fake one is not.
+            print(
+                "[sols-take] DEGRADED: the model produced no usable text — "
+                "refusing to publish a template post",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
+        if looks_contaminated(body):
+            # The article may be fine with the model's notes stapled to the end,
+            # but a reader sees the notes. Do not ship them.
+            print(
+                "[sols-take] DEGRADED: the generated text still carries the "
+                "model's own notes — refusing to publish it",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
+        # Strip an echoed heading/byline/label before anything else. A label
+        # that carries a real headline keeps that headline, as a bold dek.
+        stripped = strip_metadata_echo(body)
+        if stripped != body.strip():
+            print("[sols-take] Stripped echoed heading/byline/label from the body")
+            body = stripped
+
+        trimmed, status = enforce_word_budget(body)
+
+        if status == "ok":
+            return trimmed
+
+        if status == "short":
+            print(
+                f"[sols-take] Draft is only {len(trimmed.split())} words "
+                f"(floor {MIN_WORDS}) — regenerating"
+                + ("" if attempt == 1 else " (final attempt)")
+            )
+        else:
+            print(
+                f"[sols-take] Draft is {len(trimmed.split())} words even after "
+                f"trimming (ceiling {MAX_WORDS}) — regenerating"
+                + ("" if attempt == 1 else " (final attempt)")
+            )
+
+        # Regenerate with the length stated as a hard requirement, so the
+        # model has something concrete to aim at the second time.
+        prompt = (
+            f"Write a 'Sol's Take' — a single hot opinion piece.\n\n"
+            f"HARD REQUIREMENT: the piece must be between {MIN_WORDS} and "
+            f"{MAX_WORDS} words. Count as you write. A piece outside that "
+            f"range is rejected.\n\n"
+            f"Rules:\n"
+            f"- Start with the opinion immediately. No warm-up paragraphs.\n"
+            f"- Do not write a title, heading, byline, or \"Sol's Take\" label "
+            f"of any kind.\n"
+            f"- Be direct, slightly provocative, slightly wry.\n"
+            f"- Ground it in something real — a specific experience, a pattern "
+            f"you've noticed, a claim that bugs you.\n"
+            f"- End with one sharp sentence.\n"
+            f"- No bullet points.\n"
+            f"- No hedging (\"it depends\", \"there are nuances\"). Take the "
+            f"damn position.\n"
+            f"- Conversational tone, like you're explaining to a smart friend "
+            f"over coffee.\n\n"
+            f"Topic: {topic_prompt}\n\n"
+            f"Date: {post_date}\n"
+            f"Author: Sol\n"
         )
-        raise SystemExit(2)
 
-    if looks_contaminated(body):
-        # The article may be fine with the model's notes stapled to the end,
-        # but a reader sees the notes. Do not ship them.
-        print(
-            "[sols-take] DEGRADED: the generated text still carries the "
-            "model's own notes — refusing to publish it",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
-
-    # Strip an echoed heading/byline/label before anything else. A label that
-    # carries a real headline keeps that headline, as a bold dek.
-    stripped = strip_metadata_echo(body)
-    if stripped != body.strip():
-        print("[sols-take] Stripped echoed heading/byline/label from the body")
-        body = stripped
-
-    # Enforce the word budget in code. The prompt alone does not hold it —
-    # published posts have ranged from 187 to 248 words against a 150-200
-    # brief. The trim cuts at sentence boundaries, never mid-sentence.
-    trimmed = _trim_to_words(body.strip(), limit=200)
-    if trimmed != body.strip():
-        print(f"[sols-take] Trimmed {len(body.split())} -> {len(trimmed.split())} words")
-
-    # Never publish text that stops mid-sentence.
-    if not _ends_cleanly(trimmed):
-        paragraphs = [p.strip() for p in trimmed.split("\n\n") if p.strip()]
-        if paragraphs:
-            sentences = _split_sentences(paragraphs[-1])
-            if sentences and not _ends_cleanly(sentences[-1]):
-                sentences = sentences[:-1]
-            paragraphs[-1] = " ".join(sentences)
-            trimmed = "\n\n".join(p for p in paragraphs if p).strip()
-
-    return trimmed
+    print(
+        "[sols-take] DEGRADED: could not land the draft inside the "
+        f"{MIN_WORDS}-{MAX_WORDS} word budget after two attempts — "
+        "refusing to publish it",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 
 def create_post(body: str, d: datetime.datetime) -> Path:

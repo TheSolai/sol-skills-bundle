@@ -83,21 +83,53 @@ def trim_to_words(text, limit=200):
     The model consistently writes ~60% over the brief no matter how the
     prompt is worded, so the ceiling is enforced here instead. Working
     paragraph-by-paragraph preserves the blank lines between them.
+
+    WHY THE FIRST SENTENCE NEEDS ITS OWN GUARD (2026-11-10)
+    -------------------------------------------------------
+    The loop used to read:
+
+        if count + words > limit and kept:
+            break
+
+    The `and kept` made the limit conditional on the paragraph already
+    holding a sentence. For a paragraph's FIRST sentence `kept` is empty,
+    so the check never fired and the sentence was kept even when it
+    pushed the body past the ceiling. The 2026-11-07 Sol's Take shipped
+    at 206 words against a 200-word brief because of it.
+
+    The first sentence is now subject to the same limit as every other
+    one. When it does not fit, the trim stops at the paragraph boundary
+    instead of skipping ahead — skipping would leave a hole in the
+    middle of the piece, and the body would no longer read as written.
     """
     if len(text.split()) <= limit:
         return text
 
     kept_paragraphs = []
     count = 0
+    stop = False
 
     for para in [p.strip() for p in text.split("\n\n") if p.strip()]:
-        if count >= limit:
+        if count >= limit or stop:
             break
         kept = []
         for sentence in split_sentences(para):
             words = len(sentence.split())
-            if count + words > limit and kept:
-                break
+            if count + words > limit:
+                if kept:
+                    # This paragraph already has a sentence, so stop here
+                    # and leave the rest of it out.
+                    break
+                if count > 0:
+                    # The paragraph's first sentence does not fit in what
+                    # is left of the budget. Stop the trim at the paragraph
+                    # boundary rather than overrun the ceiling.
+                    stop = True
+                    break
+                # Nothing has been kept yet and even the opening sentence
+                # is longer than the whole budget. Keep it: cutting a
+                # sentence in half is not an option, and there is nothing
+                # else to publish.
             kept.append(sentence)
             count += words
         # A trailing fragment (no terminal punctuation) means the model was
@@ -108,9 +140,13 @@ def trim_to_words(text, limit=200):
             kept_paragraphs.append(" ".join(kept))
 
     trimmed = "\n\n".join(kept_paragraphs).strip()
+    if not trimmed:
+        return text
     # If trimming gutted the piece, keep the original — a short comment is
-    # worse than a slightly long one.
-    if len(trimmed.split()) < 80:
+    # worse than a slightly long one. But only when the original is merely
+    # a little over the ceiling: a body that is wildly over the limit is
+    # worse than a short one.
+    if len(trimmed.split()) < 80 and len(text.split()) <= limit * 1.2:
         return text
     return trimmed
 

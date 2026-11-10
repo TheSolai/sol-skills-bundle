@@ -18,6 +18,7 @@ from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from _minimax_helper import minimax_generate, load_minimax_key
+from ai_filter import is_ai_title
 from post_identity import body_signature, published_signatures
 from text_utils import trim_to_word_budget
 
@@ -108,18 +109,15 @@ def fetch_hn_stories(limit=30):
 
 
 def is_ai_story(title):
-    """Rough AI/ML keyword filter."""
-    keywords = [
-        "ai", "llm", "gpt", "claude", "gemini", "openai", "anthropic",
-        "machine learning", "neural", "model", "chatbot", "agent",
-        "copilot", "rag", "embedding", "diffusion", "stable diffusion",
-        "mistral", "groq", "ollama", "langchain", "autogen", "crewai",
-        "nlp", "vision", "multimodal", "reasoning", "reasoner",
-        "artificial intelligence", "automation", "agent", "opencl", "cursor",
-        "claude code", "devin", "v0", "replit", "lovable", "bolt.new",
-    ]
-    t = title.lower()
-    return any(kw in t for kw in keywords)
+    """Is this HN title about AI?
+
+    The filter is shared with quick-hits.py and lives in ai_filter.py.
+    It matches keywords on WORD BOUNDARIES — the old inline version here
+    used a plain substring test, so "ai" matched inside "Airplanes" and
+    "Rail". See ai_filter.py for the full account and test_ai_filter.py
+    for the regression tests.
+    """
+    return is_ai_title(title)
 
 
 def pick_regional_story(stories, region_hint=None):

@@ -6,24 +6,93 @@ Runs every weekday at 8am UK time.
 
 Cronsetup: launchd StartCalendarInterval Monday-Friday 07:00
 Or: 0 7 * * 1-5 python3 scripts/content-pipeline/quick-hits.py >> logs/sol-quick-hits.log 2>&1
+
+Usage:
+    python3 quick-hits.py                # publish for today
+    python3 quick-hits.py --date 2026-11-09   # backfill a missed day
 """
 
-import sys, os, json, datetime, urllib.request, urllib.parse, re
+import sys, os, json, datetime, urllib.request, urllib.parse, re, fcntl, contextlib
 from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from devto_key import load_devto_key
 from _minimax_helper import minimax_generate, load_minimax_key_candidates
+from ai_filter import is_ai_title
+from text_utils import split_sentences
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 DEVTO_API_KEY = load_devto_key()
 
-TODAY = datetime.datetime.now(datetime.timezone.utc)
-DATE_STR = TODAY.strftime("%Y-%m-%d")
-POST_DATE = TODAY.strftime("%B %d, %Y")
-DAY_STR = TODAY.strftime("%A")
-IS_WEEKDAY = TODAY.weekday() < 5  # Mon-Fri = 0-4
+# Serialises runs so two schedulers (the MiniMax cron task and the
+# ai.sol.quick-hits launchd agent) cannot both write the same day's post.
+LOCK_FILE = Path("/tmp/sol-quick-hits.lock")
+
+# The HN Algolia index supports a real date filter, which is what makes a
+# backfill possible: a `--date` run must see that day's stories, not
+# whatever is on the front page now.
+HN_ALGOLIA = "https://hn.algolia.com/api/v1/search"
+
+
+def today_utc() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def parse_target_date(argv: list[str]) -> datetime.datetime:
+    """The date this run publishes for.
+
+    Defaults to today. `--date YYYY-MM-DD` publishes for a specific day,
+    which is how a day the scheduler missed gets backfilled.
+
+    WHY (2026-11-10): the 2026-11-09 episode never ran. The MiniMax cron
+    task needs the desktop app awake at 08:00; the app started at 19:10
+    that evening, so the Monday slot was silently skipped and the day left
+    a hole in the series. A scheduler that only ever runs "now" cannot
+    recover a missed day — see the same lesson in OPERATIONS.md, "Three
+    days of Sol's Take went missing because the Mac was asleep".
+    """
+    if "--date" in argv:
+        idx = argv.index("--date")
+        if idx + 1 >= len(argv):
+            raise SystemExit("--date needs a YYYY-MM-DD argument")
+        raw = argv[idx + 1]
+        try:
+            d = datetime.datetime.strptime(raw, "%Y-%m-%d")
+        except ValueError:
+            raise SystemExit(f"could not parse --date {raw!r}; expected YYYY-MM-DD")
+        return d.replace(tzinfo=datetime.timezone.utc)
+    return today_utc()
+
+
+def date_fields(d: datetime.datetime) -> tuple[str, str, str]:
+    """(date_str, post_date, day_str) for a target date."""
+    return d.strftime("%Y-%m-%d"), d.strftime("%B %d, %Y"), d.strftime("%A")
+
+
+def post_path_for(date_str: str, day_str: str) -> Path:
+    """Where the post for a given day lives."""
+    return SITE_DIR / "_posts" / f"{date_str}-quick-hits-{day_str.lower()}.md"
+
+
+@contextlib.contextmanager
+def run_lock():
+    """Serialise runs so two schedulers cannot both write the same post."""
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("[quick-hits] Another run holds the lock — skipping")
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def llm_generate(prompt: str, system: str = "", max_tokens: int = 6000) -> str | None:
@@ -47,8 +116,27 @@ def llm_generate(prompt: str, system: str = "", max_tokens: int = 6000) -> str |
     return None
 
 
-def fetch_hn_ai_stories(limit=30):
-    """Fetch HN top stories, return AI-filtered list."""
+# The AI keyword filter lives in ai_filter.py and is shared with
+# run-daily.py. It matches on WORD BOUNDARIES — the old inline version
+# here used a plain substring test, so "ai" matched inside "Rail" and
+# "Airplanes". On 2026-11-09 and 2026-11-10 that shipped "Payments
+# Canada launches Canada's Real-Time Rail" as an AI story in two
+# consecutive briefs. See ai_filter.py for the full account and
+# test_ai_filter.py for the regression tests.
+
+
+def fetch_hn_ai_stories(limit=30, target=None):
+    """Fetch HN top stories, return AI-filtered list.
+
+    `target` is the day this run publishes for. For today it reads the live
+    front page (the proven path). For a BACKFILL it reads the Algolia index
+    for that day's window instead — the front page only ever shows what is
+    hot now, so a backfilled episode written from it would describe the
+    wrong day's news.
+    """
+    if target < today_utc() - datetime.timedelta(hours=36):
+        return _fetch_hn_ai_stories_for_date(target)
+
     try:
         req = urllib.request.Request(
             "https://hacker-news.firebaseio.com/v0/topstories.json",
@@ -59,15 +147,6 @@ def fetch_hn_ai_stories(limit=30):
     except Exception as e:
         print(f"[hn] Failed to fetch HN stories: {e}")
         return []
-
-    AI_KW = [
-        "ai", "llm", "gpt", "claude", "gemini", "openai", "anthropic",
-        "machine learning", "neural", "model", "chatbot", "agent",
-        "copilot", "rag", "embedding", "diffusion", "stable diffusion",
-        "mistral", "groq", "ollama", "langchain", "autogen", "crewai",
-        "nlp", "vision", "multimodal", "reasoning", "cursor", "v0",
-        "devin", "replit", "lovable", "bolt", "artificial intelligence",
-    ]
 
     stories = []
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=36)
@@ -87,8 +166,7 @@ def fetch_hn_ai_stories(limit=30):
             time = story.get("time", 0)
             if time and time < cutoff_ts:
                 continue
-            title = story["title"].lower()
-            if not any(kw in title for kw in AI_KW):
+            if not is_ai_title(story["title"]):
                 continue
             stories.append({
                 "id": story_id,
@@ -104,10 +182,74 @@ def fetch_hn_ai_stories(limit=30):
     return stories[:8]
 
 
-def fetch_devto_articles(limit=10):
-    """Fetch trending dev.to articles tagged 'AI'."""
+def _fetch_hn_ai_stories_for_date(target, limit=30):
+    """HN stories from one specific day, via the Algolia index.
+
+    WHY Algolia (2026-11-10): a backfilled episode has to be written from
+    the news of the day it is dated for. The Firebase top-stories list only
+    ever returns what is trending NOW, so it cannot answer "what was big on
+    Nov 9" — a backfill built on it would be dated Nov 9 and describe Nov
+    10. The Algolia index supports a real time filter, which is what makes
+    the date honest.
+    """
+    start = int(target.timestamp())
+    end = int((target + datetime.timedelta(days=1)).timestamp())
+
     try:
-        url = f"https://dev.to/api/articles?tag=ai&per_page={limit}&top=1"
+        params = {
+            "tags": "story",
+            "numericFilters": f"created_at_i>{start},created_at_i<{end}",
+            "hitsPerPage": str(limit),
+        }
+        url = HN_ALGOLIA + "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"User-Agent": "SolAI/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        print(f"[hn] Failed to fetch HN stories for {target:%Y-%m-%d}: {e}")
+        return []
+
+    stories = []
+    for hit in data.get("hits", []):
+        title_text = hit.get("title") or ""
+        if not title_text:
+            continue
+        if not is_ai_title(title_text):
+            continue
+        stories.append({
+            "id": hit.get("objectID", ""),
+            "title": title_text,
+            "url": hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID')}",
+            "score": hit.get("points", 0) or 0,
+            "comments": hit.get("num_comments", 0) or 0,
+            "by": hit.get("author", ""),
+        })
+
+    # The Algolia `search` endpoint already ranks by points, but the daily
+    # path ranks by score + comments*0.5. Use the same ordering so a
+    # backfilled episode is curated the same way a live one is.
+    stories.sort(key=lambda s: s["score"] + s["comments"] * 0.5, reverse=True)
+    return stories[:8]
+
+
+def fetch_devto_articles(limit=10, target=None):
+    """Fetch trending dev.to articles tagged 'AI'.
+
+    For a BACKFILL it fetches the articles published on that specific day
+    instead of the current trending set — `top=1` only ever means "trending
+    now", so a backfilled episode would otherwise cite today's articles
+    under yesterday's date.
+    """
+    try:
+        if target is not None and target < today_utc() - datetime.timedelta(hours=36):
+            start = target.strftime("%Y-%m-%dT00:00:00Z")
+            end = (target + datetime.timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+            url = (
+                "https://dev.to/api/articles?tag=ai&per_page=%d"
+                "&published_after=%s&published_before=%s"
+            ) % (limit, start, end)
+        else:
+            url = f"https://dev.to/api/articles?tag=ai&per_page={limit}&top=1"
         req = urllib.request.Request(url, headers={"User-Agent": "SolAI/1.0"})
         with urllib.request.urlopen(req, timeout=15) as r:
             articles = json.loads(r.read())
@@ -149,7 +291,120 @@ def strip_trailing_byline(body: str) -> str:
     return "\n".join(lines).rstrip()
 
 
-def build_quick_hits(hn_stories, devto_articles):
+# ── Word budget ────────────────────────────────────────────────────────────
+
+# The prompt asks for ~200 words. Published bodies run 177-243 words
+# against that brief, so the model holds the range on its own today — but a
+# prompt asks, it does not constrain, and MiniMax-M2.7 writes ~60% over the
+# brief whatever the wording (see text_utils.trim_to_word_budget). The
+# ceiling and floor are therefore enforced in code.
+WORD_LIMIT = 250
+WORD_FLOOR = 150
+
+# A Quick Hits body is three items, each shaped like:
+#
+#     **Headline**
+#     **What happened:** ...
+#     **Why it matters:** ...
+#
+# and sometimes separated by `---` dividers. The item boundaries are what
+# matter, NOT markdown headings — `trim_to_word_budget()` classifies the
+# first block as a title and the rest as prose, which for this format
+# would cut across an item and can gut the third story entirely.
+#
+# So the budget is enforced per item instead: each of the three items keeps
+# its headline and its "Why it matters" line, and only the sentences inside
+# the two body paragraphs are eligible for cutting.
+_ITEM_HEADLINE = re.compile(r"^\*\*[^*].*\*\*\s*$")
+_ITEM_LABEL = re.compile(r"^\*\*(What happened|Why it matters):\*\*\s*(.*)$")
+
+
+def enforce_word_budget(body: str, limit: int = WORD_LIMIT,
+                        floor: int = WORD_FLOOR) -> str:
+    """Trim a Quick Hits body to a word ceiling without losing a story.
+
+    WHY (2026-11-10): the brief asks for ~200 words and the prompt alone
+    does not hold a word budget. The structure-aware trimmer in text_utils
+    assumes a titled, sectioned post — its block classifier treats the
+    first block as a title and the rest as prose, which for this format
+    would cut across an item's boundary and can remove the third story
+    entirely.
+
+    So the trimming happens at the line level instead, which is how the
+    model actually writes this post: each item is a bold headline line
+    followed by a "**What happened:**" line and a "**Why it matters:**"
+    line, optionally separated from the next item by a `---` divider.
+
+    Only the text after a label is eligible for cutting, and only from the
+    last item backwards — the third story is the one a reader would miss.
+    A headline is never cut, and a label line always keeps at least one
+    sentence, so no item is ever left empty.
+
+    A body that is already within the limit is returned unchanged.
+    """
+    total = len(body.split())
+    if total <= limit:
+        return body
+
+    lines = body.split("\n")
+
+    # The eligible lines are the label lines. Work from the end of the body
+    # backwards so the LAST item gives up its words first.
+    eligible = [i for i, line in enumerate(lines) if _ITEM_LABEL.match(line.strip())]
+    if not eligible:
+        # Not the expected shape — leave it alone rather than mangle it.
+        return body
+
+    saved = 0
+    for idx in reversed(eligible):
+        if total - saved <= limit:
+            break
+        line = lines[idx]
+        stripped = line.strip()
+        m = _ITEM_LABEL.match(stripped)
+        label, text = m.group(1), m.group(2)
+        # Everything before the text — the bold label and its colon. The
+        # label is re-joined with a space so the result still reads
+        # "**What happened:** ..." and not "**What happened:**...".
+        prefix = stripped[: -len(text)].rstrip()
+
+        sentences = split_sentences(text)
+        if len(sentences) < 2:
+            # A single sentence — there is nothing to cut without emptying
+            # the label.
+            continue
+
+        while len(sentences) > 1 and total - saved > limit:
+            dropped = len(sentences[-1].split())
+            if total - saved - dropped < floor:
+                # Cutting this would starve the post. A slightly long post
+                # beats a short one.
+                break
+            sentences.pop()
+            saved += dropped
+
+        if saved:
+            lines[idx] = prefix + " " + " ".join(sentences)
+
+    return "\n".join(lines).strip()
+
+
+def existing_post_is_degraded(path: Path) -> bool:
+    """True when the published post is the deterministic template fallback.
+
+    A degraded post is worth regenerating; a real one is not.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    # The template fallback prints "**1. Title**" per item and a link line.
+    if re.search(r"^\*\*\d+\.\s", text, re.MULTILINE):
+        return True
+    return False
+
+
+def build_quick_hits(hn_stories, devto_articles, post_date: str = ""):
     """Use LLM to pick best 3 stories and write the briefing."""
 
     if not hn_stories and not devto_articles:
@@ -194,7 +449,7 @@ Pick the 3 most interesting items from the candidates below. Write each as:
 
 Keep it punchy. No intro paragraph needed — just jump straight in. Total post should be ~200 words.
 
-Date: {POST_DATE}
+Date: {post_date}
 Author: Sol
 
 Candidate stories:
@@ -221,22 +476,32 @@ Candidate stories:
     if stripped != body.strip():
         print("[quick-hits] Stripped trailing byline from the body")
         body = stripped
+
+    # Enforce the word budget in code. The prompt alone does not hold it,
+    # and a briefing that runs long is the symptom of the model padding
+    # each of the three items.
+    trimmed = enforce_word_budget(body)
+    if trimmed != body.strip():
+        print(f"[quick-hits] Trimmed {len(body.split())} -> {len(trimmed.split())} words")
+        body = trimmed
+
     return body
 
 
-def create_post(body: str) -> Path:
+def create_post(body: str, d: datetime.datetime) -> Path:
     """Write the Jekyll post to _posts."""
-    slug = f"{DATE_STR}-quick-hits-{DAY_STR.lower()}"
+    date_str, post_date, day_str = date_fields(d)
+    slug = f"{date_str}-quick-hits-{day_str.lower()}"
     filename = f"{slug}.md"
     post_path = SITE_DIR / "_posts" / filename
 
     frontmatter = f"""---
 layout: post
-title: "Quick Hits: {DAY_STR}'s AI Briefing — {POST_DATE}"
-date: {DATE_STR} 08:00:00 +0000
+title: "Quick Hits: {day_str}'s AI Briefing — {post_date}"
+date: {date_str} 08:00:00 +0000
 tags: [ai, briefing, quick-hits, sol]
 author: Sol
-description: "Three AI stories worth knowing about on {POST_DATE}."
+description: "Three AI stories worth knowing about on {post_date}."
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png
 ---
@@ -248,35 +513,67 @@ hero_image: /images/sol-avatar.png
     return post_path
 
 
-def main():
-    if not IS_WEEKDAY:
-        print(f"[quick-hits] Not a weekday ({DAY_STR}) — skipping.")
+def main(argv: list[str] | None = None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    target = parse_target_date(argv)
+    date_str, post_date, day_str = date_fields(target)
+
+    # A backfill for a day the scheduler missed is always allowed, whatever
+    # the weekday. A normal run only happens on a weekday.
+    explicit_date = "--date" in argv
+    if not explicit_date and target.weekday() >= 5:
+        print(f"[quick-hits] Not a weekday ({day_str}) — skipping.")
         return
 
-    print(f"[quick-hits] Running for {DAY_STR}, {POST_DATE}")
+    print(f"[quick-hits] Running for {day_str}, {post_date}")
 
-    hn_stories = fetch_hn_ai_stories(limit=30)
-    print(f"[quick-hits] Fetched {len(hn_stories)} HN AI stories")
+    with run_lock() as got_lock:
+        if not got_lock:
+            return
 
-    devto_articles = fetch_devto_articles(limit=10)
-    print(f"[quick-hits] Fetched {len(devto_articles)} dev.to articles")
+        post_path = post_path_for(date_str, day_str)
 
-    body = build_quick_hits(hn_stories, devto_articles)
-    if not body or body.startswith("[LLM") or body.startswith("[error"):
-        print(f"[quick-hits] Failed to generate content: {body}")
-        return
+        # Idempotency: check for the existing output BEFORE doing the
+        # expensive work (the LLM call).
+        #
+        # WHY (2026-11-10): this series is driven by BOTH a Mavis cron task
+        # and a launchd agent, so both can fire on the same weekday. The
+        # second run would otherwise regenerate the body and overwrite the
+        # first — same URL, different prose.
+        #
+        # A degraded (template-fallback) post is the one case worth
+        # regenerating, because it is not real content at all.
+        #
+        # `--force` regenerates regardless. It is how a post published with
+        # a defect gets fixed: on 2026-11-09 and 2026-11-10 both briefs
+        # carried "Payments Canada launches Canada's Real-Time Rail",
+        # which the AI filter let through because "Rail" contains "ai".
+        if post_path.exists() and not existing_post_is_degraded(post_path) \
+                and "--force" not in argv:
+            print(f"[quick-hits] Already published: {post_path.name} — skipping")
+            return
 
-    post_path = create_post(body)
+        hn_stories = fetch_hn_ai_stories(limit=30, target=target)
+        print(f"[quick-hits] Fetched {len(hn_stories)} HN AI stories")
 
-    # Auto-commit and push
-    try:
-        import subprocess
-        cwd = SITE_DIR
-        from site_git import publish
-        sha = publish(f"Quick Hits: {DAY_STR} AI briefing", cwd=cwd)
-        print(f"[quick-hits] Committed and pushed to origin/main ({sha[:12] if sha else 'nothing new'}).")
-    except Exception as e:
-        print(f"[quick-hits] Git push failed: {e}")
+        devto_articles = fetch_devto_articles(limit=10, target=target)
+        print(f"[quick-hits] Fetched {len(devto_articles)} dev.to articles")
+
+        body = build_quick_hits(hn_stories, devto_articles, post_date=post_date)
+        if not body or body.startswith("[LLM") or body.startswith("[error"):
+            print(f"[quick-hits] Failed to generate content: {body}")
+            return
+
+        post_path = create_post(body, target)
+
+        # Auto-commit and push
+        try:
+            cwd = SITE_DIR
+            from site_git import publish
+            sha = publish(f"Quick Hits: {day_str} AI briefing", cwd=cwd)
+            print(f"[quick-hits] Committed and pushed to origin/main ({sha[:12] if sha else 'nothing new'}).")
+        except Exception as e:
+            print(f"[quick-hits] Git push failed: {e}")
 
 
 if __name__ == "__main__":

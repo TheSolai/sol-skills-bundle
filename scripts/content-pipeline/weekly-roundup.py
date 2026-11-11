@@ -33,6 +33,14 @@ except Exception:  # pragma: no cover - fall back to headline-only grounding
     def fetch_source_excerpt(url, max_chars=6000):
         return ""
 
+try:
+    # The shared word-boundary AI filter (ai_filter.py). This script carried
+    # its own inline substring copy of the bug until 2026-11-11.
+    from ai_filter import is_ai_title
+except Exception:  # pragma: no cover - fall back to headline-only matching
+    def is_ai_title(title):
+        return bool(title)
+
 # Sentence-aware trimming helpers are shared with midweek-news.py so the two
 # generators cannot drift apart — see text_utils.py for the rationale.
 from text_utils import (
@@ -115,17 +123,24 @@ def fetch_hn_stories(limit=500, days_back=7):
 
 
 def is_ai_story(title):
-    keywords = [
-        "ai", "llm", "gpt", "claude", "gemini", "openai", "anthropic",
-        "machine learning", "neural", "model", "chatbot", "agent",
-        "copilot", "rag", "embedding", "diffusion", "stable diffusion",
-        "mistral", "groq", "ollama", "langchain", "autogen", "crewai",
-        "nlp", "vision", "multimodal", "reasoning",
-        "artificial intelligence", "cursor", "devin", "v0", "replit",
-        "opencl", "bolt.new", "lovable",
-    ]
-    t = title.lower()
-    return any(kw in t for kw in keywords)
+    """Is this HN title about AI?
+
+    The filter is shared with quick-hits.py, run-daily.py and midweek-news.py
+    and lives in ai_filter.py. It matches keywords on WORD BOUNDARIES — the
+    old inline version here used a plain substring test, so "ai" matched
+    inside "Airplanes" and "Rail".
+
+    WHY IT MATTERED HERE (2026-11-11): this script had the identical inline
+    copy of the bug that quick-hits.py shipped wrong stories with. Measured
+    over the 23 roundups that had shipped by then, every one of them
+    carried at least one non-AI story, because the substring test matched
+    "ai" inside ordinary words — "Outlook.com is rejecting email from
+    domains without DMARC" (2026-11-09 roundup) and "RAM Altman: Linux
+    Script Emails Sam Altman Daily" were both published as AI stories.
+    See ai_filter.py for the full account and test_ai_filter.py for the
+    regression tests.
+    """
+    return is_ai_title(title)
 
 
 # ── Sol's Take ──────────────────────────────────────────────────────────────

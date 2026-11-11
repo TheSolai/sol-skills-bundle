@@ -1769,6 +1769,101 @@ caught the "Paper Airplanes" story (the top story of 2026-11-09, 952
 points) and all three regional posts said so in their first paragraph. No
 regional post ever carried a wrong story.
 
+## The filter fix reached two scripts short of the pipeline (found 2026-11-11)
+
+**Found and fixed 2026-11-11.** The entry above says the filter now lives in
+`ai_filter.py`, shared by `quick-hits.py` and `run-daily.py`. It was shared
+by THOSE TWO ONLY. `midweek-news.py` and `weekly-roundup.py` each carried
+their own private inline copy of the substring test, and kept it.
+
+That is the same defect class, in the same pipeline, in the two scripts that
+publish the site's two longest-form series. It had shipped:
+
+- **The 2026-11-09 roundup** carried "Outlook.com is rejecting email from
+  domains without DMARC" and "RAM Altman: Linux Script Emails Sam Altman
+  Daily How Much Unused RAM in Your PC" as AI stories. Both matched on
+  "em**ai**l".
+- **The 2026-11-11 midweek digest** carried "Nvidia CEO Jensen Huang's
+  letter to staff about affair" as its TOP story — a CEO's affair, matched
+  on "aff**ai**r".
+
+Measured across the 23 roundups that had shipped by 2026-11-11, **every
+single one carried at least one non-AI story.** The two series that were
+migrated on 2026-11-10 were the two that had already been fixed by that
+night's run; the two that were missed were the two nobody re-read.
+
+**Why a shared module was not enough.** The fix on 2026-11-10 moved the
+filter into `ai_filter.py` and pointed two scripts at it. That is the right
+shape, but nothing made the OTHER scripts point at it too — and a private
+copy of a fixed bug is invisible: the code reads fine, the tests pass, and
+the defect ships. `test_ai_filter.py` now imports every consumer and
+asserts it rejects a substring-only title, so a script that grows its own
+copy again fails the suite rather than shipping.
+
+## The dedupe could not see two thirds of the archive (found 2026-11-11)
+
+**Found and fixed 2026-11-11.** `published_source_urls()` answers "has the
+archive already covered this story?" for every generator, and it reads the
+source URLs out of published posts. It read only two formats:
+
+```
+**Source story:** [title](url)
+*Source: [title](url)
+```
+
+The pipeline writes stories in two more formats, and neither was read:
+
+- the weekly roundup writes `[Read more →](url) — N points · N comments`;
+- an analysis or deep-dive post writes a `## Sources` section of bullets.
+
+The dedupe set held **143 URLs out of the 405 the archive contained.** It
+saw none of the 161 story URLs in the 23 shipped roundups, and none of the
+124 in the analysis posts' Sources sections.
+
+The consequence was visible on the live site: the 2026-11-11 midweek digest
+republished "Goldman Sachs is pulling Claude Code from its bankers and
+traders" (the Monday roundup had carried it on 2026-11-09) and "Claude
+Fable 5.2 and Mythos 5.2" (the Nov-10 Australia post had cited it). It was
+the only midweek digest in the site's history to overlap a prior roundup —
+**1 of 24** — so the overlap is the defect, not the design.
+
+`source_urls()` now reads all three formats. The singular `source_url()` is
+deliberately left alone: `seo-health.py` keys its republication families on
+that one value, and widening it would change which posts the audit groups
+together. Only bullets under a heading whose text is exactly "Sources" are
+counted, so a how-to post's "## Additional Resources" documentation links
+and a link roundup's "## Links from AgentNews#23" section are not mistaken
+for covered stories.
+
+`test_post_identity_dedupe.py` is the table-driven test for all of it.
+
+## A refresh could not keep its own stories, and one story was listed twice
+
+**Found and fixed 2026-11-11.** Two defects, both in `midweek-news.py`, both
+found while regenerating the digest above.
+
+**A refresh swapped the stories underneath the post.** `--refresh` rewrites
+today's post in place, so the post on disk already contributes its three URLs
+to the covered set — and the dedupe then forbids them. Refreshing a post
+whose commentary needed regenerating silently swapped the stories for
+different ones.
+
+The first attempt at fixing this subtracted the post's URLs from the shared
+covered set. **That was wrong, and it shipped once before it was caught:**
+it also freed any story that ANOTHER post covers, so the refresh republished
+"Claude Fable 5.2 and Mythos 5.2" and the Goldman Sachs story — both
+already on the site under other posts. The correct fix excludes the post's
+FILE from the covered set, which leaves every other post's coverage intact.
+`published_source_urls_excluding()` does that.
+
+**The same story was listed twice.** The Algolia index returns one row per
+Hacker News submission, and a story can be submitted more than once. On
+2026-11-11, "Claude Fable 5.2 and Mythos 5.2" appeared twice — 992 points
+and 891 points, both pointing at the same URL. The digest listed it as
+stories 2 and 3 and asked the model to comment on "3 stories" when only 2
+existed. `select_stories()` now dedupes its own candidates on the same URL
+key the archive uses, keeping the higher-scoring submission.
+
 Both generators now use the shared word-boundary filter, and the two
 affected briefs were regenerated with `--force`.
 

@@ -38,6 +38,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ai_filter import is_ai_title  # noqa: E402
 
 
+# Every script that picks AI stories must use the SHARED filter. Two scripts
+# kept private inline copies of the substring test until 2026-11-11, and the
+# copy is exactly how the defect survives a fix elsewhere: quick-hits.py and
+# run-daily.py were migrated on 2026-11-10, while midweek-news.py and
+# weekly-roundup.py were missed and went on shipping non-AI stories — the
+# 2026-11-09 roundup carried "Outlook.com is rejecting email from domains
+# without DMARC" and "RAM Altman: Linux Script Emails Sam Altman" as AI
+# stories, and the 2026-11-11 midweek digest carried the Nvidia CEO affair
+# story.
+#
+# This test fails if any of them goes back to a private copy, so the fix
+# cannot be undone one script at a time.
+FILTER_CONSUMERS = ["quick-hits.py", "run-daily.py", "midweek-news.py", "weekly-roundup.py"]
+
+# A title that only the substring test would match, and one that only a
+# word-boundary-aware filter matches.
+SUBSTRING_ONLY_TITLE = "Outlook.com is rejecting email from domains without DMARC"
+WORD_ONLY_TITLE = "Understanding Transformers from scratch"
+
+
 # Real HN titles that must NOT match. Each one contains a keyword as a
 # substring of an ordinary word — the defect this file pins shut.
 #
@@ -53,6 +73,18 @@ MUST_NOT_MATCH = [
     "Norway has purchased 500k drones for Ukraine (Norwegian)",
     "USPS now offers official ZIP Code boundary polygons",
     "Unlocking any car from X brand in most of the world",
+    # SHIPPED in the 2026-11-09 roundup. "email" contains "ai".
+    "Outlook.com is rejecting email from domains without DMARC",
+    # SHIPPED in the 2026-11-09 roundup. "Emails" contains "ai".
+    "RAM Altman: Linux Script Emails Sam Altman Daily How Much Unused RAM in Your PC",
+    # SHIPPED in the 2026-11-09 roundup and the 2026-11-11 midweek digest.
+    # "affair" contains "ai" — and the story is a CEO's affair, not an AI
+    # development. The shared filter rejects it.
+    "Nvidia CEO Jensen Huang's letter to staff about affair",
+    # SHIPPED in the 2026-10-18 roundup. "train" contains "ai".
+    "Microsoft and CMU team up to train early career software engineers",
+    # SHIPPED in the 2026-10-22 roundup. "Railway" contains "ai".
+    "Railway Security Disclosure",
 ]
 
 # Real HN titles that MUST match. These are the ones the old list rejected:
@@ -185,6 +217,51 @@ def test_low_ranking_false_positives_exist_but_are_harmless():
     )
 
 
+
+
+def test_every_consumer_uses_the_shared_filter():
+    """No script may keep a private copy of the AI filter.
+
+    Each consumer is imported and asked whether it accepts a title that
+    only a substring test would accept. A script with its own inline copy
+    says yes, and this test fails.
+    """
+    import importlib.util
+
+    here = Path(__file__).resolve().parent
+    for script in FILTER_CONSUMERS:
+        path = here / script
+        assert path.exists(), f"{script} is missing from the pipeline"
+
+        spec = importlib.util.spec_from_file_location(f"_filter_probe_{script[:-3]}", path)
+        module = importlib.util.module_from_spec(spec)
+        # The scripts read sys.argv at import time in some cases; neutralise it.
+        old_argv = sys.argv
+        sys.argv = [script]
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.argv = old_argv
+
+        # Every consumer exposes the same predicate name.
+        predicate = None
+        for attr in ("is_ai_story", "is_ai_title"):
+            if hasattr(module, attr):
+                predicate = getattr(module, attr)
+                break
+        assert predicate is not None, (
+            f"{script} exposes no AI filter predicate — the filter must not "
+            f"be removed from a consumer"
+        )
+
+        assert not predicate(SUBSTRING_ONLY_TITLE), (
+            f"{script} still matches a title on a substring: {SUBSTRING_ONLY_TITLE!r}. "
+            f"It must use the shared ai_filter.is_ai_title()."
+        )
+        assert predicate(WORD_ONLY_TITLE), (
+            f"{script} rejects {WORD_ONLY_TITLE!r} — it must use the shared "
+            f"ai_filter.is_ai_title()."
+        )
 
 
 def _run():

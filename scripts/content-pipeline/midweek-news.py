@@ -33,13 +33,26 @@ except Exception:  # pragma: no cover - fall back to headline-only grounding
         return ""
 
 try:
-    from post_identity import normalise_url, published_source_urls
+    from post_identity import (
+        normalise_url,
+        published_source_urls,
+        published_source_urls_excluding,
+    )
 except Exception:  # pragma: no cover - dedupe is an enhancement, not a blocker
     def normalise_url(url):
         return (url or "").strip().lower()
 
     def published_source_urls(posts_dir):
         return set()
+
+    def published_source_urls_excluding(posts_dir, exclude_path):
+        return set()
+
+try:
+    from ai_filter import is_ai_title
+except Exception:  # pragma: no cover - fall back to headline-only matching
+    def is_ai_title(title):
+        return bool(title)
 
 try:
     from text_utils import ends_cleanly, split_sentences, trim_to_words
@@ -192,15 +205,15 @@ def fetch_hn_stories(days_back=DAYS_BACK, limit=100):
 
 
 def is_ai_story(title):
-    keywords = [
-        "ai", "llm", "gpt", "claude", "gemini", "openai", "anthropic",
-        "machine learning", "neural", "model", "chatbot", "agent",
-        "copilot", "rag", "embedding", "diffusion",
-        "mistral", "groq", "ollama", "langchain",
-        "artificial intelligence", "cursor", "devin", "v0",
-    ]
-    t = title.lower()
-    return any(kw in t for kw in keywords)
+    """Is this HN title about AI?
+
+    The filter is shared with quick-hits.py and run-daily.py and lives in
+    ai_filter.py. It matches keywords on WORD BOUNDARIES — the old inline
+    version here used a plain substring test, so "ai" matched inside
+    "Airplanes" and "Rail". See ai_filter.py for the full account and
+    test_ai_filter.py for the regression tests.
+    """
+    return is_ai_title(title)
 
 
 def select_stories(stories, exclude_urls=None):
@@ -210,14 +223,35 @@ def select_stories(stories, exclude_urls=None):
     Dedupe is on the source URL — the stable key for anything that comments
     on the news (see post_identity.py and OPERATIONS.md). Publishing a second
     URL for a story the archive already covers is a duplicate post.
+
+    The candidates are ALSO deduped against each other, on the same URL key.
+    WHY (2026-11-11): the Algolia index returns one row per Hacker News
+    submission, and the same story can be submitted more than once — on
+    2026-11-11, "Claude Fable 5.2 and Mythos 5.2" appeared twice, at 992
+    points and at 891 points, both pointing at
+    anthropic.com/claude-fable-and-mythos-5-2. Without this the digest
+    listed the same story twice, under two different point counts, and the
+    commentary was asked about "3 stories" when only 2 existed.
     """
     exclude = {normalise_url(u) for u in (exclude_urls or set())}
     candidates = []
+    seen = set()
     for story in stories:
         if not is_ai_story(story["title"]):
             continue
-        if normalise_url(story["url"]) in exclude:
+        key = normalise_url(story["url"])
+        if key in exclude:
             continue
+        if key in seen:
+            # The same story, submitted twice. Keep the higher-scoring one —
+            # the loop has not sorted yet, so compare explicitly.
+            for i, existing in enumerate(candidates):
+                if normalise_url(existing["url"]) == key:
+                    if (story["score"], story["comments"]) > (existing["score"], existing["comments"]):
+                        candidates[i] = story
+                    break
+            continue
+        seen.add(key)
         candidates.append(story)
 
     candidates.sort(key=lambda s: s["score"] + s["comments"] * 0.5, reverse=True)
@@ -422,6 +456,28 @@ def main():
     stories = fetch_hn_stories(days_back=DAYS_BACK)
 
     covered = published_source_urls(POSTS_DIR)
+
+    # On a refresh, this post's OWN stories must not count against itself.
+    #
+    # WHY (2026-11-11): `--refresh` rewrites today's post in place, so the
+    # post on disk already contributes its three URLs to the covered set.
+    # Without this, a refresh could never keep the same stories — the
+    # dedupe would forbid them — so refreshing a post whose commentary
+    # needs regenerating would silently swap the stories underneath it.
+    #
+    # The post's FILE is excluded from the covered set, not its URLs
+    # subtracted from it. Subtracting the URLs would also free any story
+    # that another post covers, and the refresh would then republish a
+    # story the archive already had under a different post.
+    #
+    # A story stays in the refreshed post if it still passes the AI filter
+    # and no OTHER post covers it. A story that only qualified through the
+    # old substring filter, or that another post has since covered, still
+    # falls out — which is how a refresh fixes a defective post.
+    if args.refresh and filepath.exists():
+        covered = published_source_urls_excluding(POSTS_DIR, filepath)
+        print("[digest] Refresh: excluding this post from the covered set")
+
     top_stories = select_stories(stories, exclude_urls=covered)
     ai_count = len([s for s in stories if is_ai_story(s["title"])])
     print(f"[news] Found {ai_count} AI stories from past {DAYS_BACK} days")

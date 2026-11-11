@@ -41,6 +41,42 @@ SOURCE_URL_PATTERNS = (
     re.compile(r"\*Source:\s*\[[^\]]*\]\(([^)]+)\)"),
 )
 
+# Additional formats that a story can be cited in, used by the DEDUPE path
+# only — see `source_urls()`.
+#
+# WHY (2026-11-11): the weekly roundup and the analysis/deep-dive posts cite
+# their stories in formats the two patterns above do not match:
+#
+#   * the roundup writes "[Read more →](url) — N points · N comments";
+#   * an analysis post writes a "## Sources" section of bullet links.
+#
+# `source_urls()` only saw the two `*Source:*` formats, so `published_source_urls()`
+# — the set every generator uses to decide "have I already covered this?" —
+# did not know about a single one of the 161 story URLs in the 23 shipped
+# roundups, nor the 124 in the analysis posts' Sources sections. The dedupe
+# was blind to two thirds of the archive.
+#
+# The result was visible on the live site on 2026-11-11: the midweek digest
+# republished "Goldman Sachs is pulling Claude Code from its bankers and
+# traders", which the Monday roundup had already covered, and "Claude Fable
+# 5.2 and Mythos 5.2", which the Nov-10 Australia post had already covered.
+#
+# Only `source_urls()` (the plural, dedupe-facing helper) reads these. The
+# singular `source_url()` is deliberately left alone: seo-health.py keys its
+# republication families on that single value, and widening it would change
+# which posts the audit groups together — a separate change, with its own
+# blast radius, that the audit's own repair script consumes.
+SOURCE_URL_PATTERNS_EXTRA = (
+    # The weekly roundup's story list.
+    re.compile(r"\[Read more →\]\(([^)]+)\)"),
+)
+
+# A "## Sources" section: a heading of any level whose text is "Sources",
+# followed by bullet links until the next heading of the same or higher level.
+SOURCES_HEADING_RE = re.compile(r"^(#{1,6})\s*Sources\s*$", re.MULTILINE)
+SOURCES_BULLET_RE = re.compile(r"^\s*[-*+]\s+\[[^\]]*\]\((https?://[^)\s]+)\)")
+ANY_HEADING_RE = re.compile(r"^(#{1,6})\s+")
+
 
 def split_front_matter(text):
     """Return (front_matter, body). front_matter is '' when absent."""
@@ -78,6 +114,40 @@ def source_url(text):
     return None
 
 
+def sources_section_urls(text):
+    """URLs cited in a "## Sources" section, as bullet links.
+
+    The analysis and deep-dive posts list their sources this way instead of
+    on a `*Source:*` line. They are stories the archive has covered, so the
+    dedupe has to see them.
+
+    Only bullet links directly under a heading whose text is exactly
+    "Sources" are collected. A "## Additional Resources" section (a how-to
+    post linking to documentation) or a "## Links from AgentNews#23" section
+    is not a list of covered stories, so neither is counted.
+    """
+    out = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = SOURCES_HEADING_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        level = len(m.group(1))
+        i += 1
+        # Collect bullets until the next heading of the same or higher level.
+        while i < len(lines):
+            h = ANY_HEADING_RE.match(lines[i])
+            if h and len(h.group(1)) <= level:
+                break
+            b = SOURCES_BULLET_RE.match(lines[i])
+            if b:
+                out.append(b.group(1))
+            i += 1
+    return out
+
+
 def source_urls(text):
     """Every external story this post comments on.
 
@@ -88,15 +158,25 @@ def source_urls(text):
     republish a story the archive already covered.
 
     Order is preserved and duplicates are dropped.
+
+    It also reads the roundup's "[Read more →]" links and the analysis posts'
+    "## Sources" bullets — the two formats the original two patterns missed,
+    which left the dedupe blind to most of the archive. See
+    SOURCE_URL_PATTERNS_EXTRA for the full account.
     """
     out = []
     seen = set()
-    for pattern in SOURCE_URL_PATTERNS:
+    for pattern in SOURCE_URL_PATTERNS + SOURCE_URL_PATTERNS_EXTRA:
         for m in pattern.finditer(text):
             url = m.group(1).strip()
             if url and url not in seen:
                 seen.add(url)
                 out.append(url)
+    for url in sources_section_urls(text):
+        url = url.strip()
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
     return out
 
 
@@ -129,6 +209,56 @@ def published_signatures(posts_dir):
         sig = body_signature(text)
         if sig:
             out.add(sig)
+    return out
+
+
+def published_source_urls_of(path):
+    """Normalised source URLs of a single post.
+
+    Used when a generator refreshes a post in place: the post's own stories
+    must not count as "already covered" against itself.
+    """
+    out = set()
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for url in source_urls(text):
+        key = normalise_url(url)
+        if key:
+            out.add(key)
+    return out
+
+
+def published_source_urls_excluding(posts_dir, exclude_path):
+    """Normalised source URLs of every published post EXCEPT one.
+
+    WHY (2026-11-11): a generator that refreshes a post in place must not
+    count that post's own stories against itself. Subtracting the post's
+    URLs from the shared covered set is NOT the same thing: a URL that
+    another post also covers would be freed by the subtraction and become
+    selectable again — so the refresh could publish a story the archive
+    covers under a different post. Excluding the FILE leaves every other
+    post's coverage intact.
+
+    `exclude_path` is matched on the resolved absolute path.
+    """
+    out = set()
+    posts_dir = Path(posts_dir)
+    if not posts_dir.is_dir():
+        return out
+    excluded = Path(exclude_path).resolve() if exclude_path else None
+    for path in posts_dir.glob("*.md"):
+        if excluded is not None and path.resolve() == excluded:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for url in source_urls(text):
+            key = normalise_url(url)
+            if key:
+                out.add(key)
     return out
 
 

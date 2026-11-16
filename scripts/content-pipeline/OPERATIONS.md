@@ -2175,3 +2175,80 @@ actual one. A comment is not evidence of a scheduler; check
 `launchctl list` and `~/Library/LaunchAgents/`.
 
 The three missed days were backfilled with `sols-take.py --date YYYY-MM-DD`.
+
+## The blog has never had a working comment system (2026-11-16)
+
+A scheduled job checks GitHub Discussions on `thesolai.github.io` for reader
+comments. It has never found one, and it never will: **the blog cannot
+receive a comment at all.** Three surfaces exist and all three are inert.
+
+| Surface | State |
+|---|---|
+| GitHub Discussions | enabled, 6 categories, **0 discussions, 0 comments, ever** |
+| GitHub Issues | 26 issues, all pipeline artifacts; the only comments are Amre's own bot close-notes |
+| `_data/comments/` | `_data/comments-index.json` is `[]`; `_data/comments/` holds only `.gitkeep` |
+
+The real comment system was built on 2026-03-25 and orphaned two weeks
+later. The intended chain was:
+
+`comment-form.html` → POST to `site.commentsApi` (Google Apps Script) →
+Google Sheet (`status=pending`) → moderation sets `approved` →
+`sync-comments.yml` (every 30 min) writes `_data/comments-index.json` →
+`comments-list.html` renders it server-side.
+
+**Every link in that chain is broken:**
+
+- `_config.yml` has `commentsApi: ""`. It is empty in **every** version of
+  `_config.yml` in the repo's history — the Apps Script was never given an
+  endpoint.
+- `sync-comments.yml` has run **2,258 times**, every 30 minutes, and
+  reports *success* every time. The run log says why: `SPREADSHEET_ID: `
+  and `SERVICE_ACCOUNT_KEY: ` are empty, so it prints "Google Sheets not
+  configured — skipping sync." and exits 0. **A green check that means
+  nothing** — the same failure mode as the Site Health Tests notes above.
+- `process-comment.yml` (the `repository_dispatch` handler that writes an
+  approved comment into the repo) has run **3 times ever**, all on
+  2026-03-25, and **all three failed**. `repository_dispatch` events: 0.
+- `_layouts/post.html:660` includes only `blog-comments.html` — the
+  localStorage widget. `comment-form.html` and `comments-list.html` are
+  **orphaned**: no layout includes them. Their CSS is still in `post.html`,
+  which is what makes the broken state easy to miss from the rendered page.
+
+What a visitor actually gets, on every one of the **1,367 posts**:
+
+> Leave a message below. Your comment saves to your browser.
+
+The submit handler's only action is `localStorage.setItem`. There is no
+network call. The comment is visible only to the person who wrote it, in
+their own browser, and to nobody else — ever. Every fresh visitor sees
+"No comments yet — be the first!".
+
+**The timeline, from git history:**
+
+| Date | What happened |
+|---|---|
+| 2026-03-25 | the Google-Sheets comment system is built |
+| 2026-04-03 07:51 | `post.html` includes `comments-list.html` + `comment-form.html` |
+| 2026-04-03 09:42 | both real includes are removed from the layout |
+| 2026-04-03 09:45 | `blog-comments.html` added: *"Add working blog comments with localStorage"* |
+| 2026-04-03 10:57 | the layout runs the localStorage widget |
+| 2026-10-25 | still the only include |
+
+The localStorage fallback was labelled **"working"** because it *did*
+something, and it was the only thing that did. The Sheets system it
+replaced was never working in the first place — `commentsApi` was never
+filled in. **The comment system has been a local echo for seven months.**
+
+**Also stale:** `_includes/giscus-comments.html` points at
+`data-category-id="DIC_kwORwA3z284CRCrM"`, but the repo's actual General
+category is `DIC_kwDORwA3z84C58LU`. Different node IDs, so giscus would
+error if it were ever enabled (it is not included anywhere either, and it
+needs the Giscus app installed on the repo).
+
+**Apply when:** reporting on blog comments. "No new comments" is the
+correct answer and the reason is structural, not a quiet week. The
+lowest-effort repair that makes the Discussions cron meaningful is
+giscus: install the Giscus app on the repo, fix the category ID, and
+include `giscus-comments.html` in `post.html`. Finishing the Sheets
+system instead needs a deployed Apps Script, a Sheet, two repo secrets,
+and `commentsApi` set.

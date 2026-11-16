@@ -10,6 +10,7 @@ Or: 0 7 * * 1 python3 scripts/content-pipeline/weekly-roundup.py >> logs/sol-con
 """
 
 import sys, os, json, datetime, urllib.request, re, urllib.error
+import contextlib, fcntl
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -52,6 +53,16 @@ from text_utils import (
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 DEVTO_API_KEY = os.getenv("DEVTO_API_KEY", "")
+
+# Run lock, same convention as quick-hits.py and sols-take.py.
+# WHY (2026-11-16): this series is driven by TWO schedulers (launchd Monday
+# 07:00 and the 08:00 cron). The existence check in main() stops the second
+# run from republishing, but it does NOT stop two runs that start at the same
+# moment: both can pass `filepath.exists()` before either writes, both burn an
+# LLM call, and the second write silently overwrites the first body. The lock
+# makes "already exists" mean "the other scheduler published", not "something
+# failed".
+LOCK_FILE = Path("/tmp/sol-weekly-roundup.lock")
 
 TODAY = datetime.datetime.now(datetime.timezone.utc)
 DATE_STR = TODAY.strftime("%Y-%m-%d")
@@ -444,7 +455,34 @@ def post_to_devto(title, body, tags):
         return None
 
 
+@contextlib.contextmanager
+def run_lock():
+    """Serialise runs so two schedulers cannot both write the same post."""
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("[roundup] Another run holds the lock — skipping")
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def main():
+    with run_lock() as got_lock:
+        if not got_lock:
+            return
+        _publish_roundup()
+
+
+def _publish_roundup():
     print(f"\n{'='*60}")
     print(f"Sol AI Weekly Roundup — {WEEK_STR}")
     print(f"{'='*60}\n")

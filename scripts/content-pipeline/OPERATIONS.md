@@ -1982,3 +1982,58 @@ succeed. Checking the live URL is the only check that covers the last
 one, because it is the only state a reader can observe.
 
 
+## The weekly roundup had no run lock, and its dev.to key is an empty string (2026-11-16)
+
+Two gaps in `weekly-roundup.py`, found while running the 2026-11-16 roundup.
+Neither stopped the post from publishing; both are latent.
+
+**1. No `flock`, unlike every other two-scheduler series.** The roundup is
+driven by TWO schedulers (`ai.sol.weekly-roundup`, launchd Monday 07:00,
+and `sol-weekly-roundup`, cron `0 8 * * 1`). `quick-hits.py`,
+`sols-take.py` and `run-daily.py` all take an `flock`; the roundup did
+not. Its `filepath.exists()` check stops the SECOND run from
+republishing, but it does not stop two runs that start at the same
+moment: both can pass the existence check before either writes, both burn
+an LLM call, and the second write silently overwrites the first body.
+The rule stated earlier in this file — "a series driven by BOTH
+schedulers needs a run lock as well as the existence check" — was not
+applied to this series.
+
+Fixed: `run_lock()` on `/tmp/sol-weekly-roundup.lock`, same shape as
+`quick-hits.py`. The lock is taken BEFORE the HN fetch, so a losing run
+costs nothing. Verified: with the lock held by another process the
+script prints "Another run holds the lock — skipping" and exits 0 without
+fetching or writing; with the lock free it still reaches the
+already-published skip path.
+
+**2. `DEVTO_API_KEY` is an empty string in the launchd plist, so the
+roundup's own dev.to cross-post has been a no-op.** The plist sets the
+key to `""`. The real key lives in the canonical secret file
+(`~/.openclaw/workspace/secrets/devto-api-key.txt`), which every other
+script reads through `devto_key.load_devto_key()`. The roundup reads
+`os.getenv("DEVTO_API_KEY", "")` directly, so it never sees the key and
+prints "[dev.to] No API key — skipping cross-post".
+
+**This is harmless as it stands, and "fixing" it would make things
+worse.** `devto-poster.py` is the canonical publisher for dev.to and it
+cross-posts the roundup anyway — the tracker holds
+`the-week-in-ai-november-9-2026-4a5i` and
+`the-week-in-ai-november-16-2026-4a12`, and both are live on dev.to
+with the stories in the body. Giving the roundup a working key would
+create a SECOND writer for the same shared tracker, which is the exact
+defect class recorded under "a shared tracker needs one writer, one
+atomic write, and a pager" — two writers, two write conventions, and a
+duplicate-post window. **Do not point the roundup at the dev.to API
+until it shares the tracker's atomic write path.**
+
+**Also noted:** the roundup's own dev.to step is redundant rather than
+broken. If it is ever retired, nothing changes — `devto-poster.py`
+already covers the series.
+
+**One stale detail in the cron task description:** the task text says the
+roundup "picks the 5 most significant" stories, but the script selects
+`ai_stories[:7]` and the 2026-11-16 post contains 7 stories. The script
+is the source of truth; the description is out of date. The post's
+"7 stories that mattered" line is generated from `len(top_stories)`, so
+it stays correct either way.
+

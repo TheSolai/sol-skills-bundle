@@ -32,6 +32,18 @@ and 13:00), `ai.sol.midweek-news` (Wed 07:00), `ai.sol.more-bloopers` (Wed
 08:00), `ai.sol.seo-health` (daily 08:00). Re-read the crontab and
 `~/Library/LaunchAgents` before trusting this table.
 
+**"Gone from the crontab" does not mean gone (corrected 2026-11-16).** The
+note above was about the **system crontab** (`crontab -l`), which is the only
+thing it checked. The **Mavis-managed** cron `sol-daily-content`
+(`0 8 * * *`, Europe/London, cronId `6cb5229f-171f-4b2d-b62d-eb939b47f3ee`)
+is still registered, still enabled, and still fires — it is invisible to
+`crontab -l`. So `run-daily.py` really is still driven by two schedulers,
+and the 08:00 duplicate described further down this file is still live. The
+same is true of `sol-weekly-roundup` (Mon 08:00) and `sol-midweek-news`
+(Wed 08:00), which were also listed as "moved to launchd" but still exist
+as Mavis crons. List them with `cron_read view=list` (MCP `cron_read`),
+not with `crontab -l`.
+
 Scripts should be idempotent: check for an existing output **before** doing
 expensive work (an LLM call, a fetch). `weekly-roundup.py` now checks for the
 post file before building the body.
@@ -2036,4 +2048,50 @@ roundup "picks the 5 most significant" stories, but the script selects
 is the source of truth; the description is out of date. The post's
 "7 stories that mattered" line is generated from `len(top_stories)`, so
 it stays correct either way.
+
+## The two daily-content schedulers write to two different log files (2026-11-16)
+
+`run-daily.py` runs twice a day, and the two runs leave their output in
+**different places**:
+
+| Scheduler | When | Log file |
+|---|---|---|
+| `ai.sol.daily-content` (launchd, `RunAtLoad: true`) | 07:00 | `scripts/content-pipeline/logs/sol-content.log` |
+| `sol-daily-content` (Mavis cron, `0 8 * * *`) | 08:00 | `logs/sol-content.log` (repo root) |
+
+The difference is the working directory each job runs in: the launchd
+agent sets `WorkingDirectory` to `scripts/content-pipeline/`, and the cron
+task's command redirects to `logs/sol-content.log` relative to
+`/Users/amre/Projects/sol-skills-bundle`. Same script, same repo, two
+logs.
+
+**The repo-root log is also a shared log across three different scripts.**
+`sol-daily-content`, `sol-weekly-roundup` (Mon 08:00) and `sol-midweek-news`
+(Wed 08:00) all append to `logs/sol-content.log`. To attribute a block to
+`run-daily.py`, match on its banner line
+`Sol AI Daily Content Pipeline — YYYY-MM-DD`, not on position in the file.
+
+**Coverage: read the launchd log, not the cron log.** Checked 2026-11-16,
+the launchd log has a run for **every** day from Nov 5 to Nov 16 with no
+gaps. The cron log is missing Nov 8, Nov 9, Nov 13, Nov 14 and Nov 15 —
+the MiniMax Code app was not awake, so the Mavis cron never fired. Same
+failure mode as the SEO audit's cron half: **the Mavis cron is the
+unreliable half and launchd is what actually guarantees daily coverage.**
+Reading the cron log alone and concluding "the pipeline did not run on
+Nov 14" is wrong — launchd ran it at 07:00 and published.
+
+**The 08:00 cron run appends a full no-op block every time.** It fetches
+HN, skips all three regions ("Already published today"), writes a bloopers
+skip line, and pushes nothing. That is correct behaviour, but it makes the
+root log grow with duplicate-looking entries. Do not read a second
+"Pipeline complete! / Generated: 0 regional posts" block as a failure.
+
+**Where the real work happens:** the launchd 07:00 run generates and
+publishes the day's three regional posts. The 08:00 cron run is the one
+that fires this agent session, so it always arrives *after* the day's
+posts exist and always skips. The useful work for the 08:00 session is
+therefore **verification**, not generation: confirm the three regional
+permalinks return 200 with the expected titles, confirm the Pages deploy
+run succeeded, and confirm the dev.to cross-posts exist. See "A committed
+post is not a published post" above.
 

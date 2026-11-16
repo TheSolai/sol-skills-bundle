@@ -17,6 +17,8 @@ they overlap. Check before assuming a script runs once.
 | `sol-quick-hits` | cron `0 8 * * 1-5` | `quick-hits.py` |
 | `ai.sol.quick-hits` | launchd, Mon-Fri 07:00 | `quick-hits.py` |
 | `sol-post-to-devto` | cron `30 7 * * *` | `devto-poster.py` |
+| `ai.sol.sols-take` | launchd, daily 08:00 | `sols-take.py` (added 2026-11-16) |
+| `sol-sols-take` | cron, daily 09:00 | `sols-take.py` |
 
 The 08:00 slot is crowded — five jobs start within the same minute, plus the
 launchd jobs at 07:00. Expect them to race on the site repo.
@@ -2095,3 +2097,81 @@ permalinks return 200 with the expected titles, confirm the Pages deploy
 run succeeded, and confirm the dev.to cross-posts exist. See "A committed
 post is not a published post" above.
 
+## A model that repeats a sentence passed every check (2026-11-16)
+
+The 2026-11-16 Sol's Take shipped with this in its body:
+
+    Now, synthetic data is not poison. Synthetic data is not poison.
+    Synthetic data is not poison.
+
+Nothing caught it. The word budget was satisfied **by the repeats** (196
+words, inside the 150-200 band); `looks_contaminated()` passed; the front
+matter was clean; the metadata strip found no echoed heading. Every gate the
+pipeline had said yes. The reader saw a model that had looped.
+
+The fix is in `text_utils.py`, shared by the generators that need it:
+
+- `find_repeated_sentences()` reports every sentence that appears more than
+  once, with the count.
+- `collapse_repeated_sentences()` removes the later copies, but only when the
+  drop is safe: the sentence stands alone, and the drop does not change the
+  number of double quotes.
+
+**The exact-match version was not enough.** The first copy carries a
+discourse marker the other two do not ("Now, synthetic data is not poison."
+vs "Synthetic data is not poison."), so an exact match saw two repeats
+instead of three and the collapse would have left a visible double behind.
+`_same_sentence()` therefore also treats a key that *ends with* another key
+as the same sentence — but only when the extra prefix is at most three
+words, or two genuinely different sentences that share a tail would be
+mistaken for one.
+
+**A repeated sentence is not always a defect, and the guard has to know
+the difference.** The weekly roundup's "Sol's Take" names each story by its
+actual title, and those titles are also printed as the headline list above
+the commentary. That repetition is deliberate — the prompt requires it — so
+the roundup uses `consecutive_only=True`, which only fires on a sentence
+that *immediately* follows an identical one. Nobody writes the same
+sentence twice in a row on purpose, so that mode has no false positives.
+The quote-balance guard is the second line of defence: removing a sentence
+that carries an opening quotation mark would leave a dangling `"` behind,
+so it is refused.
+
+`sols-take.py` treats a repeat as a reason to **regenerate** (the prompt
+now says "NEVER write the same sentence twice"), and if the second attempt
+still repeats, it **collapses** rather than refusing to publish — a missing
+post is worse than a post with one line taken out. The collapse is refused
+only if it would push the body under the 150-word floor.
+
+Test: `scripts/content-pipeline/test_repeated_sentences.py` (15 checks) pins
+the detection, the collapse, the word-budget floor, the deliberate-quote
+case, and that `sols-take.py` uses the shared helpers rather than its own
+copy.
+
+## Sol's Take had no launchd fallback — three days went missing (2026-11-16)
+
+`ai.sol.sols-take` **did not exist**. Every other series in the pipeline has
+a launchd agent (`ai.sol.daily-content`, `ai.sol.weekly-roundup`,
+`ai.sol.midweek-news`, `ai.sol.quick-hits`, `ai.sol.seo-health`), but the
+Sol's Take series ran **only** from the Mavis cron task — and the Mavis
+cron is the unreliable half. It needs the MiniMax Code app to be awake,
+and it skips silently when it is not.
+
+The result: **Nov 13, 14 and 15 had no posts.** The cron log's last entry
+before today was Nov 12. The same failure as Nov 1-3 and Nov 8-9 (see
+above), now for a fourth time.
+
+`ai.sol.sols-take.plist` now exists: daily at **08:00 local**, an hour
+before the 09:00 cron, which is the ordering every other series uses — the
+launchd run publishes, and the cron session that fires later finds the post
+already there and skips. Two schedulers firing at once is safe:
+`sols-take.py` has a run lock (`/tmp/sol-sols-take.lock`) and an
+idempotency check that skips a day whose post already exists.
+
+**Note that `sols-take.py`'s own comment claimed the series was "driven by
+BOTH a Mavis cron task and a launchd agent".** It was not — the launchd
+agent was missing and the comment described the intended design, not the
+actual one. A comment is not evidence of a scheduler; check
+`launchctl list` and `~/Library/LaunchAgents/`.
+
+The three missed days were backfilled with `sols-take.py --date YYYY-MM-DD`.

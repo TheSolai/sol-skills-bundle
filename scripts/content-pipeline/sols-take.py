@@ -30,6 +30,8 @@ from text_utils import (
     ends_cleanly as _ends_cleanly,
     split_sentences as _split_sentences,
     trim_to_words as _trim_to_words,
+    find_repeated_sentences as _find_repeated_sentences,
+    collapse_repeated_sentences as _collapse_repeated_sentences,
 )
 
 # The word budget, enforced in code.
@@ -435,6 +437,7 @@ Rules:
 - End with one sharp sentence.
 - No bullet points.
 - No hedging ("it depends", "there are nuances"). Take the damn position.
+- Never write the same sentence twice. If a sentence repeats, the piece is rejected.
 - Conversational tone, like you're explaining to a smart friend over coffee.
 
 Topic: {topic_prompt}
@@ -484,10 +487,26 @@ Author: Sol
 
         trimmed, status = enforce_word_budget(body)
 
-        if status == "ok":
+        # A model that repeats a sentence has looped. It is not a style
+        # choice — no one writes the same sentence three times in a row —
+        # and nothing else in the pipeline catches it: the word budget was
+        # satisfied BY the repeats, the body carried no contamination, and
+        # the front matter was clean. The 2026-11-16 post shipped with
+        # "Synthetic data is not poison." three times in a row because of it.
+        repeats = _find_repeated_sentences(trimmed)
+
+        if not repeats and status == "ok":
             return trimmed
 
-        if status == "short":
+        if repeats:
+            detail = "; ".join(
+                f"{r['count']}x {r['sentence'][:48]}" for r in repeats[:3]
+            )
+            print(
+                f"[sols-take] Draft repeats a sentence ({detail}) — "
+                + ("regenerating" if attempt == 1 else "collapsing")
+            )
+        elif status == "short":
             print(
                 f"[sols-take] Draft is only {len(trimmed.split())} words "
                 f"(floor {MIN_WORDS}) — regenerating"
@@ -499,6 +518,25 @@ Author: Sol
                 f"trimming (ceiling {MAX_WORDS}) — regenerating"
                 + ("" if attempt == 1 else " (final attempt)")
             )
+
+        if attempt == 2 and repeats:
+            # The regeneration did not fix it. A repeated sentence is a
+            # cosmetic defect, and it can be removed mechanically — refusing
+            # to publish would leave the day with NO post at all, which is
+            # worse than a post with one line taken out. The collapse keeps
+            # the FIRST copy, so the argument still reads.
+            collapsed, removed = _collapse_repeated_sentences(trimmed)
+            if removed and len(collapsed.split()) >= MIN_WORDS:
+                print(
+                    f"[sols-take] Collapsed {removed} repeated sentence(s) — "
+                    f"{len(collapsed.split())} words"
+                )
+                return collapsed
+            if removed:
+                print(
+                    "[sols-take] Collapsing would break the word floor — "
+                    "refusing to publish"
+                )
 
         # Regenerate with the length stated as a hard requirement, so the
         # model has something concrete to aim at the second time.
@@ -518,6 +556,9 @@ Author: Sol
             f"- No bullet points.\n"
             f"- No hedging (\"it depends\", \"there are nuances\"). Take the "
             f"damn position.\n"
+            f"- NEVER write the same sentence twice. A repeated sentence is "
+            "the most common way this piece gets rejected — read it back "
+            "before you send it.\n"
             f"- Conversational tone, like you're explaining to a smart friend "
             f"over coffee.\n\n"
             f"Topic: {topic_prompt}\n\n"

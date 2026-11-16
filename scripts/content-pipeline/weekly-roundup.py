@@ -48,6 +48,7 @@ from text_utils import (
     ends_cleanly as _ends_cleanly,
     split_sentences as _split_sentences,
     trim_to_words as _trim_to_words,
+    collapse_repeated_sentences as _collapse_repeated_sentences,
 )
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
@@ -309,6 +310,17 @@ def generate_sol_take(stories):
     trimmed = _trim_to_words(text, limit=200)
     if trimmed != text:
         print(f"[take] Trimmed commentary {len(text.split())} -> {len(trimmed.split())} words")
+
+    # A model that repeats a sentence has looped, and the loop is visible to
+    # the reader. Only CONSECUTIVE repeats are collapsed here: this section
+    # deliberately quotes each story by its title, and those titles are also
+    # printed as the headline list above — so a repeated sentence is normally
+    # a quote, not a defect. A sentence immediately repeated is never
+    # deliberate.
+    collapsed, removed = _collapse_repeated_sentences(trimmed, consecutive_only=True)
+    if removed:
+        print(f"[take] Collapsed {removed} repeated sentence(s) from the commentary")
+        trimmed = collapsed
 
     # Whatever happened above, never publish text that stops mid-sentence
     # (the model can also be cut off by max_tokens).

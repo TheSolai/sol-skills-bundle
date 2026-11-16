@@ -20,6 +20,225 @@ were made public (`split_sentences`, `ends_cleanly`, `trim_to_words`).
 import re
 
 
+# ── Repeated-sentence detection ────────────────────────────────────────────
+#
+# WHY (2026-11-16)
+# ---------------
+# The 2026-11-16 Sol's Take shipped with the sentence "Synthetic data is not
+# poison." three times in a row. Nothing caught it. The word budget was
+# satisfied (196 words, inside the band), the post carried no contamination,
+# the front matter was clean — and the reader saw a model that had looped.
+#
+# The fix has to be careful, because repeating a sentence is not always a
+# defect. The weekly roundup's "Sol's Take" names each story by its actual
+# title, and those titles are also printed as the headline list above them.
+# That is deliberate quoting, and a naive duplicate detector flags it as a
+# defect that it is not.
+#
+# So the two ideas are kept apart:
+#
+#   * `find_repeated_sentences()` reports every sentence that appears more
+#     than once. It is a signal, not a verdict — too blunt to be a hard gate
+#     on its own.
+#   * `collapse_repeated_sentences()` removes a later copy, but only when it
+#     is safe to do so: the sentence stands alone, the paragraph keeps at
+#     least one sentence, and removing it does not unbalance a quotation.
+#
+# `consecutive_only=True` narrows both to the unambiguous case — a sentence
+# immediately following an identical one. No one writes the same sentence
+# twice in a row on purpose, so it has no false positives.
+
+# A sentence counts as "the same" when its words and digits match, whatever
+# the capitalisation, the quoting or the terminal punctuation. The match is
+# deliberately loose: the defect being caught is a model repeating itself
+# verbatim, and a loose match still catches that without needing to
+# understand the prose.
+def _sentence_key(sentence):
+    return re.sub(r"[^a-z0-9]+", " ", sentence.lower()).strip()
+
+
+# A model that loops does not always repeat a sentence byte for byte. The
+# 2026-11-16 post read:
+#
+#     Now, synthetic data is not poison. Synthetic data is not poison.
+#     Synthetic data is not poison.
+#
+# The first copy carries a discourse marker the other two do not, so an exact
+# match saw two repeats instead of three. A short prefix in front of an
+# otherwise identical sentence is the same sentence to a reader, so it counts
+# as one — but only when the prefix is short, or two genuinely different
+# sentences that happen to share a tail would be mistaken for one.
+MAX_PREFIX_WORDS = 3
+
+
+def _same_sentence(key_a, key_b):
+    """True when two sentence keys describe the same sentence.
+
+    Equal keys are the same sentence. So is a key that ends with the other
+    and carries only a short prefix in front — that is the re-prefixed
+    repeat described above.
+    """
+    if key_a == key_b:
+        return True
+    a = key_a.split()
+    b = key_b.split()
+    if not a or not b:
+        return False
+    longer, shorter = (a, b) if len(a) > len(b) else (b, a)
+    if len(longer) - len(shorter) > MAX_PREFIX_WORDS:
+        return False
+    return longer[-len(shorter):] == shorter
+
+
+# Short sentences ("It is not.", "Right.") repeat in real prose without
+# being a defect, so a repeat only counts when the sentence carries enough
+# words to be a statement rather than an interjection.
+MIN_REPEAT_WORDS = 4
+
+
+def _quote_signature(text):
+    """The count of each DOUBLE-quote character in the text.
+
+    Only double quotes are counted. A straight or curly apostrophe is
+    usually part of a contraction ("Alpha's", "it's"), so its count says
+    nothing about balance — but an unmatched double quote is a visible hole
+    in the prose.
+    """
+    return (
+        text.count('"'),
+        text.count("“"),
+        text.count("”"),
+    )
+
+
+def _iter_sentences(text):
+    """Yield (paragraph_text, sentences) for each paragraph in the body."""
+    for para in [p.strip() for p in text.split("\n\n") if p.strip()]:
+        yield para, split_sentences(para)
+
+
+def find_repeated_sentences(text, min_words=MIN_REPEAT_WORDS, consecutive_only=False):
+    """Report the sentences that appear more than once in `text`.
+
+    Returns a list of dicts, in document order: `{"sentence": str,
+    "count": int}`. The sentence text is the FIRST occurrence, verbatim.
+
+    With `consecutive_only`, only a sentence that immediately follows an
+    identical one counts, and `count` is the size of the run (a sentence
+    repeated three times in a row reports a count of 3).
+    """
+    results = []
+    seen = []
+    previous = None
+
+    for _, sentences in _iter_sentences(text):
+        for sentence in sentences:
+            key = _sentence_key(sentence)
+            if len(sentence.split()) < min_words or not key:
+                previous = None
+                continue
+
+            match = None
+            if consecutive_only:
+                # Only the sentence immediately before can match.
+                if previous is not None and _same_sentence(key, previous["key"]):
+                    match = previous
+            else:
+                for entry in seen:
+                    if _same_sentence(key, entry["key"]):
+                        match = entry
+                        break
+
+            if match is None:
+                entry = {"key": key, "sentence": sentence, "count": 1}
+                seen.append(entry)
+                results.append(entry)
+                previous = entry
+            else:
+                match["count"] += 1
+                previous = match
+
+    return [entry for entry in results if entry["count"] > 1]
+
+
+def collapse_repeated_sentences(text, min_words=MIN_REPEAT_WORDS, consecutive_only=False):
+    """Remove later copies of a sentence that already appears earlier.
+
+    Returns `(body, removed)` where `removed` is the number of sentences
+    dropped. The body is returned BYTE-IDENTICAL when nothing was removed,
+    so calling this on a clean body is a genuine no-op.
+
+    A sentence is only dropped when the drop is safe:
+
+      * it stands alone as a whole sentence — never a fragment of one;
+      * the drop does not change the number of double quotes, so it cannot
+        leave a dangling quotation mark behind.
+
+    A paragraph whose every sentence was a repeat is dropped whole: its
+    content is already elsewhere in the body, so removing it loses nothing.
+
+    That quote guard is what keeps the weekly roundup's deliberate quoting
+    intact: the story title appears both as a headline and inside the
+    commentary, and the commentary's copy carries the opening quotation
+    mark, so it is left alone.
+    """
+    if not text:
+        return text, 0
+
+    seen = []
+    previous = None
+    removed = 0
+    paragraphs = []
+
+    for para, sentences in _iter_sentences(text):
+        kept = []
+        dropped_here = 0
+        for sentence in sentences:
+            key = _sentence_key(sentence)
+            too_short = len(sentence.split()) < min_words or not key
+
+            if too_short:
+                is_repeat = False
+            elif consecutive_only:
+                is_repeat = previous is not None and _same_sentence(key, previous["key"])
+            else:
+                is_repeat = any(_same_sentence(key, entry["key"]) for entry in seen)
+
+            if is_repeat:
+                with_sentence = " ".join(kept + [sentence])
+                without_sentence = " ".join(kept)
+                if _quote_signature(with_sentence) == _quote_signature(without_sentence):
+                    removed += 1
+                    dropped_here += 1
+                    previous = {"key": key, "sentence": sentence}
+                    continue
+
+            kept.append(sentence)
+            if not too_short:
+                entry = {"key": key, "sentence": sentence}
+                seen.append(entry)
+                previous = entry
+            else:
+                previous = None
+
+        if not kept:
+            # Every sentence in this paragraph was a repeat of a sentence
+            # that is still in the body, so the paragraph is dropped whole.
+            continue
+        if dropped_here:
+            paragraphs.append(" ".join(kept))
+        else:
+            # Nothing was removed from this paragraph, so keep it exactly as
+            # it was. A paragraph can carry its own internal line breaks
+            # (a list, a heading) and rebuilding it from split sentences
+            # would flatten them.
+            paragraphs.append(para)
+
+    if not removed:
+        return text, 0
+    return "\n\n".join(paragraphs).strip(), removed
+
+
 # Titles and abbreviations that end in a period but do not end a sentence.
 _ABBREV_TAIL = re.compile(
     r"(?:\bDr|\bMr|\bMrs|\bMs|\bProf|\bInc|\bLtd|\bCo|\bCorp|\bJr|\bSr|"

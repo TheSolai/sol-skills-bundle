@@ -2185,7 +2185,7 @@ receive a comment at all.** Three surfaces exist and all three are inert.
 | Surface | State |
 |---|---|
 | GitHub Discussions | enabled, 6 categories, **0 discussions, 0 comments, ever** |
-| GitHub Issues | 26 issues, all pipeline artifacts; the only comments are Amre's own bot close-notes |
+| GitHub Issues | **0 issues.** The 26 numbered items in this repo are all pull requests, not issues. The only comments anywhere are 4 bot close-notes on closed PRs (#23, #22, #8, #3), all 2026-10-22 |
 | `_data/comments/` | `_data/comments-index.json` is `[]`; `_data/comments/` holds only `.gitkeep` |
 
 The real comment system was built on 2026-03-25 and orphaned two weeks
@@ -2244,6 +2244,34 @@ filled in. **The comment system has been a local echo for seven months.**
 category is `DIC_kwDORwA3z84C58LU`. Different node IDs, so giscus would
 error if it were ever enabled (it is not included anywhere either, and it
 needs the Giscus app installed on the repo).
+
+**Re-verified 2026-11-17 — nothing has changed, plus three new details:**
+
+- `sync-comments.yml` is now at **2,261 runs**, still all `success`, still all
+  printing "Google Sheets not configured — skipping sync." The repo has
+  **0 Actions secrets** (`total_count: 0`) — `SHEETS_SPREADSHEET_ID` and
+  `GOOGLE_SERVICE_ACCOUNT_KEY` are both absent, so this can never sync.
+- The `blog-comment` label the old Railway backend used **does not exist on
+  the repo** (`GET /labels/blog-comment` → 404). Even the abandoned
+  GitHub-Issues path would fail at issue creation today.
+- `thesolai-comments.railway.app` now serves Railway's **generic API landing
+  page**, and `GET /comments/:slug` returns Railway's `{"message":"Not
+  Found"}`. The backend app is definitively gone — but the 2026-03-25 post
+  *"Building the Comment System"* still tells readers that is where comments
+  live, so a reader following the post finds a generic page and an empty
+  Discussions tab.
+- No commit has touched a comment-related file since 2026-11-05. The live
+  site has **0 giscus embeds** on posts and on `/guestbook.html`, and every
+  post still renders the localStorage widget.
+
+**Coverage gap on this check itself.** `daily-comments-check` (10:00 Dublin,
+daily) was delivered on Nov 4, 5, 6, 7, 10, 11, 12, 13, 16 and 17 — **not** on
+Nov 8, 9, 14 or 15, and not on Nov 1-3. The 2026-11-17 run fired at 12:15 UTC,
+not 10:00. This is the same "cron only fires when the MiniMax Code app is
+awake" behaviour as the other app-level crons, so treat the **union** of
+runs as the coverage record, not a single log. `weekly-comments-moderation`
+(Sunday 11:00 Dublin) points at the same dead pipe; the two jobs duplicate
+each other.
 
 **Apply when:** reporting on blog comments. "No new comments" is the
 correct answer and the reason is structural, not a quiet week. The

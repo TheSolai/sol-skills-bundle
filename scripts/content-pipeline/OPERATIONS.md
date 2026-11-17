@@ -480,6 +480,31 @@ Two things decide *which* posts get posted, and both were bugs first:
   after run, with only a cheerful "will retry next run". A collision is now
   retried once with the publication date appended, e.g. `… (12 Oct 2026)`.
 
+### The poster's queue is a startup snapshot (confirmed 2026-11-17)
+
+`get_recent_posts()` runs once, before the first post goes out, and the run
+works through the list it returned. A post written into `_posts/` *after* that
+point is not in the run's queue at all. On 2026-11-17 the auto-poster started
+at 12:18 and the content pipeline wrote "Vibes Is a Testing Strategy" at
+12:24; the poster finished at 12:29 having never seen it, and
+`devto-viral.py` published it 71 seconds later (dev.to id 5057098). Nothing
+was lost.
+
+Two consequences. A short run is not necessarily a broken one — check the
+tracker before drawing a conclusion. And **do not re-run the poster to pick
+up the remainder**: the other publisher may have taken it in the meantime,
+and a second run publishes the same content twice. The tracker is the source
+of truth for what is already on dev.to, not the post count in the log.
+
+### The tracker's `id` field is not type-stable
+
+One entry (`2026-10-24-uk-ai-weekly-dessa-…`) stores `id` as the string
+`'4909031'`; every other entry stores an int. Comparing a live dev.to id
+against the tracker with `==` on ints silently reports that article as
+untracked — which reads as a missing post but is not one. Compare with
+`str(id)`. Two other entries carry `posted_at: null` and four carry no `id`
+at all, all from the 2026-10-24 era.
+
 ## `devto-viral.py` had four silent defects (fixed 2026-10-29)
 
 The daily viral engine ran for weeks reporting success while doing almost
@@ -519,6 +544,48 @@ The general lesson: **a count in the log is not proof the work happened.**
 "Trending: 20 new" was printed by a run that wrote nothing, and "5 new ad
 opportunities" was printed by a run that linked the same article five times.
 Read the file the run wrote.
+
+## `devto-viral.py` lost its whole cross-post slot to a deploy race (fixed 2026-11-17)
+
+On 2026-11-17 the viral engine started at 12:18:40 and **published nothing**,
+while exiting 0 and printing "Done." Every one of its five candidates was
+skipped with `Skipped (canonical not live)`.
+
+The cause was a race, not a fault. The site's deploy workflow ran
+**12:18:24 → 12:21:35 (3m11s)** for that push, and the engine checked each
+canonical at ~12:19:00 — about **2.5 minutes before the deploy finished**. A
+canonical that 404s during a deploy is not a dead post; it is a post that has
+not been published *yet*. The engine treated the first answer as final and
+spent the entire day's slot on skips.
+
+This is only possible when the content pipeline and the viral engine run close
+together. Normally the site is deployed by 09:17 and the 10:00 cron is safe.
+On 2026-11-17 the MiniMax Code app was not awake in the morning, so every
+app-driven job fired together on wake: the content generators pushed at
+12:15–12:24, `devto-poster.py` started at 12:18:50, and the viral engine at
+12:18:40. The two posting paths then competed for the same posts — the
+poster won the canonicals, and the viral engine got whatever was left.
+
+`cross_post()` now **waits for the deploy instead of skipping**:
+
+- If the newest candidate is dated today or yesterday and its canonical is not
+  live, the engine polls for up to `DEPLOY_WAIT_SECONDS` (6 minutes) at
+  `DEPLOY_POLL_SECONDS` (20s) intervals before deciding to skip. Six minutes is
+  more than twice the measured 3m11s deploy.
+- The wait happens **before** the first LLM call and before the per-post skip,
+  so a deploy race costs wall-clock time, not an LLM call or a publishing slot.
+- The wait is bounded and only applies to fresh posts. An old post that was
+  never deployed is a different problem and must not stall the run.
+
+`devto-poster.py` does **not** check canonical liveness at all, which is why it
+published successfully at 12:19:54 — 90 seconds after the push — with a
+canonical that was not live yet. That is the mirror image of the defect above:
+the poster risks a dead canonical, the viral engine risks no post at all.
+
+Regression tests: `test_devto_viral_posting.py`, class
+`TestDeployRaceDoesNotWipeTheSlot` (7 tests). They assert that a canonical
+that 404s then goes live is published rather than skipped, that the wait is
+bounded, and that the wait is ordered before both the skip and the LLM call.
 
 ## Posts published with `sol-blog.py` skip the OG image generator
 
@@ -2360,3 +2427,179 @@ cancelled run: it carries no content the successful one lacks.
 deployed, because the winning run builds the repository HEAD rather than
 only its own commit. `git merge-base --is-ancestor <post-sha> origin/main`
 confirms a post's commit is in the deployed tree.
+
+## The audit could not tell "broken" from "not published yet" (2026-11-17)
+
+The daily SEO audit reported **7 issues** on 2026-11-17. **All 7 were false
+alarms**, and all 7 came from the same defect: the audit could not tell a
+post that is broken from a post that has not been published yet.
+
+| Reported | Reality |
+|---|---|
+| 6 × "missing og/<post>.png" | The posts were written seconds earlier by the daily pipeline. The OG PNG is rendered *after* the Markdown, so the audit was reading the site mid-publish. All 8 PNGs existed within a minute. |
+| 1 × "<post> is not live (HTTP 404)" | The post was written at 01:02 and not pushed to `origin/main` until 12:16. It genuinely was not live — the pipeline had not shipped it. |
+
+The deploy check had a 15-minute grace window for recently-written files,
+but the OG check had **none**, and an mtime window cannot help a post that is
+hours old and still unpublished.
+
+**The fix: ask git what is actually published.** `seo-health.py` now reads the
+file list of `origin/main` once per run (`git ls-tree -r --name-only`, after a
+`git fetch origin main` so the ref is not stale) and skips any post that is
+not in it:
+
+- a post **not on `origin/main`** is in flight — its OG image has not been
+  rendered and its permalink is not live yet;
+- a post **on `origin/main` with no PNG** is a genuine defect — its social
+  card really would 404 — and is still reported.
+
+The same rule applies to the deploy check: only a post that IS on
+`origin/main` and still 404s proves the deploy broke. A post that was never
+pushed is a pipeline problem, and the pipeline logs it itself.
+
+**Deliberately conservative.** If git's state cannot be read,
+`published_to_origin()` returns True, so the audit gets **stricter** (it
+checks the URL) rather than quietly skipping posts. A broken repo must never
+make the audit quieter.
+
+One `git ls-tree` replaced a per-post `git cat-file`, which matters: the
+site has ~1,400 posts and a subprocess per post would take minutes. The
+audit still runs in ~11 seconds.
+
+**Test:** `scripts/content-pipeline/test_seo_inflight_posts.py` (10 checks)
+pins both directions — an in-flight post is skipped, a published post with no
+OG image is still reported, and a published post that 404s is still reported.
+Verified against the pre-fix script: the original reports 1 issue for the
+in-flight case, the fixed one reports 0.
+
+**Also note:** the Mac was asleep for most of that morning. `kern.boottime`
+reads 12:13:48 and `uptime` says "up 12 mins", yet processes started at
+01:02:50 are still running with 11h39m elapsed — the machine hibernated
+(`hibernatemode 3`) and the wall clock moved on resume. The corroborating
+evidence: `site-cron-watchdog` runs every 10 minutes and logged **nothing**
+between 01:03 and 12:15, and the jobs scheduled for 07:00, 08:00 and 09:00
+(`quick-hits`, `sols-take`, `skills-update`, `trending-topics`) all fired in
+one burst at 12:14–12:15.
+
+`ai.sol.quick-take` has `RunAtLoad: true`, so it ran at **01:02** — the boot
+that woke the machine — instead of its scheduled 12:30. It wrote the post at
+01:02:59 and its `publish()` did not return until **12:16:28**, having been
+frozen across the sleep. The commit was actually created at 12:15:33 and
+pushed at 12:16:28. Its stderr (`quick-take.err`) records the git contention
+of that wake burst: a push rejected with `! [rejected] main -> main (fetch
+first)` and `fatal: Unable to create '.git/index.lock': File exists`.
+
+The upshot: for 11 hours the post existed on disk but had never reached
+`origin/main` — exactly the state the audit used to report as a broken site.
+Readers saw it at roughly the intended time, because the deploy landed at
+~12:18.
+
+## A reboot at 12:13 makes `ps` report 11 hours of false uptime (2026-11-17)
+
+On 2026-11-17 the Mac rebooted at 12:13:48 (`kern.boottime`). The
+`ai.sol.daily-content` agent has `RunAtLoad: true`, so it fired a catch-up
+run immediately and wrote the day's three regional posts at 12:15:24 — before
+the 08:00 cron slot ever arrived.
+
+Looking for that run afterwards, `ps` says the process started at **01:03** and
+has been alive for **11h12m**:
+
+```
+  PID STARTED                      ELAPSED COMMAND
+ 1247 Tue Nov 17 01:03:01 2026     11:12:48 .../run-daily.py
+```
+
+That is false, and it reads exactly like a hung job. The machine had been up
+**4 minutes**. The reason is that the boot happened with the clock in a
+**different, pre-correction state**: every process in the boot batch carries
+the same stale stamp (`01:02:27` for the ~60 system daemons, `01:03:01` for
+the launchd jobs), while anything started after the clock settled carries the
+correct time (`12:15:05`, `12:15:27`). `ps` derives elapsed time from the
+wall-clock stamp, so a forward clock correction inflates the elapsed time of
+every process that was already running.
+
+The decisive check is `uptime` (monotonic, immune to clock changes) against
+`ps`:
+
+```
+$ uptime
+12:41  up 27 mins, 1 user, load averages: 4.67 6.87 17.71
+```
+
+**Rule: never diagnose a suspected hang from `ps` elapsed time alone on this
+Mac.** `kern.boottime` and `uptime` are the trustworthy clocks; `ps` lstart
+is not. A process showing hours of elapsed time on a machine that booted
+minutes ago is a clock artefact, not a stuck job.
+
+**And a process blocked in `time.sleep` is not necessarily stuck.** The
+sample of PID 1247 showed it parked in `time_sleep` inside a generator frame,
+with 0.9s of CPU across its whole life and no open sockets. It was the
+`publish_lock()` retry loop in `site_git.py:95` — a legitimate 2-second
+backoff while it waited for the site publish lock — not a deadlock. It
+finished normally.
+
+## A "No changes to commit" from the daily run does not mean the posts are unpublished (2026-11-17)
+
+The 2026-11-17 daily run wrote all three regional posts and then logged:
+
+```
+[git] No changes to commit
+```
+
+That reads like the day's content was lost. It was not. `site_git.py` stages
+with `git add -A`, which stages the **whole working tree**, so the regional
+posts were already swept into a *different* job's commit — `f7159587`
+"Quick Hits: Tuesday AI briefing" — which ran 12:17:08 and swept up all
+three `2026-11-17-*` regional files alongside its own post.
+
+So the ownership of a commit says nothing about which job wrote the content.
+Verify publication by looking at the **files in `origin/main`** and the live
+URLs, never by which commit message carries them.
+
+## `run-daily.py`'s own dev.to cross-post is dead code under launchd (2026-11-17)
+
+`run-daily.py` reads the dev.to key from the environment only:
+
+```python
+api_key = os.getenv("DEVTO_API_KEY", "")     # run-daily.py:1065
+```
+
+It never uses `devto_key.load_devto_key()`, the canonical resolver every
+other script in the pipeline uses (secret file first, env as override). The
+`ai.sol.daily-content` plist does not set `DEVTO_API_KEY`, and neither does
+`ai.sol.midweek-news`/`ai.sol.weekly-roundup` have it set for this agent —
+`launchctl getenv DEVTO_API_KEY` comes back empty. So `api_key` is always
+empty in the launchd environment, and the cross-post block at
+`run-daily.py:1157` is skipped every time. Today's run confirms it: three
+posts generated, **zero** `[dev.to]` lines in the log.
+
+This is harmless *today* because `devto-poster.py` (the 07:30 cron) picks
+up the regional posts from the site repo and posts them — it did, at
+12:18–12:29, all three with the correct canonical URL. But that is a
+**different job** rescuing a gap, and the gap is invisible in the daily log.
+
+**Do not "fix" this by having `run-daily.py` read the key from the secret
+file.** That would double-post: `run-daily.py` posts only the *first*
+generated post, while `devto-poster.py` posts all of them, and neither
+`run-daily.py`'s `post_to_devto()` nor its tracker write records the article
+in `logs/devto-posted.json`. Enabling it would create a duplicate dev.to
+article with no canonical URL and no tracker entry — the exact
+duplicate-article defect the shared tracker exists to prevent.
+
+The correct fix, if the gap is ever closed, is to make `run-daily.py` use the
+canonical resolver **and** record what it posts in the same tracker
+`devto-poster.py` writes to, so the two writers stay consistent.
+
+## `timeout` does not exist on macOS (2026-11-17)
+
+`timeout` is GNU coreutils. This Mac has neither `timeout` nor `gtimeout`,
+and coreutils is not installed:
+
+```
+/bin/bash: timeout: command not found      # exit 127
+```
+
+Guard a long-running command with a shell-level watchdog instead, or use
+`perl -e 'alarm shift; exec @ARGV' <secs> <cmd>`. Note that a `command not
+found` failure inside a `cmd >> log 2>&1` redirect still lands in the log —
+which is how this one surfaced there rather than in the terminal.

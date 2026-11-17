@@ -2252,3 +2252,83 @@ giscus: install the Giscus app on the repo, fix the category ID, and
 include `giscus-comments.html` in `post.html`. Finishing the Sheets
 system instead needs a deployed Apps Script, a Sheet, two repo secrets,
 and `commentsApi` set.
+
+## Quick Hits writes to two logs, and the cron's is the stale one (2026-11-17)
+
+`quick-hits.py` is driven by two schedulers, and they append to **different
+files**:
+
+| Scheduler | When | Log file |
+|---|---|---|
+| `ai.sol.quick-hits` (launchd, `RunAtLoad: true`) | 07:00 Mon-Fri | `scripts/content-pipeline/logs/sol-quick-hits-launchd.log` |
+| `sol-quick-hits` (Mavis cron, `0 8 * * 1-5`) | 08:00 Mon-Fri | `logs/sol-quick-hits.log` (repo root) |
+
+The launchd agent sets `WorkingDirectory` to `scripts/content-pipeline/` and
+points stdout/stderr at files in that directory; the cron task redirects to
+`logs/sol-quick-hits.log` relative to the repo root. Same script, same repo,
+two logs — the same shape as `run-daily.py`, documented above.
+
+**Read the launchd log for coverage.** On 2026-11-17 the cron log's last
+entry was Nov 13, while the launchd log had runs for Nov 16 and Nov 17.
+Reading the cron log alone says the series missed two days; it missed none.
+launchd is the half that guarantees coverage, because it does not need the
+MiniMax Code app to be awake.
+
+**The stderr file is not the stdout file.** A MiniMax HTTP 429 (`Token Plan
+usage limit reached`) lands in
+`scripts/content-pipeline/logs/sol-quick-hits-launchd.err` and does **not**
+appear in the stdout log, which shows the fallback instead (`[llm] MiniMax
+returned nothing — using template fallback`). The stderr file is the only
+place the raw provider error is recorded.
+
+**Three outcomes for a given day, and which line means which:**
+
+| Line | Meaning |
+|---|---|
+| `Post written: ...` + `Committed and pushed to origin/main (<sha>)` | published |
+| `Already published: ... — skipping` | the other scheduler got there first |
+| `No stories fetched — skipping.` | the run fired with **no network** |
+
+**"Failed to generate content: None" is not a second, separate failure.** It
+is the same no-network outcome printed twice. `build_quick_hits()` returns
+`None` when both source lists are empty (`quick-hits.py:411`); the caller
+then prints the `None` it got back (`quick-hits.py:564`). The `None` is the
+return value, not an error payload — do not read it as "the model returned
+an error object".
+
+**A third failure mode exists besides "the app was asleep": the run fires
+with no network at all.** On 2026-11-17 the 07:00 launchd run failed with
+`[hn] Failed to fetch HN stories: <urlopen error [Errno 8] nodename nor
+servname provided, or not known>` and the same for dev.to — the Mac had been
+asleep and DNS was not up. The post was still published that day, because
+`RunAtLoad: true` fired a catch-up run at 12:15 once the machine was awake.
+This is why Quick Hits is the one series that keeps `RunAtLoad: true`: its
+slug and title come from the day the run happens, so a catch-up publishes
+today's briefing rather than a mis-dated copy of an earlier day.
+
+## A "cancelled" deploy run in the Pages list is not a failure (2026-11-17)
+
+A burst of pushes in one morning produces a burst of `Build and Deploy` runs.
+The workflow uses `concurrency: group: pages` with `cancel-in-progress:
+false`, so GitHub keeps at most one *pending* run per group and the queued run
+is always the newest commit. The runs that lose that race are recorded as
+**cancelled** — and a cancelled run has **zero jobs** (`jobs: []`), because
+it was superseded before a runner was ever assigned.
+
+Verified 2026-11-17 after a burst of seven posts:
+
+| Run | Conclusion | Jobs |
+|---|---|---|
+| 44081677458 Skills rotation | cancelled | none |
+| 44081698099 Sol's Take | cancelled | none |
+| 44081727447 Quick Hits | **success** | validate, build |
+| 44081893520 Workspace backup | **success** | validate, build |
+
+So `gh run list` showing several `cancelled` rows does not mean anything
+failed. Check the *newest* run and check the live URL. Do not re-run a
+cancelled run: it carries no content the successful one lacks.
+
+**Also:** with `cancel-in-progress: false`, a cancelled run's commit is still
+deployed, because the winning run builds the repository HEAD rather than
+only its own commit. `git merge-base --is-ancestor <post-sha> origin/main`
+confirms a post's commit is in the deployed tree.

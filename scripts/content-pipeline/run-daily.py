@@ -19,7 +19,7 @@ import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from _minimax_helper import minimax_generate, load_minimax_key
 from ai_filter import is_ai_title
-from post_identity import body_signature, published_signatures
+from post_identity import body_signature, published_signatures, claim_stories
 from text_utils import trim_to_word_budget
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
@@ -128,6 +128,61 @@ def pick_regional_story(stories, region_hint=None):
     # Prefer stories with decent engagement
     ai_stories.sort(key=lambda s: s["score"] + s["comments"] * 0.5, reverse=True)
     return ai_stories[0] if ai_stories else None
+
+
+def _same_day_regional_posts():
+    """The regional post files written TODAY, if any.
+
+    These are excluded from the archive scan when claiming a story: uk, eu
+    and us deliberately cover the same story, so the first region to write
+    must not lock the story out of the other two.
+    """
+    posts_dir = SITE_DIR / "_posts"
+    out = []
+    for path in posts_dir.glob(f"{DATE_STR}-*.md"):
+        if re.match(r"^\d{4}-\d{2}-\d{2}-(uk|eu|us)-", path.name):
+            out.append(path)
+    return out
+
+
+def claim_regional_story(stories):
+    """Choose ONE story for the whole regional day and claim it.
+
+    WHY (2026-11-18): the regional series published the top Hacker News AI
+    story three times a day — once per region, three different angles. That
+    part is deliberate. What was not deliberate is that the series never
+    checked whether the story was already published: on 2026-11-18 it
+    republished "GPT-6.2 Astra and Sol", which the midweek digest had
+    published earlier that morning and the Quick Hits briefing was covering
+    at the same time. Five posts, one story, on a site that publishes
+    around eight.
+
+    The claim is what stops it. The trio's own posts are excluded from the
+    archive scan so uk, eu and us can still share a story; every other post
+    counts, including the digest's.
+
+    If every candidate is already covered, the top story is used anyway and
+    the repetition is logged — a repeated story is better than a dead
+    series.
+    """
+    ranked = sorted(stories, key=lambda s: s["score"] + s["comments"] * 0.5, reverse=True)
+    if not ranked:
+        return None
+
+    claimed = claim_stories(
+        "regional",
+        ranked,
+        1,
+        SITE_DIR / "_posts",
+        day=DATE_STR,
+        exclude_paths=_same_day_regional_posts(),
+    )
+    if claimed:
+        print(f"[claims] regional claimed: {claimed[0]['title'][:70]}")
+        return claimed[0]
+
+    print("[claims] ⚠️  Every AI story is already covered — repeating the top story")
+    return pick_regional_story(stories)
 
 
 # ── Source grounding ───────────────────────────────────────────────────────
@@ -1145,23 +1200,24 @@ def run_pipeline():
     regions = ["uk", "eu", "us"]
     generated_posts = []
 
+    # Work out which regions still need a post BEFORE choosing a story.
+    #
+    # WHY (2026-11-18): the story is claimed once for the whole day, and a
+    # claim nobody publishes is a story the other series cannot use for the
+    # rest of the day. So the claim only happens if there is still a post
+    # to write.
+    #
+    # Idempotency: the day's post for a region is the unit of publication,
+    # not the story. Checked BEFORE the expensive LLM call.
+    #
+    # WHY (2026-11-06): the old check matched date + region + source URL,
+    # so it only caught a re-run that picked the SAME story. This series is
+    # driven by BOTH the 07:00 launchd agent and an 08:00 cron task; when
+    # HN's top AI story changed between the two runs, the second run saw an
+    # unknown URL and published a SECOND set of three regional posts for the
+    # same day. Matching on date + region closes that gap.
+    pending = []
     for region in regions:
-        story = pick_regional_story(ai_stories)
-        if not story:
-            print(f"[{region}] No story available, skipping")
-            continue
-
-        # Idempotency: the day's post for a region is the unit of
-        # publication, not the story. Checked BEFORE the expensive LLM
-        # call.
-        #
-        # WHY (2026-11-06): the old check matched date + region + source
-        # URL, so it only caught a re-run that picked the SAME story. This
-        # series is driven by BOTH the 07:00 launchd agent and an 08:00
-        # cron task; when HN's top AI story changed between the two runs,
-        # the second run saw an unknown URL and published a SECOND set of
-        # three regional posts for the same day. Matching on date + region
-        # closes that gap.
         existing = find_post_for_region(region)
         stale = None
         if existing and not existing_post_is_degraded(existing):
@@ -1174,6 +1230,27 @@ def run_pipeline():
             # the duplicate this check exists to prevent.
             print(f"[{region}] ⚠️  Today's post is a template fallback — regenerating")
             stale = existing
+        pending.append((region, stale))
+
+    # ONE story for the whole day: uk, eu and us are three angles on it.
+    #
+    # WHY (2026-11-18): this series had no dedupe at all. It took the
+    # highest-scoring AI story from Hacker News and published it three
+    # times — by design, three angles — but it never checked whether the
+    # story was already published. On 2026-11-18 it republished "GPT-6.2
+    # Astra and Sol", which the midweek digest had published an hour
+    # earlier, and the Quick Hits briefing was covering as well: five
+    # posts on one story.
+    #
+    # The trio's own posts are excluded from the archive scan, so uk, eu
+    # and us can still share a story. Every OTHER post counts — including
+    # the digest's, published minutes earlier.
+    story = claim_regional_story(ai_stories) if pending else None
+
+    for region, stale in pending:
+        if not story:
+            print(f"[{region}] No story available, skipping")
+            continue
 
         content = generate_post(region, story)
         filepath, frontmatter = build_jekyll_post(region, content, story)

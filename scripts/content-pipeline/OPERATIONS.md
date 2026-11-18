@@ -12,16 +12,33 @@ they overlap. Check before assuming a script runs once.
 |---|---|---|
 | `ai.sol.weekly-roundup` | launchd, Mon 07:00 | `weekly-roundup.py` |
 | `sol-weekly-roundup` | cron `0 8 * * 1` | `weekly-roundup.py` |
-| `ai.sol.daily-content` | launchd, daily 07:00 | `run-daily.py` |
-| `sol-daily-content` | cron `0 8 * * *` | `run-daily.py` |
-| `sol-quick-hits` | cron `0 8 * * 1-5` | `quick-hits.py` |
-| `ai.sol.quick-hits` | launchd, Mon-Fri 07:00 | `quick-hits.py` |
+| `ai.sol.midweek-news` | launchd, Wed 07:00 | `midweek-news.py` |
+| `sol-midweek-news` | cron `0 8 * * 3` | `midweek-news.py` |
+| `ai.sol.quick-hits` | launchd, Mon-Fri 07:05 | `quick-hits.py` |
+| `sol-quick-hits` | cron `5 8 * * 1-5` | `quick-hits.py` |
+| `ai.sol.daily-content` | launchd, daily 07:10 | `run-daily.py` |
+| `sol-daily-content` | cron `10 8 * * *` | `run-daily.py` |
 | `sol-post-to-devto` | cron `30 7 * * *` | `devto-poster.py` |
 | `ai.sol.sols-take` | launchd, daily 08:00 | `sols-take.py` (added 2026-11-16) |
 | `sol-sols-take` | cron, daily 09:00 | `sols-take.py` |
 
-The 08:00 slot is crowded — five jobs start within the same minute, plus the
-launchd jobs at 07:00. Expect them to race on the site repo.
+**The 07:00 cluster is staggered on purpose (2026-11-18).** The digest,
+the Quick Hits briefing and the regional trio all fired at the same minute
+and all published "GPT-6.2 Astra and Sol" — five posts, one story. The
+order above is the priority order: digest (the curated 3-story package)
+first, then the briefing, then the regional trio. Each layer mirrors the
+other — every launchd job runs exactly an hour before its Mavis cron — so
+the priority is the same whether launchd or the cron task published.
+
+The stagger sets priority. It is not what prevents the double cover — the
+story-claim registry does that, and it works whatever order the jobs
+actually run in. See "Three series at 07:00 published the same story five
+times" below.
+
+The 08:00 cron slot is still crowded — the roundup, the skills rotation,
+the blooper queue, the daily-ai-news job and the digest all land there.
+Expect them to race on the site repo. The three content series that used
+to collide at 07:00 are now staggered (see the table above).
 
 **The cron column above is out of date (checked 2026-10-28).** The only cron
 entry left in the crontab is `sol-post-to-devto` (`30 7 * * *`). The
@@ -372,6 +389,90 @@ correct behaviour: a silent copy is worse than a gap.
 is the single definition of "this post needs a canonical", and
 `seo-repair-canonicals.py` applies exactly what the audit prescribes —
 the repair can never disagree with the check that reports it.
+
+## Three series at 07:00 published the same story five times (fixed 2026-11-18)
+
+The archive dedupe answers "has this story been published?" by reading the
+post files. It cannot answer two questions that the Wednesday morning
+schedule asks, and both gaps were live on 2026-11-18.
+
+**What happened.** The midweek digest (`ai.sol.midweek-news`), the weekday
+Quick Hits briefing (`ai.sol.quick-hits`) and the regional trio
+(`ai.sol.daily-content`, which writes uk/eu/us) all fired at **07:00**,
+all drew from the same Hacker News top-stories list, and all published
+**"GPT-6.2 Astra and Sol"** — five posts, one story, on a site that
+publishes around eight posts a day. The digest had deduped correctly: it
+ran first, and the archive did not yet contain the other two series'
+picks. It had nothing to dedupe against.
+
+Two things made it invisible rather than merely rare:
+
+- **The regional series had no dedupe at all.** It took the highest-scoring
+  AI story and published it three times — three angles, which is
+  deliberate — but it never checked whether the story was already
+  published. On 2026-08-07 and 2026-08-08 it republished an AMD story on
+  consecutive days.
+- **The Quick Hits briefing cited no source at all.** Its posts are prose
+  with no links, so `source_urls()` found nothing in them and the archive
+  could not see what they had covered. Nothing could.
+
+**The fix is a story-claim registry** in `post_identity.py`:
+
+| | |
+|---|---|
+| `claim_stories(series, candidates, count, ...)` | Claim the stories a generator is about to publish, under its own series name, and return the ones it may use. |
+| `read_claims(day)` | The claims registered for a day, for another generator to check. |
+| `release_claims(series, keep_urls, day)` | Give back claims that were reserved but not used. |
+
+A generator claims **before** it spends a minute generating, so a
+generator that asks a moment later sees the claim and picks something
+else. The registry lives in `scripts/content-pipeline/state/` as one JSON
+file per day, written with `os.replace()` under an exclusive `flock` —
+several generators write it concurrently, and a plain read-modify-write
+loses one generator's claims. A broken registry never blocks publishing:
+`claim_stories()` falls back to the candidates unfiltered.
+
+Three rules the registry has to respect, each of them a deliberate design
+decision rather than an oversight:
+
+1. **The regional trio still shares one story.** uk, eu and us are three
+   angles on the same story. The trio's own post files are excluded from
+   the archive scan (`published_source_urls_excluding_paths()`), or only
+   the first region to write would find an eligible story. The FILES are
+   excluded, not their URLs — subtracting the URLs would free a story that
+   the digest also covers.
+2. **A refresh may re-claim its own stories.** `midweek-news.py --refresh`
+   rewrites today's post in place; if its own claims blocked it, the
+   refresh would silently swap the stories underneath the post.
+3. **Quick Hits reserves its pool and releases what it did not use.** The
+   model picks three out of five candidates, so until it answers nobody
+   knows which three. It claims all five, then releases the two it left
+   out, so the day's remaining supply is not wasted.
+
+**The schedulers are staggered** so the order is deterministic and the
+digest keeps priority for the day's biggest story:
+
+| Series | launchd | Minute |
+|---|---|---|
+| `ai.sol.midweek-news` (digest) | Wednesday | 07:00 |
+| `ai.sol.quick-hits` | Mon–Fri | 07:05 |
+| `ai.sol.daily-content` (regional) | daily | 07:10 |
+
+Without the stagger the registry would still prevent a double cover, but
+which series got the top story would depend on which process reached its
+claim first. With it, the order is the one above. `launchd` fires missed
+slots together when the Mac wakes, so the registry — not the schedule — is
+what guarantees correctness; the schedule only sets priority.
+
+**Quick Hits now cites its sources.** Each item ends with a `SOURCE: <url>`
+line that the model writes; the line is stripped from the published body
+and turned into a `## Sources` section, the format the archive already
+knows how to read. That is what makes the briefing visible to the dedupe
+at all. Without it the series is invisible to every other generator.
+
+Tests: `test_story_claims.py` (13 checks) pins the registry, the trio's
+shared story, the refresh re-claim, the release, and the rule that a
+broken registry must not stop the site publishing.
 
 ## The 08:00 cron duplicates the 07:00 launchd job (fixed 2026-11-06)
 

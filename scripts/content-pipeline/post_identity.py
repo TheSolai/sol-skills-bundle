@@ -29,6 +29,11 @@ TWO KINDS OF IDENTITY
     a month produced 25 URLs but only 4 matched bodies exactly.
 """
 
+import contextlib
+import datetime
+import fcntl
+import json
+import os
 import re
 from pathlib import Path
 
@@ -282,3 +287,220 @@ def published_source_urls(posts_dir):
             if key:
                 out.add(key)
     return out
+
+
+def published_source_urls_excluding_paths(posts_dir, exclude_paths):
+    """Normalised source URLs of every published post EXCEPT the given files.
+
+    WHY (2026-11-18): the regional series publishes THREE posts — uk, eu and
+    us — that deliberately cover the SAME story from three angles. So the
+    trio must not count its own posts against itself, or only the first
+    region would find an eligible story and eu/us would have nothing to
+    write about.
+
+    Excluding the FILES (not their URLs) keeps every other post's coverage
+    intact: a URL that the digest also covers stays covered, because the
+    digest's file is not excluded. That is the same rule
+    `published_source_urls_excluding()` follows for a single path.
+    """
+    out = set()
+    posts_dir = Path(posts_dir)
+    if not posts_dir.is_dir():
+        return out
+    excluded = {Path(p).resolve() for p in (exclude_paths or ())}
+    for path in posts_dir.glob("*.md"):
+        if path.resolve() in excluded:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for url in source_urls(text):
+            key = normalise_url(url)
+            if key:
+                out.add(key)
+    return out
+
+
+# ── Story claims ───────────────────────────────────────────────────────────
+#
+# WHY THIS EXISTS
+# ---------------
+# `published_source_urls()` answers "has this story been published?" by
+# reading the post files. That works for any series whose posts cite their
+# source, and it is how the midweek digest has always deduped.
+#
+# It cannot answer the same question for a series whose posts do not cite
+# their sources, and it cannot answer it at all for two generators that run
+# in the SAME minute and therefore have not written their posts yet.
+#
+# Both gaps were live on 2026-11-18. The Wednesday digest, the weekday
+# Quick Hits briefing and the regional trio (uk/eu/us) all fire at 07:00,
+# all draw from the same Hacker News top-stories list, and all published
+# "GPT-6.2 Astra and Sol" — five posts, one story. The digest had deduped
+# correctly: it ran first and the archive did not yet contain the other
+# two series' picks. Quick Hits made it invisible: its posts cite no source
+# at all, so no later run could have seen that the story was taken.
+#
+# A claim registry closes the gap. A generator claims the stories it is
+# about to publish, under its own series name, BEFORE it spends a minute
+# generating them. A generator that asks a moment later sees the claim and
+# picks something else.
+#
+# The registry is a small per-day JSON file. It is written atomically under
+# an exclusive file lock, because several generators write it concurrently —
+# a plain read-modify-write would lose one generator's claims.
+#
+# Cross-day repetition is NOT the registry's job: that is the archive's job,
+# and every series now cites its sources so the archive can see them. The
+# registry only has to survive a single day.
+
+CLAIMS_DIR = Path(__file__).resolve().parent / "state"
+
+
+def claims_file_for(day, claims_dir=None):
+    """Path of the claim registry for one day."""
+    base = Path(claims_dir) if claims_dir else CLAIMS_DIR
+    return base / f"story-claims-{day}.json"
+
+
+@contextlib.contextmanager
+def _claims_lock(claims_dir=None):
+    """Exclusive lock over the claim registry.
+
+    Held across the whole read-modify-write, not just the write: two
+    generators that claim at the same moment must not both read an empty
+    registry and then each write their own version of it.
+    """
+    base = Path(claims_dir) if claims_dir else CLAIMS_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(base / "story-claims.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def read_claims(day, claims_dir=None):
+    """The claims registered for one day: {normalised_url: {series, title}}."""
+    path = claims_file_for(day, claims_dir)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_claims_atomic(claims, day, claims_dir=None):
+    """Write the claim registry atomically.
+
+    A truncated registry would silently free every claimed story, so the
+    content goes to a temporary file and is moved into place with
+    os.replace(), which is atomic on the same filesystem.
+    """
+    path = claims_file_for(day, claims_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(claims, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def claim_stories(
+    series,
+    candidates,
+    count,
+    posts_dir,
+    *,
+    day=None,
+    exclude_paths=(),
+    claims_dir=None,
+):
+    """Claim up to `count` stories for `series` and return the ones claimed.
+
+    A candidate is claimable only if its source URL is not:
+
+      * cited by any published post — the archive, minus `exclude_paths`
+        (a generator refreshing its own post in place excludes that file);
+      * already claimed TODAY by another series.
+
+    A claim this series made today is NOT a blocker: a refresh re-claims
+    the same stories so a post can be rewritten in place without silently
+    swapping the stories underneath it.
+
+    `candidates` are dicts with a "url" and a "title". The ones claimed are
+    returned in the order given, so a caller keeps its own ordering.
+
+    Failure is never fatal. If the registry cannot be read or written, the
+    candidates are returned unfiltered — that is the behaviour the pipeline
+    had before the registry existed, and a broken registry must not stop
+    the site from publishing.
+    """
+    if day is None:
+        day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    candidates = list(candidates or [])
+    if count <= 0 or not candidates:
+        return []
+
+    try:
+        with _claims_lock(claims_dir):
+            claims = read_claims(day, claims_dir)
+            taken = published_source_urls_excluding_paths(posts_dir, exclude_paths)
+            for url, rec in claims.items():
+                if rec.get("series") == series:
+                    continue
+                taken.add(url)
+
+            picked = []
+            for cand in candidates:
+                if len(picked) >= count:
+                    break
+                key = normalise_url(cand.get("url", ""))
+                if not key or key in taken:
+                    continue
+                taken.add(key)
+                picked.append(cand)
+                claims[key] = {"series": series, "title": cand.get("title", "")}
+
+            if picked:
+                write_claims_atomic(claims, day, claims_dir)
+            return picked
+    except Exception as exc:  # pragma: no cover - the registry must never block publishing
+        print(f"[claims] Registry unavailable ({exc}) — continuing without claims")
+        return candidates[:count]
+
+
+def release_claims(series, keep_urls, day, claims_dir=None):
+    """Release this series' claims that are not in `keep_urls`.
+
+    WHY (2026-11-18): the Quick Hits briefing asks the model to choose
+    three stories out of five candidates, so it cannot know which three it
+    will use until the model has answered. It claims the whole candidate
+    pool BEFORE generating — otherwise a generator running at the same
+    moment could take one of them — and releases the two it did not use
+    afterwards, so the day's remaining supply is not wasted.
+
+    A claim belonging to another series is never released.
+    """
+    keep = {normalise_url(u) for u in (keep_urls or [])}
+    try:
+        with _claims_lock(claims_dir):
+            claims = read_claims(day, claims_dir)
+            released = 0
+            for url in list(claims):
+                rec = claims[url]
+                if rec.get("series") != series:
+                    continue
+                if url in keep:
+                    continue
+                del claims[url]
+                released += 1
+            if released:
+                write_claims_atomic(claims, day, claims_dir)
+            return released
+    except Exception as exc:  # pragma: no cover - the registry must never block publishing
+        print(f"[claims] Could not release claims ({exc})")
+        return 0

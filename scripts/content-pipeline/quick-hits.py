@@ -20,6 +20,14 @@ from devto_key import load_devto_key
 from _minimax_helper import minimax_generate, load_minimax_key_candidates
 from ai_filter import is_ai_title
 from text_utils import split_sentences
+from post_identity import (
+    normalise_url,
+    published_source_urls_excluding_paths,
+    claim_stories,
+    read_claims,
+    release_claims,
+    sources_section_urls,
+)
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
@@ -28,6 +36,10 @@ DEVTO_API_KEY = load_devto_key()
 # Serialises runs so two schedulers (the MiniMax cron task and the
 # ai.sol.quick-hits launchd agent) cannot both write the same day's post.
 LOCK_FILE = Path("/tmp/sol-quick-hits.lock")
+
+# The working note the model writes under each item to name its source.
+# It is stripped from the published body and turned into a Sources section.
+SOURCE_LINE_RE = re.compile(r"^[ \t]*SOURCE:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
 
 # The HN Algolia index supports a real date filter, which is what makes a
 # backfill possible: a `--date` run must see that day's stories, not
@@ -404,14 +416,19 @@ def existing_post_is_degraded(path: Path) -> bool:
     return False
 
 
-def build_quick_hits(hn_stories, devto_articles, post_date: str = ""):
-    """Use LLM to pick best 3 stories and write the briefing."""
+def candidate_pool(hn_stories, devto_articles, exclude_urls=None):
+    """The stories the model may choose from — the top 5 by engagement.
 
-    if not hn_stories and not devto_articles:
-        print("[quick-hits] No stories fetched — skipping.")
-        return None
+    Split out of `build_quick_hits()` because the caller has to claim this
+    pool BEFORE the model is asked to choose: the model picks three out of
+    five, so until it answers nobody knows which three will be used, and a
+    generator running at the same moment could take one of them.
 
-    # Combine sources
+    Stories in `exclude_urls` — already published, or already claimed
+    today by another series — are dropped.
+    """
+    exclude = {normalise_url(u) for u in (exclude_urls or set())}
+
     all_items = []
     for s in hn_stories:
         all_items.append({
@@ -432,9 +449,40 @@ def build_quick_hits(hn_stories, devto_articles, post_date: str = ""):
             "comments": d["comments"],
         })
 
-    # Sort by engagement, take top 5 for LLM to choose from
+    if exclude:
+        before = len(all_items)
+        all_items = [i for i in all_items if normalise_url(i["url"]) not in exclude]
+        if before != len(all_items):
+            print(f"[quick-hits] Dropped {before - len(all_items)} already-covered stories")
+
     all_items.sort(key=lambda x: x["engagement"], reverse=True)
-    candidates = all_items[:5]
+    return all_items[:5]
+
+
+def build_quick_hits(hn_stories, devto_articles, post_date: str = "", exclude_urls=None):
+    """Use LLM to pick best 3 stories and write the briefing.
+
+    `exclude_urls` holds the source URLs that are already published or
+    claimed today. They are dropped from the candidate pool BEFORE the
+    model chooses, so the briefing cannot lead with a story another series
+    is already covering.
+
+    The model is asked to name the URL it used for each item. That is not
+    decoration: this series' posts used to cite NO source at all, which
+    made them invisible to the archive dedupe — and to every later run that
+    wanted to know what had already been covered. The URLs are turned into
+    a "## Sources" section, which the archive already knows how to read.
+    """
+
+    if not hn_stories and not devto_articles:
+        print("[quick-hits] No stories fetched — skipping.")
+        return None
+
+    candidates = candidate_pool(hn_stories, devto_articles, exclude_urls)
+
+    if not candidates:
+        print("[quick-hits] Every candidate story is already covered — skipping.")
+        return None
 
     candidates_txt = "\n".join(
         f"- [{item['source']}] {item['title']}\n  URL: {item['url']}\n  Score: {item['score']} / Comments: {item['comments']}"
@@ -448,6 +496,11 @@ Pick the 3 most interesting items from the candidates below. Write each as:
 **Why it matters:** [1-2 sentences]
 
 Keep it punchy. No intro paragraph needed — just jump straight in. Total post should be ~200 words.
+
+After the "Why it matters" paragraph of each item, add one line containing
+exactly SOURCE: followed by that item's URL, on its own line. Nothing else
+on that line. These lines are removed before the post is published and are
+used to credit the sources.
 
 Date: {post_date}
 Author: Sol
@@ -465,7 +518,17 @@ Candidate stories:
             lines.append(f"**{i}. {item['title']}**")
             lines.append(f"[{item['source']}]({item['url']}) — {item['score']} score")
             lines.append("")
-        return "\n".join(lines)
+        return _with_sources("\n".join(lines), top3)
+
+    # Pull the model's own source lines out of the body. They are working
+    # notes, not prose, so they must not reach the published post.
+    used = []
+    for m in SOURCE_LINE_RE.finditer(body):
+        url = m.group(1).strip()
+        if url and url not in used:
+            used.append(url)
+    body = SOURCE_LINE_RE.sub("", body)
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
 
     # The model sometimes signs the post itself ("—Sol", "-- Sol", "**Sol**").
     # The layout already renders "By Sol" in the header, so a trailing
@@ -485,7 +548,26 @@ Candidate stories:
         print(f"[quick-hits] Trimmed {len(body.split())} -> {len(trimmed.split())} words")
         body = trimmed
 
-    return body
+    # Credit the sources. This is what makes the briefing visible to the
+    # archive dedupe: without a citation, no later run could tell that this
+    # story had already been covered.
+    picked = [c for c in candidates if c["url"] in used] or candidates[:3]
+    return _with_sources(body, picked)
+
+
+def _with_sources(body: str, items) -> str:
+    """Append a "## Sources" section crediting the stories used.
+
+    The section is appended AFTER the word budget is enforced, so the
+    briefing's prose still fits its budget.
+    """
+    items = [i for i in (items or []) if i.get("url")]
+    if not items:
+        return body
+    lines = ["## Sources", ""]
+    for item in items:
+        lines.append(f"- [{item['title']}]({item['url']})")
+    return f"{body.rstrip()}\n\n" + "\n".join(lines)
 
 
 def create_post(body: str, d: datetime.datetime) -> Path:
@@ -559,10 +641,59 @@ def main(argv: list[str] | None = None):
         devto_articles = fetch_devto_articles(limit=10, target=target)
         print(f"[quick-hits] Fetched {len(devto_articles)} dev.to articles")
 
-        body = build_quick_hits(hn_stories, devto_articles, post_date=post_date)
+        # Stories that are already published, or that another series has
+        # already claimed today, are not candidates.
+        #
+        # WHY (2026-11-18): this series had no dedupe at all, and its posts
+        # cited no source, so nothing it covered was visible to anyone else.
+        # On 2026-11-18 the briefing, the midweek digest and the regional
+        # trio all covered "GPT-6.2 Astra and Sol" — five posts, one story.
+        #
+        # The day's own post is excluded so a `--force` regeneration can
+        # still pick the same stories.
+        exclude = published_source_urls_excluding_paths(SITE_DIR / "_posts", [post_path])
+        for url, rec in read_claims(date_str).items():
+            if rec.get("series") != "quick-hits":
+                exclude.add(url)
+        print(f"[quick-hits] {len(exclude)} source URLs already covered")
+
+        # Claim the candidate pool BEFORE the model chooses.
+        #
+        # WHY (2026-11-18): the model picks three out of five, so until it
+        # answers nobody knows which three will be used. Claiming the pool
+        # first means a generator running at the same moment cannot take
+        # one of them; the two it does not use are released afterwards.
+        pool = candidate_pool(hn_stories, devto_articles, exclude)
+        if pool:
+            claim_stories(
+                "quick-hits",
+                pool,
+                len(pool),
+                SITE_DIR / "_posts",
+                day=date_str,
+            )
+            for c in pool:
+                print(f"[claims] quick-hits reserved: {c['title'][:70]}")
+
+        body = build_quick_hits(hn_stories, devto_articles, post_date=post_date, exclude_urls=exclude)
         if not body or body.startswith("[LLM") or body.startswith("[error"):
             print(f"[quick-hits] Failed to generate content: {body}")
+            release_claims("quick-hits", [], date_str)
             return
+
+        # Claim the stories this post actually used, and release the rest of
+        # the pool. The URLs are read back out of the Sources section, so
+        # the claim matches the post exactly.
+        used = [
+            u for u in sources_section_urls(body)
+            if normalise_url(u) not in exclude
+        ]
+        if used:
+            for u in used:
+                print(f"[claims] quick-hits claimed: {u[:70]}")
+        released = release_claims("quick-hits", used, date_str)
+        if released:
+            print(f"[claims] quick-hits released {released} unused reservations")
 
         post_path = create_post(body, target)
 

@@ -1,0 +1,22 @@
+# Local run logs — never committed.
+# `scripts/content-pipeline/logs/sol-seo-health.log` alone reached 29 MB over
+# 798 runs, and `logs/` holds the per-job stdout for every scheduled task.
+# These are append-only diagnostics, not source. The summary the SEO audit
+# writes for itself (`scripts/content-pipeline/logs/seo-health.log`) is
+# regenerated on every run, so nothing is lost by leaving all of them local.
+logs/
+scripts/content-pipeline/logs/
+
+# Local secrets and machine-specific state
+*.local
+.env
+.env.*
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# The story-claim registry (2026-11-18). One JSON file per day plus a lock
+# file — runtime state that every generator rewrites, not source. The
+# registry is only meaningful for the day it was written; it is rebuilt
+# from scratch each day.
+scripts/content-pipeline/state/

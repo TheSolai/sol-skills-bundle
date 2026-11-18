@@ -37,6 +37,8 @@ try:
         normalise_url,
         published_source_urls,
         published_source_urls_excluding,
+        claim_stories,
+        read_claims,
     )
 except Exception:  # pragma: no cover - dedupe is an enhancement, not a blocker
     def normalise_url(url):
@@ -47,6 +49,12 @@ except Exception:  # pragma: no cover - dedupe is an enhancement, not a blocker
 
     def published_source_urls_excluding(posts_dir, exclude_path):
         return set()
+
+    def claim_stories(series, candidates, count, posts_dir, **kwargs):
+        return list(candidates)[:count]
+
+    def read_claims(day):
+        return {}
 
 try:
     from ai_filter import is_ai_title
@@ -216,13 +224,18 @@ def is_ai_story(title):
     return is_ai_title(title)
 
 
-def select_stories(stories, exclude_urls=None):
+def select_stories(stories, exclude_urls=None, count=STORY_COUNT):
     """
     Pick the most significant AI stories that are not already published.
 
     Dedupe is on the source URL — the stable key for anything that comments
     on the news (see post_identity.py and OPERATIONS.md). Publishing a second
     URL for a story the archive already covers is a duplicate post.
+
+    `count` is the number of stories to return. It is a parameter rather than
+    a constant so the caller can over-fetch: a story claimed by another
+    series a moment ago is dropped AFTER this ranking, so the caller needs
+    more candidates than it intends to publish.
 
     The candidates are ALSO deduped against each other, on the same URL key.
     WHY (2026-11-11): the Algolia index returns one row per Hacker News
@@ -255,7 +268,7 @@ def select_stories(stories, exclude_urls=None):
         candidates.append(story)
 
     candidates.sort(key=lambda s: s["score"] + s["comments"] * 0.5, reverse=True)
-    return candidates[:STORY_COUNT]
+    return candidates[:count]
 
 
 def _story_digest(stories):
@@ -478,10 +491,40 @@ def main():
         covered = published_source_urls_excluding(POSTS_DIR, filepath)
         print("[digest] Refresh: excluding this post from the covered set")
 
-    top_stories = select_stories(stories, exclude_urls=covered)
+    # Stories another series has already claimed TODAY are off the table too.
+    #
+    # WHY (2026-11-18): the archive cannot see a story that another
+    # generator has claimed but not yet published — and on a Wednesday the
+    # digest, the Quick Hits briefing and the regional trio all fire at
+    # 07:00. Without this the digest published "GPT-6.2 Astra and Sol" and
+    # so did all four other posts that day: five posts, one story.
+    #
+    # A claim this series made today is not a blocker, so a refresh can
+    # re-claim the same three stories.
+    for url, rec in read_claims(DATE_STR).items():
+        if rec.get("series") != "ai-digest":
+            covered.add(url)
+
+    # Over-fetch: a story claimed by another series in the last moment is
+    # dropped after the ranking, so the claim step needs spare candidates.
+    ranked = select_stories(stories, exclude_urls=covered, count=STORY_COUNT * 3)
+
+    # Claim the stories before generating them. The claim is what stops a
+    # generator running moments later from publishing the same story.
+    top_stories = claim_stories(
+        "ai-digest",
+        ranked,
+        STORY_COUNT,
+        POSTS_DIR,
+        day=DATE_STR,
+        exclude_paths=[filepath] if (args.refresh and filepath.exists()) else [],
+    )
+
     ai_count = len([s for s in stories if is_ai_story(s["title"])])
     print(f"[news] Found {ai_count} AI stories from past {DAYS_BACK} days")
     print(f"[news] Selected {len(top_stories)} after removing already-covered stories")
+    for s in top_stories:
+        print(f"[claims] ai-digest claimed: {s['title'][:70]}")
 
     if not top_stories:
         print("[digest] No eligible stories — skipping (a gap beats a duplicate)")

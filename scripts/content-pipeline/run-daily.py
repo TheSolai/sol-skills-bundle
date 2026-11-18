@@ -216,6 +216,61 @@ def _html_to_text(raw):
     return parser.description, parser.text()
 
 
+# A Cloudflare-fronted site answers a bare User-Agent with 403 and nothing
+# else — no body, no hint that it is a bot check. openai.com did exactly
+# that, so the grounding fetch for every OpenAI announcement came back empty
+# and the post was written from the headline alone, with no log line to say
+# so. Sending the header set a real browser sends gets the same page:
+# openai.com went from 403 to a 400KB HTML document once Sec-Fetch-* and
+# Accept-Language were added (verified 2026-11-18).
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# Last resort for sites that refuse even the browser headers. Returns
+# markdown text rather than HTML, so it is used as-is, not parsed.
+TEXT_PROXY = "https://r.jina.ai/"
+
+
+def _fetch_direct(url, timeout=20):
+    """GET a URL with browser headers. Returns the raw body, or None."""
+    try:
+        req = urllib.request.Request(url, headers=BROWSER_HEADERS)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(1_500_000).decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def _fetch_via_proxy(url, timeout=45):
+    """GET a URL through a text-extraction proxy. Returns text, or None."""
+    try:
+        req = urllib.request.Request(
+            TEXT_PROXY + url, headers={"User-Agent": BROWSER_HEADERS["User-Agent"]}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(1_500_000).decode("utf-8", "replace")
+    except Exception:
+        return None
+
+    # The proxy wraps the page in a short markdown preamble.
+    for marker in ("Markdown Content:", "Raw Content:"):
+        idx = raw.find(marker)
+        if idx != -1:
+            raw = raw[idx + len(marker):]
+            break
+    return raw.strip() or None
+
+
 def fetch_source_excerpt(url, max_chars=6000):
     """Fetch a source page and return readable text for factual grounding.
 
@@ -224,32 +279,39 @@ def fetch_source_excerpt(url, max_chars=6000):
     to invent a local origin to satisfy the framing. Giving it the real
     text removes the need to guess.
 
+    Three attempts, in order: a direct request with browser headers, then a
+    text-extraction proxy for sites that refuse a plain client, then give
+    up. Every failure is LOGGED — the old version returned "" in silence,
+    so a blocked site looked exactly like a site with nothing to say.
+
     Returns "" on any failure — this is an enhancement, never a hard
     dependency.
     """
     if not url or not url.startswith("http"):
         return ""
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; SolAI/1.0)"}
-        )
-        with urllib.request.urlopen(req, timeout=20) as r:
-            raw = r.read(1_500_000).decode("utf-8", "replace")
-    except Exception:
-        return ""
 
-    desc, body = _html_to_text(raw)
-    if not body:
-        return ""
+    raw = _fetch_direct(url)
+    if raw:
+        desc, body = _html_to_text(raw)
+        if body or desc:
+            text = re.sub(r"[ \t]+", " ", body or desc)
+            text = re.sub(r"\n{2,}", "\n", text).strip()
+            if desc and body and desc not in text:
+                text = f"{desc}\n\n{text}"
+            if text:
+                return text[:max_chars].strip()
 
-    text = re.sub(r"[ \t]+", " ", body)
-    text = re.sub(r"\n{2,}", "\n", text).strip()
+    # The site refused a plain client. Try the text proxy before giving up.
+    proxied = _fetch_via_proxy(url)
+    if proxied:
+        text = re.sub(r"[ \t]+", " ", proxied)
+        text = re.sub(r"\n{2,}", "\n", text).strip()
+        if text:
+            print(f"[grounding] Direct fetch blocked for {url[:70]} — used the text proxy")
+            return text[:max_chars].strip()
 
-    if desc and desc not in text:
-        text = f"{desc}\n\n{text}"
-
-    return text[:max_chars].strip()
+    print(f"[grounding] ⚠️  No source text for {url[:70]} — grounding unavailable")
+    return ""
 
 
 # ── Truncation repair ──────────────────────────────────────────────────────
@@ -529,6 +591,11 @@ def generate_post(region, story, llm_api_key=None):
     excerpt = fetch_source_excerpt(story["url"])
     if excerpt:
         prompt += f"\nSource page text (use ONLY these facts):\n{excerpt}\n"
+    else:
+        # Say so. A post written from the headline alone looks the same as a
+        # grounded one until a reader spots the missing facts.
+        print(f"[{region}] ⚠️  No source grounding for {story['url'][:60]} — "
+              f"writing from the headline alone")
     print(f"[{region}] Generating post about: {story['title'][:60]}")
 
     key = _load_minimax_key()

@@ -2603,3 +2603,61 @@ Guard a long-running command with a shell-level watchdog instead, or use
 `perl -e 'alarm shift; exec @ARGV' <secs> <cmd>`. Note that a `command not
 found` failure inside a `cmd >> log 2>&1` redirect still lands in the log —
 which is how this one surfaced there rather than in the terminal.
+
+## The grounding fetch was refused by openai.com, and said nothing (found 2026-11-18)
+
+`fetch_source_excerpt()` sent one header — `User-Agent: Mozilla/5.0
+(compatible; SolAI/1.0)` — and returned `""` on any failure, **in silence**.
+
+openai.com answers a bot User-Agent with **403 Forbidden** and an empty body.
+That is not a bot-detection page you can parse; it is a refusal. So every
+post grounded on an OpenAI announcement was written **from the headline
+alone**, and the log said `✅ MiniMax` with nothing about the missing source
+text.
+
+The three regional posts of 2026-11-18 are the evidence. All three hedged
+about what the models actually are — "the available details do not establish
+how Astra and Sol differ" — when the announcement says plainly that **Astra
+is the frontier model for the hardest projects and Sol the efficient,
+versatile model for everyday work**, with fewer output tokens and lower cost
+across ChatGPT Work, Codex and the API. The facts were one header away.
+
+**The fix (2026-11-18):**
+
+- The request now carries a browser header set — `Accept`,
+  `Accept-Language`, `Sec-Fetch-Mode`, `Sec-Fetch-Site`, `Sec-Fetch-User`,
+  `Upgrade-Insecure-Requests`, and a Chrome User-Agent. That took
+  openai.com from **403 to a 400KB document**, and the excerpt from **0 to
+  5,999 characters**. Other domains were tested and are unaffected.
+- A site that refuses even those headers falls through to a text-extraction
+  proxy (`https://r.jina.ai/<url>`), whose markdown preamble
+  (`Title:`/`URL Source:`/`Markdown Content:`) is stripped before use.
+- **Every failure now logs.** `[grounding] Direct fetch blocked … — used the
+  text proxy` or `[grounding] ⚠️ No source text for … — grounding
+  unavailable`. The generator also prints `[<region>] ⚠️ No source grounding
+  … — writing from the headline alone`. A silent `""` is indistinguishable
+  from a site with nothing to say, and that is exactly how this stayed
+  invisible for a week.
+
+**The general rule:** a silent fallback is a defect, not a convenience. Any
+step whose failure changes the quality of the output — but not its shape —
+must say so in the log. `""` and "there was nothing there" have to be
+distinguishable, or the degraded path runs forever without anyone noticing.
+
+**Test:** `scripts/content-pipeline/test_source_grounding.py` (11 checks)
+pins the header set, the proxy fallback, the stripped preamble, the logged
+failure, and that the shared loader in `source_fetch.py` — used by
+`weekly-roundup.py` and `midweek-news.py` — reaches this fetcher rather than
+a second copy of the old code.
+
+**To check grounding on any story, live:**
+
+```bash
+cd scripts/content-pipeline && python3 -c "
+import importlib.util
+spec = importlib.util.spec_from_file_location('rd','run-daily.py')
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(len(m.fetch_source_excerpt('<the story URL>')))"
+```
+
+A length of 0 means the post was written from the headline alone.

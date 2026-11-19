@@ -474,9 +474,9 @@ Tests: `test_story_claims.py` (13 checks) pins the registry, the trio's
 shared story, the refresh re-claim, the release, and the rule that a
 broken registry must not stop the site publishing.
 
-## The 08:00 cron duplicates the 07:00 launchd job (fixed 2026-11-06)
+## The 08:00 cron duplicates the 07:10 launchd job (fixed 2026-11-06)
 
-`ai.sol.daily-content` (launchd, 07:00) already runs `run-daily.py`, so the
+`ai.sol.daily-content` (launchd, 07:10) already runs `run-daily.py`, so the
 08:00 cron invocation of the same script is a **no-op**: the day's posts
 exist, `find_post_for_region()` matches them on date + region, and the run
 reports "Already published today: <file> — skipping" for all three regions
@@ -2226,7 +2226,7 @@ it stays correct either way.
 
 | Scheduler | When | Log file |
 |---|---|---|
-| `ai.sol.daily-content` (launchd, `RunAtLoad: true`) | 07:00 | `scripts/content-pipeline/logs/sol-content.log` |
+| `ai.sol.daily-content` (launchd, `RunAtLoad: true`) | 07:10 | `scripts/content-pipeline/logs/sol-content.log` |
 | `sol-daily-content` (Mavis cron, `0 8 * * *`) | 08:00 | `logs/sol-content.log` (repo root) |
 
 The difference is the working directory each job runs in: the launchd
@@ -2762,3 +2762,60 @@ print(len(m.fetch_source_excerpt('<the story URL>')))"
 ```
 
 A length of 0 means the post was written from the headline alone.
+
+## The grounding fix held on its first production day (2026-11-19)
+
+The entry above records the **fix** for the refused openai.com fetch. This is
+the first full day on the new code, and the fix did what it was supposed to:
+the 2026-11-19 regional trio is grounded in the actual source text, not in the
+headline.
+
+The story was *Advancing chip design with OpenAI models* (198 points). Pulling
+the source with the pipeline's own `fetch_source_excerpt()` and checking every
+number the three posts assert:
+
+| Claim in the post | In the source |
+|---|---|
+| 13% less cell area, vector unit | ✅ |
+| 10% less cell area, matrix unit | ✅ |
+| multiplier redesign: ~15% less area, two clock cycles → one | ✅ |
+| up to 14% over heavily optimised baselines on flagship GPU IP | ✅ |
+| "roughly a year of progress achieved in less than 5 months" | ✅ |
+| designs scored zero above 16× the original core's area | ✅ |
+| started with GPT-o3 mini on Jalapeño in early 2025 | ✅ |
+| AMD sent a design for manufacturing, added others to production files | ✅ |
+| AMD verified single-digit PPA gains on its next flagship CPU | ✅ |
+| comparable budget of ~112,000 tokens per run | ✅ |
+
+**The general rule:** a grounding fix is not done when the fetch stops
+returning `""`. It is done when the published numbers can be traced to the
+source. `fetch_source_excerpt()` returning a non-empty string only proves the
+fetch worked — it does not prove the model used it.
+
+## The launchd slot is 07:10, and two places still said 07:00 (2026-11-19)
+
+The `ai.sol.daily-content` plist was staggered to **07:10** on 2026-11-18
+(`ai.sol.daily-content.plist.bak-20261118-stagger`), but the scheduler table
+and the "08:00 cron duplicates the launchd job" section still said **07:00**.
+
+That is a false-gap trap in the exact shape this file keeps warning about: a
+reader checking the launchd log for a **07:00** entry finds none, and reports
+a missed run for a day that published fine. **Both references are now 07:10.**
+
+The day's own two logs confirm the split, and confirm which one to read:
+
+- `scripts/content-pipeline/logs/sol-content.log` (launchd, 07:10) — the
+  **informative** log. It has the banner
+  `Sol AI Daily Content Pipeline — 2026-11-19`, `[claims] regional claimed:`,
+  the three `[<region>] ✅ Written:` lines, and `[git] ✅ Pushed to GitHub
+  Pages`.
+- `logs/sol-content.log` (Mavis cron, 08:00) — the **skip** log. It has the
+  same banner but only `⚠️ Already published today: … — skipping` for all three
+  regions.
+
+This is the same rule already recorded for Quick Hits and Sol's Take: **for a
+double-scheduled series, the scheduler that WINS the publish owns the
+informative log.** The `flock` on `/tmp/sol-daily-content.lock` means the two
+runs can never both pass the existence check before either writes, so the
+second one is always a clean no-op rather than a duplicate.
+

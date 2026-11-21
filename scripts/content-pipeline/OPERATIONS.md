@@ -2819,3 +2819,123 @@ informative log.** The `flock` on `/tmp/sol-daily-content.lock` means the two
 runs can never both pass the existence check before either writes, so the
 second one is always a clean no-op rather than a duplicate.
 
+
+## One SSL timeout cost a whole day of regional posts (fixed 2026-11-21)
+
+`run-daily.py` fetched the Hacker News top-stories list with a **single**
+`urlopen` call wrapped in a bare `except`. On 2026-11-20 that call died on
+an SSL handshake timeout:
+
+```
+[news] Failed to fetch HN stories: <urlopen error _ssl.c:1126: The handshake operation timed out>
+[news] Found 0 AI-related stories out of 0 total
+[news] No AI stories found — using top stories
+[uk] No story available, skipping
+[eu] No story available, skipping
+[us] No story available, skipping
+```
+
+The run then printed **"Pipeline complete! Generated: 0 regional posts"** and
+**exited 0**. That is the worst shape a silent failure can take: the
+uk/eu/us trio published nothing for the whole day, and both the log line
+and the exit code said the run was fine.
+
+The same failure mode appears twice more in the launchd log — a DNS
+failure (`[Errno 8] nodename nor servname provided`) and `[Errno 65] No
+route to host`. Every one of them was a transient network error rather
+than a permanent one, and each one silently removed a day.
+
+Two changes fix it:
+
+- **`_http_get_json()`** in `run-daily.py` retries a failed GET with linear
+  backoff — three attempts for the top-stories list (fatal without it), two
+  attempts and a shorter delay for an individual story item (survivable
+  without it, since the loop just skips a missing item). A healthy fetch
+  still makes exactly one call per URL, so the retry costs nothing on a
+  normal day.
+- **A run that fetched nothing now exits non-zero** and prints
+  `[news] ❌ FATAL: no HN stories could be fetched`. The scheduler reports a
+  failed day instead of recording a green one. The normal "already
+  published" no-op still exits 0 — a clean skip is not a failure.
+
+`test_hn_fetch_resilience.py` pins both: a transient failure is retried and
+the day survives, a healthy fetch does not retry, a dead fetch exits
+non-zero without generating anything, and a healthy run still exits 0. The
+change is stdlib-only and was checked under `/usr/bin/python3` (3.9.6),
+`/opt/homebrew/bin/python3` (3.15, the interpreter launchd pins) and the
+Learnage venv (3.13).
+
+**The general lesson:** a bare `except` around a network call that returns
+a "nothing found" value is indistinguishable from a real result. A fetch
+that *failed* has to be distinguishable from a fetch that *found nothing* —
+otherwise the pipeline's own success message becomes the evidence that it
+failed.
+
+## A token-plan limit silently replaced four days of analysis with a template (found 2026-11-21)
+
+This is the other half of the November gap. It is **not fixed**, and the
+posts are still live.
+
+`run-daily.py` falls back to a deterministic structured template when
+MiniMax generation fails, and it logs `MiniMax failed — using structured
+fallback`. On **2026-11-08, 2026-11-13, 2026-11-14 and 2026-11-15** all
+three regions took that fallback, because the API answered every request
+with:
+
+```
+[minimax] generation failed: MiniMax-M3.1-Flash with key ..._3pg: HTTP 429 Too Many Requests
+{"type":"error","error":{"type":"rate_limit_error","message":"Token Plan usage limit reached: Upgrade your Token Plan or purchase Credits for more usage. (2056)"}}
+```
+
+`_minimax_helper.py` already rotates keys and models, so this was not a
+single-key problem — the whole token plan was exhausted. What made it
+durable is that **the pipeline cannot repair a degraded post once its day
+has passed**:
+
+- `existing_post_is_degraded()` recognises the template fallback, and
+  `run_pipeline()` does regenerate one — but only for **today**, because
+  `find_post_for_region()` defaults to `DATE_STR`.
+- A degraded post from a past date is therefore never revisited.
+- `backfill_repair.py` does not catch these either: its `REGIONAL` pattern
+  matches `uk-ai-weekly`/`eu-ai-watch`/`us-ai-pulse`, and the fallback posts
+  are written with a **different slug** (`2026-11-13-uk-anthropic-ipo.md`).
+
+The four November days are the current series, and all twelve posts keep
+their `hn_url` and `hn_score`, so they can be regenerated against the same
+source. The same audit across the site's history finds **130 degraded
+posts** still live — 12 from those four November days, and 118 from
+June-September, when the fallback was between 18% and 41% of each month's
+regional output. October has none.
+
+### The detector that counts them had a hole
+
+`existing_post_is_degraded()` matched only a **double** quote after
+`title:`:
+
+```
+^title:\s*"?\[(UK|EU|US)\]\s
+```
+
+`_yaml()` double-quotes today, but 54 posts published in June-September
+carry `title: '[EU] ...'` — a single quote. The pattern did not match
+those, so an audit built on it **under-counted the degraded posts by more
+than a third**. The pattern now accepts either quote, and
+`test_degraded_post_detection.py` pins all three quote styles against a
+real post.
+
+### Counting the trio's coverage by series prefix is also wrong
+
+A fallback post is written with the story's slug, not the series slug: it
+is `2026-11-13-uk-anthropic-ipo.md`, not `2026-11-13-uk-ai-weekly-*.md`.
+A coverage check that counts by series prefix therefore reports **0/3** for
+a day that in fact published three posts. The only November day with
+nothing at all is 2026-11-20. Check the degraded marker, not the slug.
+
+### The general lesson
+
+Two different failures produce the same symptom — a hole in the regional
+series — and only one of them was visible. The network failure lost a day
+outright; the token-plan failure published three posts that *looked* like
+a normal day and were template filler. A series that publishes filler on a
+bad day is harder to detect than one that publishes nothing, and nothing in
+the pipeline notices either.

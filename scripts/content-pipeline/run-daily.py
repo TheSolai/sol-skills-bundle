@@ -12,7 +12,7 @@ Or manually:
 LLM: MiniMax only. Falls back to structured templates if key is missing.
 """
 
-import sys, os, json, datetime, urllib.request, re, contextlib, fcntl
+import sys, os, json, datetime, urllib.request, re, contextlib, fcntl, time
 from html.parser import HTMLParser
 from pathlib import Path
 import sys as _sys
@@ -72,28 +72,54 @@ def _load_minimax_key() -> str:
 
 # ── Fetch AI news from Hacker News ──────────────────────────────────────────
 
+def _http_get_json(url, timeout, attempts=3, base_delay=2.0):
+    """GET a JSON URL, retrying transient failures with linear backoff.
+
+    WHY (2026-11-21): on 2026-11-20 the single topstories request hit an
+    SSL handshake timeout. The old code returned [] on the first error, the
+    pipeline printed "No story available, skipping" for all three regions
+    and exited 0 — a whole day of regional posts lost, with a log that read
+    like a normal run. One network blip should cost a delay, not a day.
+
+    The retry budget differs by call site: the topstories list is fatal
+    without it, so it gets the full three attempts. A single story item
+    failing is survivable — the loop simply skips it — so items get two
+    attempts and a shorter delay, keeping a healthy run fast.
+    """
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "SolAI/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            last_exc = e
+            if attempt < attempts:
+                delay = base_delay * attempt
+                print(f"[news] Attempt {attempt}/{attempts} failed ({e}) — retrying in {delay:.0f}s")
+                time.sleep(delay)
+    raise last_exc
+
+
 def fetch_hn_stories(limit=30):
     """Fetch top HN stories and filter for AI-related ones."""
     try:
-        req = urllib.request.Request(
-            "https://hacker-news.firebaseio.com/v0/topstories.json",
-            headers={"User-Agent": "SolAI/1.0"}
+        ids = _http_get_json(
+            "https://hacker-news.firebaseio.com/v0/topstories.json", timeout=10
         )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            ids = json.loads(r.read())
     except Exception as e:
-        print(f"[news] Failed to fetch HN stories: {e}")
+        print(f"[news] Failed to fetch HN stories after 3 attempts: {e}")
         return []
 
     stories = []
     for story_id in ids[:limit]:
         try:
-            req = urllib.request.Request(
+            story = _http_get_json(
                 f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json",
-                headers={"User-Agent": "SolAI/1.0"}
+                timeout=5,
+                attempts=2,
+                base_delay=0.5,
             )
-            with urllib.request.urlopen(req, timeout=5) as r:
-                story = json.loads(r.read())
             if story and story.get("title"):
                 stories.append({
                     "id": story_id,
@@ -799,7 +825,11 @@ def existing_post_is_degraded(path):
         text = path.read_text(encoding="utf-8")
     except OSError:
         return False
-    return bool(re.search(r'^title:\s*"?\[(UK|EU|US)\]\s', text, re.M))
+    # The quote is optional AND may be single: `_yaml()` double-quotes today,
+    # but 54 posts published in June-September carry `title: '[EU] ...'`.
+    # A pattern that only allowed `"` reported those as healthy, so any
+    # audit built on it under-counted the degraded posts by more than a third.
+    return bool(re.search(r"""^title:\s*['"]?\[(UK|EU|US)\]\s""", text, re.M))
 
 
 # A metadata line the model echoed instead of leaving in the front matter.
@@ -1179,8 +1209,8 @@ def main():
     # published today" check before either writes.
     with run_lock() as got_lock:
         if not got_lock:
-            return
-        run_pipeline()
+            return 0
+        return run_pipeline()
 
 
 def run_pipeline():
@@ -1189,6 +1219,17 @@ def run_pipeline():
     # 1. Fetch news
     print("[news] Fetching top HN stories...")
     stories = fetch_hn_stories(30)
+
+    # Zero stories means the fetch failed, not that Hacker News was empty.
+    # On 2026-11-20 an SSL handshake timeout produced exactly this state and
+    # the run ended with "Pipeline complete! Generated: 0 regional posts" —
+    # a lost day that read like success. Fail loudly instead, and exit
+    # non-zero so the scheduler surfaces it instead of recording a green run.
+    if not stories:
+        print("[news] ❌ FATAL: no HN stories could be fetched — nothing can be published today.")
+        print("[news] ❌ The uk/eu/us trio will publish NOTHING. Re-run this script to retry.")
+        return 1
+
     ai_stories = [s for s in stories if is_ai_story(s["title"])]
     print(f"[news] Found {len(ai_stories)} AI-related stories out of {len(stories)} total")
 
@@ -1314,7 +1355,8 @@ def run_pipeline():
     print("Pipeline complete!")
     print(f"Generated: {len(generated_posts)} regional posts + {1 if bloopers_written else 0} bloopers post")
     print(f"{'='*60}\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -9,6 +9,9 @@ Format: real companies, real (anonymised) deployments, real lessons.
 
 import os, datetime, json, re
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
+from text_utils import clamp_title
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 LOG_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline/logs")
@@ -182,7 +185,7 @@ def generate_post():
     post_date = f"{today.strftime('%B')} {today.day}, {today.year}"
     full_body = f"""---
 layout: post
-title: {_yaml(f"Case Study: {case['title']} ({post_date})")}
+title: {_yaml(clamp_title(f"Case Study: {case['title']} ({post_date})"))}
 description: {_yaml(f"How {case['company']} deployed AI for {case['industry'].lower()}. Real outcomes, real lessons. ({post_date})")}
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png

@@ -14,6 +14,13 @@ from pathlib import Path
 
 sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from post_identity import normalise_url, published_source_urls, source_url, source_urls
+from text_utils import strip_hn_markers, clamp_title, TITLE_MAX_LENGTH
+
+# The series prefix is part of the published title, so the headline's
+# budget is whatever is left of the ceiling. Deriving it from the
+# prefix keeps the arithmetic from drifting when either changes —
+# "Trending: " is ten characters, not nine.
+TRENDING_PREFIX = "Trending: "
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 LOG_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline/logs")
@@ -188,16 +195,29 @@ def generate_post():
         log("no uncovered trending story found")
         return None
 
-    title = story.get("title", "AI News Today")
+    # The HN feed annotates a link's title with the kind of link it
+    # is ("[pdf]", "[video]") and prefixes a user-submitted post with
+    # "Show HN:" / "Launch HN:". Neither is part of the headline and
+    # both were being published verbatim - into the title, the
+    # description and the body. Strip them once, here.
+    # See text_utils.strip_hn_markers().
+    title = strip_hn_markers(story.get("title", "AI News Today"))
     url = story_url(story)
     points = story.get("points", 0)
     comments = story.get("num_comments", 0)
 
-    # Short headline for the post
-    if len(title) > 70:
-        title_short = title[:67] + "..."
-    else:
-        title_short = title
+    # Short headline for the post.
+    #
+    # The old cut was a blind slice at 67 characters, so every long
+    # headline shipped cut mid-word ("...platforms from ca..."). The
+    # cut is now made at a word boundary, and the episode date is no
+    # longer repeated in the title - it is already in the front matter
+    # `date:` and on the page, and spending 20 of 70 characters on it
+    # pushed the headline itself out of view.
+    # See text_utils.clamp_title().
+    title_short = clamp_title(
+        title, max_len=TITLE_MAX_LENGTH - len(TRENDING_PREFIX)
+    )
 
     already = normalise_url(url)
     if already and already in covered:
@@ -216,7 +236,7 @@ def generate_post():
     post_date = f"{today.strftime('%B')} {today.day}, {today.year}"
     full_body = f"""---
 layout: post
-title: {_yaml(f"Trending: {title_short} ({post_date})")}
+title: {_yaml(f"{TRENDING_PREFIX}{title_short}")}
 description: {_yaml(f"Sol's take on the {slot} AI story: {title_short[:100]} ({post_date})")}
 date: {date_str} {hour:02d}:00:00 +0000
 tags: [ai, trending, commentary, sol]

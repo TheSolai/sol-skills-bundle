@@ -16,6 +16,8 @@ Checks:
   9.  Internal links point at files that exist
   10. Live spot-check: sitemap, feed and a sample of posts (with working
       og:image, canonical, title and description)
+  15. Published headlines carry no Hacker News chrome and stay inside the
+      title-length ceiling
 
 Notes on false positives this script used to raise:
   * "Missing author" — the post layout hardcodes `<meta name="author">` and
@@ -42,6 +44,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from post_identity import normalise_url, source_url
+from text_utils import find_hn_markers, TITLE_MAX_LENGTH
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle")
@@ -73,6 +76,91 @@ JEKYLL_POST_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
 # the same title, and they are reported as a note — see
 # `check_duplicate_metadata`.
 SERIES_METADATA_FIX_DATE = "2026-10-31"
+
+
+# ─────────────────────── headline hygiene ───────────────────────
+#
+# WHY (2026-11-22): this audit reported "✅ All checks passed!" on a site
+# that was publishing Hacker News chrome in its headlines and titles that ran
+# to 103 characters. Every generator copied its source headline straight into
+# the front matter, so the HN feed's own annotations — "[pdf]", "[video]",
+# "Launch HN:" — reached the page title, the meta description and the body.
+# The Trending series cut its headline at a fixed 67 characters, mid-word, and
+# then added a prefix and a full date on top.
+#
+# The rules live in text_utils.py, because the generators that write the front
+# matter and the audit that checks it have to agree on what a headline is. Two
+# definitions drift, and the drift shows up as "the audit says clean, the site
+# says otherwise" — which is exactly how this defect survived a green audit.
+#
+# Hacker News chrome fails at any date: a reader sees "[pdf]" in the title of
+# a page about something else. Title length fails only for posts published on
+# or after TITLE_LENGTH_FIX_DATE — before it the ceiling was not enforced, and
+# those posts are reported as residue, the same way duplicate metadata is.
+TITLE_LENGTH_FIX_DATE = "2026-11-23"
+
+# A meta description is truncated in the SERP well before this. It is reported
+# rather than failed: most of the long ones are hand-written posts the pipeline
+# does not generate, and there is no generator change to make.
+DESCRIPTION_LENGTH_MAX = 160
+
+
+def check_headline_hygiene(posts):
+    """Catch Hacker News chrome in a published headline and over-long titles.
+
+    Returns (issues, notes). A chrome hit is always an issue — it is
+    visible to a reader. A title over the ceiling is an issue for a post
+    published on or after TITLE_LENGTH_FIX_DATE and residue before it.
+    """
+    issues = []
+    notes = []
+    long_titles = []
+    long_descriptions = 0
+
+    for post in posts:
+        text = post.read_text(encoding="utf-8", errors="replace")
+        front_matter, _ = split_front_matter(text)
+        title = field(front_matter, "title")
+        description = field(front_matter, "description")
+
+        for label, value in (("title", title), ("description", description)):
+            chrome = find_hn_markers(value)
+            if chrome:
+                issues.append(
+                    f"❌ {post.name}: {label} carries Hacker News chrome "
+                    f"{', '.join(chrome)} — a reader sees it on the page"
+                )
+
+        if len(title) > TITLE_MAX_LENGTH:
+            post_date = post.name[:10]
+            if post_date >= TITLE_LENGTH_FIX_DATE:
+                issues.append(
+                    f"❌ {post.name}: title is {len(title)} characters "
+                    f"(ceiling {TITLE_MAX_LENGTH}) — published on or after "
+                    f"{TITLE_LENGTH_FIX_DATE}, so the generator did not "
+                    f"clamp it"
+                )
+            else:
+                long_titles.append((post.name, len(title)))
+
+        if len(description) > DESCRIPTION_LENGTH_MAX:
+            long_descriptions += 1
+
+    if long_titles:
+        longest = max(long_titles, key=lambda item: item[1])
+        notes.append(
+            f"ℹ️  {len(long_titles)} post(s) published before "
+            f"{TITLE_LENGTH_FIX_DATE} have a title longer than "
+            f"{TITLE_MAX_LENGTH} characters — reported, not rewritten "
+            f"(longest: {longest[0]}, {longest[1]} characters)"
+        )
+    if long_descriptions:
+        notes.append(
+            f"ℹ️  {long_descriptions} post(s) have a meta description "
+            f"longer than {DESCRIPTION_LENGTH_MAX} characters"
+        )
+
+    return issues, notes
 
 
 # ─────────────────────────── helpers ───────────────────────────
@@ -1141,6 +1229,13 @@ def main():
     liquid_issues = check_liquid_in_content()
     all_issues.extend(liquid_issues)
     print(f"    {'✅ All good!' if not liquid_issues else f'{len(liquid_issues)} issue(s) found'}")
+
+    print("[15] Checking published headlines for Hacker News chrome and length...")
+    headline_issues, headline_notes = check_headline_hygiene(posts)
+    all_issues.extend(headline_issues)
+    for note in headline_notes:
+        print(f"    {note}")
+    print(f"    {'✅ All good!' if not headline_issues else f'{len(headline_issues)} issue(s) found'}")
 
     print(f"\n{'─'*60}")
     if not all_issues:

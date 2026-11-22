@@ -60,6 +60,7 @@ from text_utils import (
     classify_blocks,
     split_blocks,
     trim_to_word_budget,
+    clamp_title,
 )
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
@@ -892,7 +893,7 @@ def create_post(body: str, topic: dict, date_str: str | None = None) -> Path:
     post_date = f"{d.strftime('%B')} {d.day}, {d.year}"
     frontmatter = f"""---
 layout: post
-title: {_yaml(f"{topic['topic']} ({post_date})")}
+title: {_yaml(clamp_title(f"{topic['topic']} ({post_date})"))}
 date: {date_str} 09:00:00 +0000
 tags: {tags_str}
 author: Sol

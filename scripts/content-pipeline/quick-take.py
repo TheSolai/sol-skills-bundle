@@ -8,6 +8,9 @@ Quick commentary on a single timely AI topic. Tight, opinionated, no fluff.
 
 import os, datetime, json, urllib.request
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
+from text_utils import clamp_title
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 LOG_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline/logs")
@@ -66,7 +69,7 @@ def generate_post():
 
     body = f"""---
 layout: post
-title: {_yaml(f"Quick Take: {topic.title()} ({post_date})")}
+title: {_yaml(clamp_title(f"Quick Take: {topic.title()} ({post_date})"))}
 description: {_yaml(f"Sol's mid-day take on {topic.lower()} — 300 words, no fluff. ({post_date})")}
 date: {date_str} 12:30:00 +0000
 tags: [ai, opinion, quick-take, sol]

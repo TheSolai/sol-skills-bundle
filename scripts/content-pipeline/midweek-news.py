@@ -63,8 +63,15 @@ except Exception:  # pragma: no cover - fall back to headline-only matching
         return bool(title)
 
 try:
-    from text_utils import ends_cleanly, split_sentences, trim_to_words
+    from text_utils import (ends_cleanly, split_sentences, trim_to_words,
+                           clamp_title, strip_hn_markers)
 except Exception:  # pragma: no cover - degrade to no trimming
+    def clamp_title(title, max_len=70):
+        return title
+
+    def strip_hn_markers(title):
+        return title
+
     def ends_cleanly(sentence):
         return bool(sentence) and sentence.rstrip()[-1:] in ".!?\"'”’"
 
@@ -199,7 +206,7 @@ def fetch_hn_stories(days_back=DAYS_BACK, limit=100):
             if story.get("time", 0) < cutoff:
                 continue
             stories.append({
-                "title": story["title"],
+                "title": strip_hn_markers(story["title"]),
                 "url": story.get("url", f"https://news.ycombinator.com/item?id={story_id}"),
                 "score": story.get("score", 0),
                 "comments": story.get("descendants", 0),
@@ -542,7 +549,7 @@ def main():
 
     frontmatter = f"""---
 layout: post
-title: {_yaml(title)}
+title: {_yaml(clamp_title(title))}
 date: {DATE_STR}
 description: {_yaml("Mid-week AI digest — the most important AI stories from the past few days, curated by Sol AI. (" + POST_DATE + ")")}
 image: /images/sol-avatar.png

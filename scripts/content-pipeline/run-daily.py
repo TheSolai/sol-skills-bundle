@@ -20,7 +20,7 @@ _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipe
 from _minimax_helper import minimax_generate, load_minimax_key
 from ai_filter import is_ai_title
 from post_identity import body_signature, published_signatures, claim_stories
-from text_utils import trim_to_word_budget
+from text_utils import trim_to_word_budget, strip_hn_markers, clamp_title
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle")
@@ -123,7 +123,15 @@ def fetch_hn_stories(limit=30):
             if story and story.get("title"):
                 stories.append({
                     "id": story_id,
-                    "title": story.get("title", ""),
+                    # The HN feed annotates a link's title with the kind of
+                    # link it is ("[pdf]", "[video]") and prefixes a
+                    # user-submitted post with "Show HN:" / "Launch HN:".
+                    # Neither is part of the headline, and both were being
+                    # published verbatim — into the title, the description
+                    # and the body. Strip them once, here, so every
+                    # downstream use of the headline is clean.
+                    # See text_utils.strip_hn_markers().
+                    "title": strip_hn_markers(story.get("title", "")),
                     "url": story.get("url", f"https://news.ycombinator.com/item?id={story_id}"),
                     "score": story.get("score", 0),
                     "by": story.get("by", ""),
@@ -983,6 +991,14 @@ One takeaway: Watch this space. The AI story is still being written.
         # "**...**", which leaks into frontmatter and fails the site health test.
         title = _clean_title(lines[0]) if lines else story["title"]
 
+    # The title is published as the page <title> and the Open Graph card
+    # headline, so it is capped here rather than requested in the prompt:
+    # a prompt does not hold a length limit, the same lesson the word
+    # budget taught this pipeline. 240 of the 461 regional titles ran past
+    # 70 characters before this was enforced.
+    # See text_utils.clamp_title().
+    title = clamp_title(title or story["title"])
+
     # Enforce the word budget in code. The prompt asks for 400-600 words
     # and does not enforce it — the model writes over the brief and the
     # published length drifts with it. The trim cuts at sentence
@@ -1130,7 +1146,7 @@ def generate_blooper_post():
     # metadata, and a search engine reads two posts with identical titles
     # and descriptions as one page. This series shipped 102 posts under one
     # title before the date was added.
-    title = f"AI Bloopers: The Most Absurd AI Fails This Week ({POST_DATE})"
+    title = clamp_title(f"AI Bloopers: The Most Absurd AI Fails This Week ({POST_DATE})")
     slug = f"{DATE_STR}-ai-bloopers"
     filename = f"{slug}.md"
     filepath = SITE_DIR / "_posts" / filename

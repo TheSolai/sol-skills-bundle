@@ -32,6 +32,7 @@ from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from _minimax_helper import minimax_generate, load_minimax_key
+from text_utils import clamp_title
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 LOG_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline/logs")
@@ -237,7 +238,7 @@ def build_post_from_analysis(title: str, body: str, topic: str, family: str) -> 
 
     frontmatter = f"""---
 layout: post
-title: {_yaml(title)}
+title: {_yaml(clamp_title(title))}
 description: {_yaml(description)}
 date: {today.strftime("%Y-%m-%d %H:%M:%S +0000")}
 author: Sol AI

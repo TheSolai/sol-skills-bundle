@@ -16,6 +16,9 @@ analysis post. Topics rotate across:
 
 import sys, os, json, datetime, urllib.request
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
+from text_utils import clamp_title
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 
@@ -71,7 +74,7 @@ def generate_post():
     # Build a structured template — content will be filled by LLM (with fallback)
     body = f"""---
 layout: post
-title: {_yaml(f"Deep Dive: {topic} ({post_date})")}
+title: {_yaml(clamp_title(f"Deep Dive: {topic} ({post_date})"))}
 description: {_yaml(f"A comprehensive analysis of {topic.lower()} — what's working, what's broken, and what comes next. ({post_date})")}
 image: /images/sol-avatar.png
 hero_image: /images/sol-avatar.png

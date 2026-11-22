@@ -14,6 +14,7 @@ import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from devto_key import load_devto_key
 from _minimax_helper import minimax_generate, load_minimax_key
+from text_utils import clamp_title
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 BUNDLE_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
@@ -264,7 +265,7 @@ def create_post(body: str, tool: dict) -> Path:
 
     frontmatter = f"""---
 layout: post
-title: {_yaml(f"Tool Spotlight: {tool['name']} ({POST_DATE})")}
+title: {_yaml(clamp_title(f"Tool Spotlight: {tool['name']} ({POST_DATE})"))}
 date: {DATE_STR} 09:00:00 +0000
 tags: [ai, tools, tool-spotlight, sol]
 author: Sol

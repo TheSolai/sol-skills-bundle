@@ -49,6 +49,8 @@ from text_utils import (
     split_sentences as _split_sentences,
     trim_to_words as _trim_to_words,
     collapse_repeated_sentences as _collapse_repeated_sentences,
+    clamp_title,
+    strip_hn_markers,
 )
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
@@ -92,7 +94,7 @@ def fetch_story(story_id, cutoff):
             if story_time >= cutoff:
                 return {
                     "id": story_id,
-                    "title": story.get("title", ""),
+                    "title": strip_hn_markers(story.get("title", "")),
                     "url": story.get("url", f"https://news.ycombinator.com/item?id={story_id}"),
                     "score": story.get("score", 0),
                     "by": story.get("by", ""),
@@ -524,7 +526,7 @@ def _publish_roundup():
 
     frontmatter = f"""---
 layout: post
-title: "{title}"
+title: "{clamp_title(title)}"
 date: {DATE_STR}
 description: "This week's most important AI news — curated, assessed, and contextualised. Policy, products, and research for the week ending {POST_DATE}."
 image: /images/sol-avatar.png

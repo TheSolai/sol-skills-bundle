@@ -3008,3 +3008,160 @@ read as violations that are not. When a pipeline enforces a limit, the limit's
 own definition is the one that counts; measuring it any other way produces
 confident false alarms, and a false alarm in an audit is worse than no alarm
 because it sends someone to fix a post that was never broken.
+
+## Headlines carried Hacker News chrome and ran past 70 characters (found 2026-11-22)
+
+The daily SEO health check for 2026-11-22 reported:
+
+```
+✅ SEO Health: All checks passed!
+```
+
+All fourteen checks did pass. The site was still publishing broken headlines.
+The 2026-11-22 Trending episode had this page title:
+
+```
+Trending: A Privacy Analysis of Web and Mobile Conversational AI Agents [pdf] (November 22, 2026)
+```
+
+— 99 characters, with the Hacker News feed's own link-type annotation in the
+middle of it. The reader sees `[pdf]`. The search engine sees a 99-character
+title. The social card shows the same thing.
+
+The same class of defect was already sitting on the site from months
+earlier: the 2026-08-05 regional trio carried `[pdf]` in both its title and
+its description, the 2026-11-16 trio carried `[video]` in its description, and
+the 2026-11-03 trio opened its description with `Launch HN:`.
+
+### What the audit could not see
+
+None of the fourteen checks asks what a headline *says*. Check [1] asks that a
+title and a description exist, check [5] asks that no two posts share a title
+verbatim, and check [10] fetches the page and confirms the tags are present
+and non-empty. A title of `Trending: … [pdf] (November 22, 2026)` passes every
+one of them: it exists, it is unique, it is non-empty.
+
+**A check that never ran is not a check.** The audit had no headline rule at
+all, so a green run said nothing about the one field that every visitor reads
+first.
+
+### Defect 1 — Hacker News chrome in the headline
+
+The HN/Algolia feed annotates a story's title with the kind of link it points
+at — `[pdf]`, `[video]`, `[image]`, `[text]`, `[url]`, `[audio]` — and prefixes
+a user-submitted post with `Ask HN:`, `Show HN:`, `Tell HN:` or `Launch HN:`.
+None of that is part of the headline.
+
+**Cause.** Every generator copied its source headline straight into the front
+matter:
+
+- `run-daily.py` — `description = (story["title"] + " — daily AI analysis from …")`
+  and `*Source: [{story['title']}]({story['url']})*` in the body;
+- `trending-topics.py` — `title = story.get("title", …)` fed the front-matter
+  title, the description and the body source link;
+- `midweek-news.py`, `weekly-roundup.py`, `quick-hits.py` — the same headline
+  into their body source links.
+
+**Measured.** 14 front-matter fields across 10 posts, and 17 occurrences in
+9 post bodies. Two of those body posts are *not* defects —
+`2026-07-06-week-in-ai-jul-2026.md` and `2026-10-17-weekend-deep-dive.md`
+quote a `[pdf]` inside prose an author wrote, and they were left alone.
+
+### Defect 2 — titles that ran past the limit, and cut mid-word
+
+**Cause.** Two separate things.
+
+The Trending series cut its headline with a blind slice:
+
+```python
+if len(title) > 70:
+    title_short = title[:67] + "..."
+```
+
+67 is not a word boundary, so every long headline shipped cut mid-word —
+`"…mobile operating systems platforms from ca..."`. Then it prefixed
+`"Trending: "` and appended the full episode date, so the published title ran
+to 75-103 characters. The 2026-11-21 episode was 103.
+
+The regional series had no ceiling at all: the LLM's title went straight into
+the front matter, and 240 of the 461 regional titles exceeded 70 characters.
+
+**Measured.** 350 of the 1411 published posts had a front-matter title longer
+than 70 characters. The front-matter `title:` is what the site renders as the
+page `<title>` and what it bakes into the Open Graph card, so every one of
+those 350 posts had a truncated title in search results and a truncated
+headline on its social card.
+
+### The fix
+
+Both rules now live in `text_utils.py`, because the generators that write the
+front matter and the audit that checks it have to agree on what a headline is.
+Two definitions drift, and the drift shows up as "the audit says clean, the
+site says otherwise" — exactly how this defect survived a green audit.
+
+- **`strip_hn_markers(title)`** removes the link-type annotation and the
+  submission prefix, and nothing else. It does not tidy whitespace: a
+  tidy-up that also collapsed a double space would make the audit's "does
+  this string contain a marker?" test impossible to trust.
+- **`clamp_title(title, max_len=70)`** caps a headline at 70 characters. The
+  cut is made at a word boundary, never mid-word; the tail may not end on a
+  function word (`… Into a Very` reads as broken copy); and a truncated title
+  ends in an ellipsis so it is visibly shortened rather than published that
+  way.
+
+The ceiling is enforced at the point the front matter is written, not asked
+for in a prompt — the same lesson the word budget taught this pipeline. A
+prompt does not hold a limit. All thirteen generators that write a front-matter
+title now clamp it, and the five that consume an HN headline strip it at the
+source, once, so every downstream use is clean.
+
+The Trending title also lost its duplicated episode date. The date is already
+in the front-matter `date:` and on the page; spending 20 of 70 characters on
+it pushed the headline itself out of view. The prefix is now a constant and
+the headline's budget is derived from it, because `"Trending: "` is ten
+characters, not nine.
+
+### The audit now checks it — check [15]
+
+`seo-health.py` gains check [15], "Checking published headlines for Hacker
+News chrome and length":
+
+- **Hacker News chrome in a front-matter title or description fails at any
+  date.** A reader sees it on the page; there is no date at which that is
+  acceptable.
+- **A title over 70 characters fails for a post published on or after
+  `TITLE_LENGTH_FIX_DATE` (2026-11-23)** and is reported as a note before it.
+  The date partition is the same shape the duplicate-metadata check uses:
+  before the ceiling was enforced the generators did not clamp, so those
+  posts are history. Failing on them would make the audit permanently red
+  and teach everyone to ignore it.
+- Meta descriptions over 160 characters are reported as a note. 167 posts
+  carry one, and most are hand-written posts the pipeline does not generate,
+  so there is no generator change that would fix them.
+
+### The repair
+
+The 10 posts carrying chrome were repaired — the annotation and the prefix
+removed from the title, the description and the body, with the headline
+itself untouched. The 2026-11-22 Trending episode was also rewritten to the
+form the fixed generator produces: no duplicated date, clamped to the ceiling.
+
+**350 legacy titles were not rewritten.** Editing a published title changes
+the Open Graph card and the manifest digest for that post, so a bulk repair is
+350 card regenerations and 350 pushes. That is a separate, deliberate
+operation, and it is reported rather than smuggled into an audit fix.
+
+### The general lesson
+
+**The audit's job is to check the things the pipeline decides.** Every defect
+here was decided by the pipeline — it copied a feed annotation into a headline
+and it cut a headline at a fixed column — and not one of them was caught,
+because the audit checked the *presence* of metadata and never its *content*.
+
+The shape of the failure is the same one this pipeline has hit three times
+now: a rule that is not written down is not enforced (the word budget), a
+limit that is not enforced in code is not held (the title ceiling), and a
+check that does not exist is not a check (headline hygiene). All three are
+fixed the same way — put the rule in code, put the code where the decision is
+made, and make the audit read the rule from the same place the generator
+reads it from.

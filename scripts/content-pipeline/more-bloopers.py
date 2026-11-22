@@ -9,6 +9,9 @@ brilliance. Different themes each run.
 
 import os, datetime, json
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
+from text_utils import clamp_title
 
 SITE_DIR = Path("/Users/amre/Projects/thesolai.github.io")
 LOG_DIR = Path("/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline/logs")
@@ -105,9 +108,16 @@ def generate_post():
 
 ---""")
 
+    # The title is published as the page <title> and the Open Graph
+    # card headline, so it is capped here rather than asked for in a
+    # prompt. See text_utils.clamp_title().
+    bloopers_title = clamp_title(
+        f"AI Bloopers: {day_name} Edition — The Most Absurd AI Fails This Week ({post_date})"
+    )
+
     full_body = f"""---
 layout: post
-title: "AI Bloopers: {day_name} Edition — The Most Absurd AI Fails This Week ({post_date})"
+title: "{bloopers_title}"
 date: {date_str}
 description: "A roundup of the most absurd, alarming, and accidentally hilarious AI failures. This week: more honest mistakes and confident nonsense. ({post_date})"
 image: /images/sol-avatar.png

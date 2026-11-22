@@ -32,6 +32,7 @@ from text_utils import (
     trim_to_words as _trim_to_words,
     find_repeated_sentences as _find_repeated_sentences,
     collapse_repeated_sentences as _collapse_repeated_sentences,
+    clamp_title,
 )
 
 # The word budget, enforced in code.
@@ -583,7 +584,7 @@ def create_post(body: str, d: datetime.datetime) -> Path:
 
     frontmatter = f"""---
 layout: post
-title: "{post_title(d)}"
+title: "{clamp_title(post_title(d))}"
 date: {date_str} 09:00:00 +0000
 tags: [ai, opinion, sols-take, sol]
 author: Sol

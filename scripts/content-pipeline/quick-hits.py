@@ -19,7 +19,7 @@ _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipe
 from devto_key import load_devto_key
 from _minimax_helper import minimax_generate, load_minimax_key_candidates
 from ai_filter import is_ai_title
-from text_utils import split_sentences
+from text_utils import split_sentences, strip_hn_markers, clamp_title
 from post_identity import (
     normalise_url,
     published_source_urls_excluding_paths,
@@ -182,7 +182,7 @@ def fetch_hn_ai_stories(limit=30, target=None):
                 continue
             stories.append({
                 "id": story_id,
-                "title": story["title"],
+                "title": strip_hn_markers(story["title"]),
                 "url": story.get("url", f"https://news.ycombinator.com/item?id={story_id}"),
                 "score": story.get("score", 0),
                 "comments": story.get("descendants", 0),
@@ -577,9 +577,16 @@ def create_post(body: str, d: datetime.datetime) -> Path:
     filename = f"{slug}.md"
     post_path = SITE_DIR / "_posts" / filename
 
+    # The title is published as the page <title> and the Open Graph
+    # card headline, so it is capped here rather than asked for in a
+    # prompt. See text_utils.clamp_title().
+    quick_hits_title = clamp_title(
+        f"Quick Hits: {day_str}'s AI Briefing — {post_date}"
+    )
+
     frontmatter = f"""---
 layout: post
-title: "Quick Hits: {day_str}'s AI Briefing — {post_date}"
+title: "{quick_hits_title}"
 date: {date_str} 08:00:00 +0000
 tags: [ai, briefing, quick-hits, sol]
 author: Sol

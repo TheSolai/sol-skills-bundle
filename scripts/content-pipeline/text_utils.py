@@ -556,3 +556,188 @@ def trim_to_word_budget(body, limit=600, floor=400):
         final.append(b)
 
     return "\n\n".join(final).strip()
+
+
+# ── Headline hygiene ───────────────────────────────────────────────────────
+#
+# WHY (2026-11-22)
+# ---------------
+# The daily SEO audit reported "✅ All checks passed!" on a site that was
+# publishing broken headlines. Two classes of defect reached the live site
+# because every generator copied its source headline straight into the front
+# matter:
+#
+# 1. Hacker News link-type markers. The HN/Algolia feed annotates a story's
+#    title with the kind of link it points at — "[pdf]", "[video]",
+#    "[image]", "[text]", "[url]", "[audio]" — and prefixes user-submitted
+#    posts with "Ask HN:", "Show HN:", "Tell HN:", "Launch HN:". Neither is
+#    part of the headline. Both are HN chrome, and both were being published
+#    verbatim: 11 markers across 7 posts in front matter, plus 3 "Launch HN:"
+#    prefixes, plus 9 posts whose body carried them too.
+#
+# 2. Runaway title length. The front-matter `title:` became the rendered
+#    `<title>` and the Open Graph card headline. The Trending series
+#    truncated the source headline at a fixed 67 characters — mid-word, with
+#    a "..." — and then added a prefix and a full date, so every episode
+#    shipped a 75-103 character title that no search result or social card
+#    shows in full. 350 of 1411 published posts exceed 70 characters.
+#
+# The rules live here, in one module, because the generators that write the
+# front matter and the audit that checks it have to agree on what a
+# headline is. Two definitions would drift, and the drift would show up as
+# "the audit says clean, the site says otherwise" — which is exactly how
+# this defect survived a green audit run.
+
+# The link types Hacker News itself annotates a story title with.
+HN_LINK_TYPES = ("pdf", "video", "image", "text", "url", "audio")
+
+# "[pdf]" and friends, as a standalone token.
+#
+# There is no positional rule that separates the annotation from a product
+# name that happens to use a bracketed word — "My [text] editor" and
+# "X [pdf] appeared on Hacker News" have the same shape. So the token
+# itself is the rule: these six words are the link types Hacker News
+# annotates a story with, and a headline is not expected to contain one.
+# Across 1411 published posts the only occurrences are the chrome itself.
+HN_MARKER_RE = re.compile(
+    r"\s*\[(?:" + "|".join(HN_LINK_TYPES) + r")\]", re.IGNORECASE
+)
+
+# "Ask HN:", "Show HN:", "Tell HN:", "Launch HN:" — a user-submitted post
+# prefix, not part of the headline.
+HN_PREFIX_RE = re.compile(
+    r"(?:Ask|Show|Tell|Launch)\s+HN\s*:\s*", re.IGNORECASE
+)
+
+# The same prefix rule, anchored to the start of a headline.
+HN_PREFIX_AT_START_RE = re.compile(
+    r"^\s*(?:Ask|Show|Tell|Launch)\s+HN\s*:\s*", re.IGNORECASE
+)
+
+
+def find_hn_markers(text):
+    """Return the Hacker News chrome found in `text`, as a list of strings.
+
+    The audit uses this to decide whether a published headline is clean. It
+    is a detector, not a diff: it reports the marker and the prefix it
+    found and leaves every other character of the headline alone.
+
+    A prefix is only chrome when it starts the headline. "Ask HN:" in the
+    middle of a sentence is prose ("we asked on Ask HN: …"), and the
+    headline it opens is the one the generator composes.
+    """
+    found = []
+    if not text:
+        return found
+    t = str(text)
+    for match in HN_MARKER_RE.finditer(t):
+        found.append(match.group(0).strip())
+    if HN_PREFIX_AT_START_RE.match(t):
+        found.append(HN_PREFIX_AT_START_RE.match(t).group(0).strip())
+    return found
+
+
+def strip_hn_markers(title):
+    """Remove Hacker News chrome from a source headline.
+
+    Strips the link-type marker ("[pdf]", "[video]", …) and the submission
+    prefix ("Show HN:", "Launch HN:", …) that the HN/Algolia feed adds to
+    story titles, and returns the headline itself.
+
+    Everything else is preserved exactly — the headline is the publisher's
+    words and only the HN annotation is removed. Nothing else is rewritten,
+    not even whitespace: a headline is not this function's to tidy, and a
+    tidy-up that silently touches a double space turns "does this string
+    contain a marker?" into an unusable diff.
+    """
+    if not title:
+        return title
+    t = str(title)
+    t = HN_PREFIX_AT_START_RE.sub("", t, count=1)
+    t = HN_MARKER_RE.sub("", t)
+    return t
+
+
+# The ceiling for a published front-matter title.
+# WHY 70 (2026-11-22): the front-matter `title:` is the rendered `<title>`
+# and the Open Graph card headline. The site layout appends " — Sol AI" to
+# it, and search engines and social platforms cut the display around
+# 60-70 characters. A 70-character ceiling keeps the whole headline inside
+# that window for the generator series, which prefixes the headline with a
+# short series label ("Trending: ", "EU AI Watch: ").
+#
+# Posts published before the ceiling was enforced are reported as residue
+# rather than rewritten in bulk — see OPERATIONS.md, "Headlines carried
+# Hacker News chrome and ran past 70 characters".
+TITLE_MAX_LENGTH = 70
+
+# Words that must not end a headline. A cut that lands on "… Turned Claude
+# and Codex Into" reads as broken copy, not as a shortened title. These are
+# articles, coordinating conjunctions, subordinators, prepositions and
+# auxiliaries — the function words that carry no meaning on their own.
+#
+# Deliberately excluded: adjectives and adverbs ("very", "already"). They
+# can be the end of a real headline, and dropping them changes meaning.
+_DANGLING_TAIL_WORDS = {
+    # articles
+    "a", "an", "the",
+    # coordinating conjunctions / subordinators
+    "and", "or", "but", "nor", "so", "yet", "that", "which", "who", "whom",
+    "whose", "while", "because", "if", "when", "where", "as", "than",
+    # prepositions
+    "in", "on", "at", "to", "of", "with", "without", "within", "for", "from",
+    "by", "into", "onto", "about", "between", "among", "through", "during",
+    "against", "after", "before", "across", "around", "over", "under",
+    # auxiliaries / copulas
+    "is", "are", "was", "were", "be", "been", "being", "am", "can", "could",
+    "will", "would", "shall", "should", "may", "might", "must", "has", "have",
+    "had", "does", "did",
+    # intensifiers — they modify the word before them and mean nothing on
+    # their own, so a headline ending in one is always a truncated headline
+    "very", "too", "quite", "rather", "really", "actually", "extremely",
+}
+
+
+def clamp_title(title, max_len=TITLE_MAX_LENGTH):
+    """Cap a headline at `max_len` characters, cutting at a word boundary.
+
+    WHY THIS EXISTS (2026-11-22): a prompt does not hold a length limit —
+    the same lesson the word budget taught this pipeline — so the ceiling
+    is enforced here, at the point the front matter is written.
+
+    The cut is made at a word boundary, never mid-word, and the resulting
+    tail is not allowed to end on a function word ("… Into a Very" reads as
+    broken copy). The word after the dropped one is not taken back to fill
+    the gap: that rebuilds the phrase the cut broke — "… But the Real Story
+    Nudification…" instead of "… But the Real Story…".
+
+    A truncated headline ends in an ellipsis so a reader — and a search
+    engine — can tell it was shortened rather than published that way.
+    """
+    if not title:
+        return title
+    t = re.sub(r"\s+", " ", str(title)).strip()
+    if len(t) <= max_len:
+        return t
+
+    # One character is reserved for the ellipsis.
+    budget = max_len - 1
+    words = t.split()
+
+    kept = []
+    for word in words:
+        if len(" ".join(kept + [word])) > budget:
+            break
+        kept.append(word)
+
+    # A headline must not end on a function word. The popped word is not
+    # eligible to be taken back below — it is exactly what is being
+    # removed, and taking the word after it would rebuild the phrase the
+    # cut broke ("… But the Real Story Nudification…").
+    while len(kept) > 2 and kept[-1].lower().strip(".,;:!?") in _DANGLING_TAIL_WORDS:
+        kept.pop()
+
+    out = " ".join(kept).rstrip(" ,;:—-–")
+    if not out:
+        return t[:max_len]
+    return out + "…"

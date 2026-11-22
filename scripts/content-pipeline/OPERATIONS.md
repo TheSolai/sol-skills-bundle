@@ -2939,3 +2939,72 @@ outright; the token-plan failure published three posts that *looked* like
 a normal day and were template filler. A series that publishes filler on a
 bad day is harder to detect than one that publishes nothing, and nothing in
 the pipeline notices either.
+
+## Counting words the wrong way reports 29 false over-budget posts (found 2026-11-22)
+
+The regional posts have a 400-600 word budget, and `run-daily.py` enforces it
+with `text_utils.trim_to_word_budget()`. That helper does **not** count the
+whole body. `budget_words()` excludes the title line, the section headings, the
+`---` dividers and the `*Source:*` line, and counts everything else. The
+trimmer is asked for `limit=WORD_LIMIT` (600) against *that* number, so a post
+whose counted body is 585 words is already compliant and is left alone.
+
+**Counting the body with `len(body.split())` instead gives a different, larger
+number**, because it includes all the excluded lines. Measured across the 385
+published regional posts, the two measures differ by 6 to 120 words, 35 on
+average. The consequence is that a naive count reports posts as over budget
+that the pipeline considers compliant:
+
+| measure | posts counted over 600 |
+|---|---|
+| `len(body.split())` | 43 |
+| `budget_words()` (the real one) | 14 |
+
+**29 of those 43 are false alarms** — posts that are over 600 by the naive count
+and inside 600 by the measure the pipeline actually enforces. The 14 genuine
+violations are all from **2026-11-06 or earlier**, i.e. from before the trimmer
+landed (`f89f143`, 2026-11-06 08:51); every regional post published since has
+been inside the budget.
+
+The trimmer's own log line is in the same trap and cannot be read as a word
+count either:
+
+```
+[us] Trimmed 709 -> 611 words
+```
+
+That `611` is `len(trimmed.split())` — the naive count of the trimmed body,
+which is over 600 while the post the trimmer produced is inside the budget on
+the measure that counts. (The published file counts 624 naively rather than
+611 because the `*Source:*` line is appended after the trim.) The published
+2026-11-10 US post measures 624 naive / **599 budget** — compliant. The four
+trims the pipeline has actually performed (2026-11-10 uk/eu/us, 2026-11-12 uk)
+all produced compliant posts: 585, 599 and 585.
+
+### How to measure a published regional post
+
+Use the pipeline's own helper, on the body only:
+
+```python
+import sys; sys.path.insert(0, "scripts/content-pipeline")
+from text_utils import split_blocks, classify_blocks, budget_words
+body = open(path, encoding="utf-8").read().split("---", 2)[2]   # drop front matter
+blocks = split_blocks(body)
+print(budget_words(blocks, classify_blocks(blocks)))
+```
+
+`budget_words()` is the same function the trimmer enforces against, so the
+number it returns is comparable with the budget. Two more things to keep in
+mind when comparing: the measure excludes the front matter (a post's
+front-matter `description` is not body text), and the trimmed body is what is
+published, so measure the file on disk rather than the model's raw output.
+
+### The general lesson
+
+**A budget enforced by code has to be audited with that code.** The number the
+trimmer enforces against and the number a person counts by hand are not the
+same number, and the gap is larger than the slack in the band — 29 posts
+read as violations that are not. When a pipeline enforces a limit, the limit's
+own definition is the one that counts; measuring it any other way produces
+confident false alarms, and a false alarm in an audit is worse than no alarm
+because it sends someone to fix a post that was never broken.

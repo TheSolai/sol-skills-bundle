@@ -11,5 +11,19 @@
     "_added": true,
     "_added_at": "2026-08-09T08:00:00",
     "_note": "Added to Prompt Loops as #303030 on 2026-08-09. Manual addition because bloopers-refresh.py regex was broken (categories on multi-line spans, didn't match). See git log for fix."
+  },
+  {
+    "title": "The Chatbot That Made Up a Refund Policy",
+    "category": "broken-automation",
+    "emoji": "\u2699\ufe0f",
+    "category_label": "Broken Automation",
+    "tag": "Automation",
+    "what_happened": "In November 2022, Jake Moffatt's grandmother died, so he asked Air Canada's website chatbot whether he could fly first and apply for a bereavement discount afterwards. The chatbot said yes \u2014 as long as he applied within 90 days of the ticket date. He bought full-price tickets to Toronto and back, $1,630.36, then asked for the refund when he got home. Air Canada refused, and admitted the chatbot had given him 'misleading words.'",
+    "why_funny": "Air Canada's lawyers then told the tribunal the chatbot was 'a separate legal entity responsible for its own actions' \u2014 as though the airline had outsourced its customer service to some other company. It had not. It had just written the chatbot.",
+    "source": "Moffatt v. Air Canada, 2024 BCCRT 149 \u2014 <a href=\"https://www.cbc.ca/news/canada/british-columbia/air-canada-chatbot-1.7116416\" target=\"_blank\" rel=\"noopener\">CBC News on the ruling \u2192</a>",
+    "featured": false,
+    "_added": true,
+    "_added_at": "2026-11-22T09:29:42.679199",
+    "_note": "Added as #101010 to Broken Automation on 2026-11-22"
   }
 ]

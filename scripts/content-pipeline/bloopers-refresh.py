@@ -17,10 +17,13 @@ Crontab (weekly, Sunday 8am UK):
     0 8 * * 0 cd /Users/amre/Projects/sol-skills-bundle && python3 scripts/content-pipeline/bloopers-refresh.py >> logs/sol-bloopers.log 2>&1
 
 Notes:
-  - Card numbers are 6-digit decorative (e.g. #303030, #313131). The script
-    does NOT renumber existing cards — it only assigns a number to the new
-    card by finding the highest existing blooper-num and incrementing.
-  - Card title/count "29 Real Fails" in the page meta tags is updated to the
+  - Card numbers are 6-digit decorative (e.g. #383838). Every run re-numbers
+    all cards sequentially in document order (01, 02, ... N) so the numbers
+    read top-to-bottom down the page.
+  - A new card is appended at the END of its category grid, never nested
+    inside another card. Each run also lifts any card that a previous run
+    left nested inside a sibling card.
+  - Card title/count "37 Real Fails" in the page meta tags is updated to the
     new total.
 """
 
@@ -144,21 +147,204 @@ def save_queue(queue):
         json.dump(queue, f, indent=2)
 
 
-def find_next_card_number(content):
-    """Find the highest existing blooper-num and return the next 6-digit format.
+DIV_TAG_RE = re.compile(r"<div\b[^>]*>|</div>")
+CLASS_ATTR_RE = re.compile(r'class="([^"]*)"')
+NUM_SPAN_RE = re.compile(r'<span class="blooper-num">#(\d{6})</span>')
 
-    Card numbers are 6-digit decorative (e.g. #303030). Pattern is XXYYXX where
-    XX=YY=card_num, repeated for the first 19 cards. For 20+, format is XXYYZZ
-    (last pair differs). We follow the simple XXYYXX pattern for new cards to
-    keep numbering predictable.
+
+def _tag_classes(tag_text):
+    """The class attribute of an opening tag."""
+    m = CLASS_ATTR_RE.search(tag_text)
+    return m.group(1) if m else ""
+
+
+def find_matching_div_end(text, from_pos):
+    """Return (start, end) of the </div> that closes the div opened before from_pos.
+
+    `from_pos` is the position just after that div's opening tag, so the
+    element is already open when the scan starts and the depth starts at 1.
     """
-    nums = re.findall(r'<span class="blooper-num">#(\d{6})</span>', content)
-    if not nums:
-        return "#010101"
-    # Strip to leading 2 digits (the canonical card position)
-    max_pos = max(int(n[:2]) for n in nums)
-    next_pos = max_pos + 1
-    return f"#{next_pos:02d}{next_pos:02d}{next_pos:02d}"
+    depth = 1
+    for m in DIV_TAG_RE.finditer(text, from_pos):
+        if m.group(0).startswith("</"):
+            depth -= 1
+            if depth == 0:
+                return m.start(), m.end()
+        else:
+            depth += 1
+    return None
+
+
+def _sort_children(el):
+    el["children"].sort(key=lambda c: c["start"])
+    for child in el["children"]:
+        _sort_children(child)
+
+
+def _parse_div_children(text, start, end):
+    """Parse the divs directly inside text[start:end] into a tree of dicts.
+
+    Every node carries its absolute offsets in `text`, its class list and its
+    child divs — so a card can be re-emitted byte for byte, minus any card
+    that was nested inside it.
+    """
+    children = []
+    stack = []
+    for m in DIV_TAG_RE.finditer(text, start, end):
+        if m.group(0).startswith("</"):
+            if not stack:
+                continue
+            el = stack.pop()
+            el["end"] = m.end()
+            if stack:
+                stack[-1]["children"].append(el)
+            else:
+                children.append(el)
+        else:
+            stack.append({
+                "cls": _tag_classes(m.group(0)),
+                "start": m.start(),
+                "open_end": m.end(),
+                "end": None,
+                "children": [],
+            })
+    for el in children:
+        _sort_children(el)
+    return children
+
+
+def _descendant_cards(el):
+    """Cards nested inside `el` whose nearest card ancestor is `el`."""
+    out = []
+    for child in el["children"]:
+        if "blooper-card" in child["cls"]:
+            out.append(child)
+        else:
+            out.extend(_descendant_cards(child))
+    return out
+
+
+def _all_cards(el):
+    """`el` plus every card nested inside it, in reading order."""
+    out = [el]
+    for card in _descendant_cards(el):
+        out.extend(_all_cards(card))
+    return out
+
+
+CARD_INDENT = "                    "
+
+
+def _emit_card(parts, markup):
+    """Append a card's markup so it starts on its own line at the card indent."""
+    if parts:
+        # Drop the indentation the previous card left on its last line, so no
+        # whitespace-only line survives in the file.
+        parts[-1] = re.sub(r"[ \t]+(?=\n|$)", "", parts[-1])
+        if not parts[-1].endswith("\n"):
+            parts.append("\n")
+        parts.append(CARD_INDENT)
+    parts.append(markup)
+
+
+def _card_markup_without_nested(text, el):
+    """`el`'s markup with any card nested inside it removed."""
+    nested = _descendant_cards(el)
+    if not nested:
+        return text[el["start"]:el["end"]]
+    parts = []
+    cursor = el["start"]
+    for card in nested:
+        # The card was written straight after the previous tag, so drop the
+        # indentation it left behind.
+        parts.append(text[cursor:card["start"]].rstrip())
+        cursor = card["end"]
+    parts.append(text[cursor:el["end"]])
+    return "".join(parts)
+
+
+def _card_order_key(text, el):
+    """Sort key: the card's existing number, so cards keep their age order."""
+    m = NUM_SPAN_RE.search(text[el["start"]:el["end"]])
+    return int(m.group(1)[:2]) if m else 999
+
+
+def repair_nested_cards(content):
+    """Rebuild every blooper-grid so each card is a direct child of its grid.
+
+    Older versions of insert_card_into_category() matched the first
+    "</div></div>" after a grid opened, so a new card landed inside the
+    previous card's body instead of after it. Six cards were left that way
+    by the 2026-10-28 dedupe. This lifts every card back out to be a direct
+    child of its grid, oldest first, and puts each one on its own line at
+    the card indent — so the numbers read in order and the next insert
+    lands cleanly.
+
+    Returns (new_content, repaired_card_count).
+    """
+    repaired = 0
+    grid_re = re.compile(r'<div\b[^>]*class="[^"]*blooper-grid[^"]*"[^>]*>')
+    while True:
+        changed = False
+        for grid_match in reversed(list(grid_re.finditer(content))):
+            open_end = grid_match.end()
+            close = find_matching_div_end(content, open_end)
+            if not close:
+                continue
+            close_start, _ = close
+            roots = _parse_div_children(content, open_end, close_start)
+            top_cards = [r for r in roots if "blooper-card" in r["cls"]]
+            if not top_cards:
+                continue
+
+            nested = [c for r in top_cards for c in _descendant_cards(r)]
+            parts = []
+            cursor = open_end
+            for card in top_cards:
+                parts.append(content[cursor:card["start"]])
+                ordered = sorted(
+                    _all_cards(card),
+                    key=lambda c: _card_order_key(content, c),
+                )
+                for nested_card in ordered:
+                    _emit_card(
+                        parts,
+                        _card_markup_without_nested(content, nested_card),
+                    )
+                cursor = card["end"]
+            parts.append(content[cursor:close_start])
+
+            new_inner = "".join(parts)
+            if new_inner == content[open_end:close_start]:
+                continue
+            content = content[:open_end] + new_inner + content[close_start:]
+            repaired += len(nested)
+            changed = True
+            break
+        if not changed:
+            break
+    return content, repaired
+
+
+def renumber_cards(content):
+    """Re-number every card sequentially in document order (01, 02, ... N)."""
+    counter = {"n": 0}
+
+    def _replace(_match):
+        counter["n"] += 1
+        n = counter["n"]
+        return f'<span class="blooper-num">#{n:02d}{n:02d}{n:02d}</span>'
+
+    return NUM_SPAN_RE.sub(_replace, content), counter["n"]
+
+
+def find_card_number_for_title(content, title):
+    """The number now shown on the card with this title."""
+    idx = content.find(f'<h3 class="blooper-title">{title}</h3>')
+    if idx == -1:
+        return None
+    nums = NUM_SPAN_RE.findall(content[:idx])
+    return f"#{nums[-1]}" if nums else None
 
 
 def get_category_emoji_for_label(content, category_label):
@@ -211,22 +397,41 @@ def blooper_card_html(blooper, card_num):
 
 
 def insert_card_into_category(content, category_label, card_html):
-    """Insert a new card into the given category, before the blooper-grid closing div.
+    """Append a card to the END of a category's blooper-grid.
+
+    The old version matched the first "</div></div>" after the grid opened.
+    That is the closing pair of the FIRST card in the grid, so the new card
+    was written inside that card's body instead of after it — which is how
+    six cards ended up nested in their siblings. This finds the grid that
+    follows the category title and inserts just before the grid's own
+    closing tag.
 
     Returns (new_content, success).
     """
-    # Find the category block: <div class="category">...<category-title>X</category-title>...<div class="blooper-grid">...cards...</div></div>
-    # We'll insert right before the closing </div> of the blooper-grid.
-    # Strategy: locate the category's blooper-grid block, find its last </div>, insert before.
-
-    # Build a regex to capture the category block
-    cat_pattern = rf'(<div class="category">\s*<div class="category-header">\s*<span class="category-emoji">[^<]+</span>\s*<span class="category-title">{re.escape(category_label)}</span>.*?<div class="blooper-grid">)(.*?)(\s*</div>\s*</div>)'
-    m = re.search(cat_pattern, content, re.DOTALL)
-    if not m:
+    title_match = re.search(
+        rf'<span class="category-title">{re.escape(category_label)}</span>', content
+    )
+    if not title_match:
         return content, False
-    before, cards, after = m.group(1), m.group(2), m.group(3)
-    new_section = before + cards + card_html + after
-    new_content = content[:m.start()] + new_section + content[m.end():]
+
+    grid_match = re.search(
+        r'<div\b[^>]*class="[^"]*blooper-grid[^"]*"[^>]*>',
+        content[title_match.end():],
+    )
+    if not grid_match:
+        return content, False
+
+    open_end = title_match.end() + grid_match.end()
+    close = find_matching_div_end(content, open_end)
+    if not close:
+        return content, False
+
+    close_start, _ = close
+    head = content[:close_start]
+    # Drop the indentation that preceded the grid's own closing tag, so the
+    # new card lands on its own line at the card indent.
+    head = head.rstrip(" \t")
+    new_content = head + "\n" + card_html + content[close_start:]
     return new_content, True
 
 
@@ -317,6 +522,13 @@ def main():
         return
     with open(BLOOPERS_FILE, encoding="utf-8") as f:
         content = f.read()
+    original = content
+
+    # Lift any card a previous run left nested inside a sibling card, so the
+    # grid we insert into is well-formed and the new card lands as a sibling.
+    content, repaired = repair_nested_cards(content)
+    if repaired:
+        print(f"  🔧 Lifted {repaired} card(s) out of a sibling card's body.")
 
     queue = load_queue()
     # Filter out already-added (committed) entries
@@ -337,6 +549,17 @@ def main():
     if not available:
         print("  ⚠️  Every blooper available to this run is already published — nothing to add.")
         print("      Add new ones to _data/bloopers-queue.json to resume this series.")
+        if content == original:
+            return
+        # The repair still has work to publish — save and push it on its own.
+        if dry_run:
+            print("  [DRY RUN — not saved]")
+            return
+        with open(BLOOPERS_FILE, "w", encoding="utf-8") as f:
+            f.write(content)
+        print("  Saved. bloopers.html repaired.")
+        if not no_push:
+            commit_and_push(f"Bloopers: repair card layout ({now:%Y-%m-%d})")
         return
 
     to_add = available[:count_arg]
@@ -345,10 +568,10 @@ def main():
     current_count = count_cards(content)
     print(f"  Current blooper count: {current_count}")
 
+    added = []
     for i, blooper in enumerate(to_add):
         category_label = blooper.get("category_label", "")
-        card_num = find_next_card_number(content)
-        card_html = blooper_card_html(blooper, card_num)
+        card_html = blooper_card_html(blooper, "#000000")
 
         new_content, inserted = insert_card_into_category(content, category_label, card_html)
         if not inserted:
@@ -363,10 +586,20 @@ def main():
         if not count_ok:
             print(f"  ⚠️  Could not find category-count for '{category_label}'")
 
-        print(f"  ✅ Added {card_num}: {blooper['title']} → {category_label}")
+        added.append(blooper)
         blooper["_added"] = True
         blooper["_added_at"] = now.isoformat()
-        blooper["_note"] = f"Added as {card_num} to {category_label} on {now:%Y-%m-%d}"
+
+    # Re-number every card sequentially in document order, so the numbers on
+    # the page always read 01, 02, ... N from top to bottom.
+    content, total_cards = renumber_cards(content)
+    if total_cards:
+        print(f"  Cards re-numbered: 01 → {total_cards:02d} in document order")
+
+    for blooper in added:
+        card_num = find_card_number_for_title(content, blooper["title"])
+        blooper["_note"] = f"Added as {card_num} to {blooper.get('category_label', '')} on {now:%Y-%m-%d}"
+        print(f"  ✅ Added {card_num}: {blooper['title']} → {blooper.get('category_label', '')}")
 
     # Update page totals to reflect new count
     new_count = count_cards(content)

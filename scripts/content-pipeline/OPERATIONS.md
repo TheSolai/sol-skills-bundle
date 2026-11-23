@@ -48,7 +48,9 @@ cause of the same-day regional duplicates. Everything else has moved to
 launchd: `ai.sol.quick-take` (Tue 12:30), `ai.sol.trending-topics` (09:00
 and 13:00), `ai.sol.midweek-news` (Wed 07:00), `ai.sol.more-bloopers` (Wed
 11:00), `ai.sol.case-study` (Fri 09:00), `ai.sol.bloopers-refresh` (Sun
-08:00), `ai.sol.seo-health` (daily 08:00). Re-read the crontab and
+08:00), `ai.sol.seo-health` (daily **10:00**, corrected 2026-11-23 — the
+plist says `Hour 10`, not 08:00; looking for an 08:00 SEO report finds
+nothing and reads as a failed job). Re-read the crontab and
 `~/Library/LaunchAgents` before trusting this table.
 
 **"Gone from the crontab" does not mean gone (corrected 2026-11-16).** The
@@ -3165,3 +3167,31 @@ check that does not exist is not a check (headline hygiene). All three are
 fixed the same way — put the rule in code, put the code where the decision is
 made, and make the audit read the rule from the same place the generator
 reads it from.
+
+## The regional trio publishes three posts a day, not one (verified 2026-11-23)
+
+The `sol-daily-content` cron task's own description says the rotation is
+"UK Mon/Sat, EU Wed/Sun, US Tue/Thu/Fri". **The code does not rotate.**
+`run-daily.py` writes `regions = ["uk", "eu", "us"]` — all three, every
+day, as three angles on one story. `UK AI Weekly`, `EU AI Watch` and
+`US AI Pulse` are three *series names*, not three weekday slots, and each
+one publishes daily.
+
+Verified 2026-11-23 against the published archive: 2026-11-21, 2026-11-22
+and 2026-11-23 each carry a `uk-`, `eu-` and `us-` post, and the launchd
+run at 07:10 logged all three being written before the 08:00 cron ran. The
+same fact is in the commit message of `f448bb7` ("the trio publishes three
+real posts every day") but not in this file's body, which is why a reader
+of the cron prompt can believe a region is missing on a given weekday.
+
+**Why it matters:** a weekday rotation that does not exist in the code is a
+false alarm waiting to happen. "Wednesday should be EU only, and I see a UK
+post" is not a defect — it is the design. Conversely, a *missing* region on
+any day is a real defect, and the check for it is the existence of all three
+`{date}-{uk,eu,us}-` posts, not a weekday lookup.
+
+The `find_post_for_region()` existence check keys on **date + region**, so a
+re-run of the 08:00 cron after the 07:10 launchd job is a clean no-op for
+all three regions — it does not need the weekday to agree. See "One SSL
+timeout cost a whole day of regional posts" for the run lock that keeps the
+two schedulers from both writing.

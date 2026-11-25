@@ -46,6 +46,43 @@ SOURCE_URL_PATTERNS = (
     re.compile(r"\*Source:\s*\[[^\]]*\]\(([^)]+)\)"),
 )
 
+# A Markdown link target that may contain BALANCED parentheses.
+#
+# WHY (2026-11-25): the patterns above capture `([^)]+)` — everything up to
+# the FIRST closing parenthesis. A URL that legitimately contains a
+# parenthesis was therefore truncated:
+#
+#   https://.../20260916-Prompt-like-a-butterfly-sting-like-a-tracker-(clean).pdf
+#   -> captured as "...-tracker-(clean"
+#
+# The captured string is not the URL. `normalise_url()` cannot match it
+# against the same story fetched from Hacker News, so the archive never
+# recognised a story it had already published — and the trending series,
+# whose dedupe is built on exactly this comparison, republished the same
+# Hacker News PDF every morning for four consecutive days. Four posts
+# shared one title and one body, and four copies of one article were on
+# the live site under four URLs.
+#
+# CommonMark permits unescaped parentheses in a link destination only when
+# they are balanced, so one level of nesting is the most that can be
+# captured correctly.
+#
+# The singular `source_url()` deliberately keeps the old pattern. The SEO
+# audit keys its republication families on that single value, and widening
+# it changes which posts the audit groups together — a separate change with
+# its own blast radius, which the audit's own repair script consumes. Only
+# the plural, dedupe-facing helper is widened here.
+SOURCE_LINK_TARGET = r"((?:[^()\n]|\([^()\n]*\))+)"
+
+
+# The dedupe-facing twin of SOURCE_URL_PATTERNS. `source_urls()` uses these
+# instead, so only the helper the generators ask "have I covered this
+# story?" is affected.
+SOURCE_URL_PATTERNS_DEDUPE = (
+    re.compile(r"\*\*Source story:\*\*\s*\[[^\]]*\]\(" + SOURCE_LINK_TARGET + r"\)"),
+    re.compile(r"\*Source:\s*\[[^\]]*\]\(" + SOURCE_LINK_TARGET + r"\)"),
+)
+
 # Additional formats that a story can be cited in, used by the DEDUPE path
 # only — see `source_urls()`.
 #
@@ -73,13 +110,15 @@ SOURCE_URL_PATTERNS = (
 # blast radius, that the audit's own repair script consumes.
 SOURCE_URL_PATTERNS_EXTRA = (
     # The weekly roundup's story list.
-    re.compile(r"\[Read more →\]\(([^)]+)\)"),
+    re.compile(r"\[Read more →\]\(" + SOURCE_LINK_TARGET + r"\)"),
 )
 
 # A "## Sources" section: a heading of any level whose text is "Sources",
 # followed by bullet links until the next heading of the same or higher level.
 SOURCES_HEADING_RE = re.compile(r"^(#{1,6})\s*Sources\s*$", re.MULTILINE)
-SOURCES_BULLET_RE = re.compile(r"^\s*[-*+]\s+\[[^\]]*\]\((https?://[^)\s]+)\)")
+SOURCES_BULLET_RE = re.compile(
+    r"^\s*[-*+]\s+\[[^\]]*\]\((https?://(?:[^()\s]|\([^()\s]*\))+)\)"
+)
 ANY_HEADING_RE = re.compile(r"^(#{1,6})\s+")
 
 
@@ -168,10 +207,14 @@ def source_urls(text):
     "## Sources" bullets — the two formats the original two patterns missed,
     which left the dedupe blind to most of the archive. See
     SOURCE_URL_PATTERNS_EXTRA for the full account.
+
+    The patterns used here capture a BALANCED parenthesis group, so a URL
+    that contains parentheses survives intact. The singular `source_url()`
+    still stops at the first ")" on purpose — see SOURCE_LINK_TARGET.
     """
     out = []
     seen = set()
-    for pattern in SOURCE_URL_PATTERNS + SOURCE_URL_PATTERNS_EXTRA:
+    for pattern in SOURCE_URL_PATTERNS_DEDUPE + SOURCE_URL_PATTERNS_EXTRA:
         for m in pattern.finditer(text):
             url = m.group(1).strip()
             if url and url not in seen:

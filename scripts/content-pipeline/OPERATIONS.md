@@ -3411,3 +3411,128 @@ assuming GitHub is down.
 Sol's Take post carries `date: 2026-11-25 09:00:00 +0000`) **will** be
 built and published — it is not a future-date exclusion. Do not treat a
 post's 09:00 date as the reason it 404s.
+
+## A URL with a parenthesis in it was invisible to the dedupe (found 2026-11-25)
+
+**The rule:** every pattern that reads a source URL captured `([^)]+)` —
+everything up to the FIRST closing parenthesis. A URL that legitimately
+contains a parenthesis was therefore truncated, and the truncated string is
+not the URL:
+
+```
+https://.../20260916-Prompt-like-a-butterfly-sting-like-a-tracker-(clean).pdf
+-> captured as "...-tracker-(clean"
+```
+
+`normalise_url()` cannot match a truncated string against the same story as
+it appears in the Hacker News feed, so the archive never recognised a story
+it had already published. Every generator that asks "have I covered this
+story?" was asking about a URL that could never match.
+
+**The measured consequence:** the trending series republished ONE Hacker
+News PDF every morning for four consecutive days — 2026-11-22, 11-23, 11-24
+and 11-25. All four posts carried the same title, the same body and the
+same source line, and all four were live under four different URLs. The
+daily SEO audit reported them as duplicate content and as duplicate
+metadata ("4 post(s) share a title with another post published since
+2026-10-31 ... a generator has regressed and is publishing a fixed title
+again").
+
+Seven source URLs in the whole archive were affected: the four trending
+posts, plus the three regional angles of the 2026-08-05 "There Will Come
+Soft Rains" PDF, which carries the same defect. The other 858 source URLs
+in the archive were unaffected.
+
+**How it was fixed:** `source_urls()` now captures a balanced parenthesis
+group, and so do the roundup's "[Read more →]" links and the analysis
+posts' "## Sources" bullets. `source_url()` — the singular helper — is
+deliberately left alone: the SEO audit keys its republication families on
+that value, and widening it would change which posts the audit groups
+together. The asymmetry is pinned by a test so it stays a decision rather
+than an accident.
+
+Regression tests: `scripts/content-pipeline/test_paren_url_dedupe.py` (9
+checks). The fix was verified against the whole archive: 865 source URLs
+before, 865 after, with exactly 7 changed — the 7 that had been truncated.
+
+**The companion change:** with the dedupe working, the trending series had
+nothing to publish. The candidate list is ordered by points, not by date, so
+an unbounded query is all-time: 1,146 stories, every one of them already
+covered. The series went silent instead of repeating itself — honest, but
+empty. `TRENDING_WINDOW_DAYS = 7` bounds the query to the last week, which
+on 2026-11-25 held 11 candidates, 6 of them uncovered. "Trending" now means
+trending, and the series still says something.
+
+**The general lesson:** a dedupe key is only as good as the parser that
+extracts it, and a parser that silently returns a *near miss* is worse than
+one that returns nothing — it makes the dedupe look like it is working.
+When a key is compared as a string, check that the extracted string is
+actually the key and not a prefix of it. A URL is not a prefix of itself.
+
+## The Pages deploy was racing its own artifact upload (fixed 2026-11-25)
+
+**The rule:** `actions/deploy-pages` finds the `github-pages` artifact by
+NAME through the run-artifacts listing API, and that listing is eventually
+consistent. When the upload and the deploy ran back to back in ONE job,
+the lookup intermittently came back empty for an artifact that had been
+finalised a fraction of a second earlier:
+
+```
+09:02:07.595  Artifact github-pages has been successfully uploaded!
+              Artifact ID is 15007285346
+09:02:08.135  Found 0 artifact(s)
+##[error]No artifacts named "github-pages" were found for this workflow run.
+```
+
+The artifact existed — the REST API listed it afterwards — so the upload
+was never the problem. This is the known race in
+[actions/deploy-pages#451](https://github.com/actions/deploy-pages/issues/451).
+
+**The measured consequence:** 10 of the last 40 deploys failed this way
+(25%). Every one of them left that push's post unpublished until a later
+push happened to deploy successfully. The 2026-11-25 Trending post was a
+404 on the live site for an hour for exactly this reason. GitHub's status
+page was fully operational throughout — this is not an outage, and waiting
+for GitHub to recover does not fix it.
+
+**How it was fixed:** the workflow now uploads in a `build` job and
+publishes in a separate `deploy` job that `needs` it. The job boundary
+puts seconds between the upload and the lookup instead of milliseconds,
+which is the fix the upstream issue recommends and the layout GitHub's own
+Pages starter workflows use. The `deploy` job also probes the artifact list
+before deploying, and never fails if the probe times out — it only delays.
+
+The `deploy` job uploads nothing. That is what makes a retry safe:
+re-running a failed deploy can never leave a second `github-pages` artifact
+on the run, so it cannot fail with "Multiple artifacts named ...".
+
+Verified 2026-11-25 (site repo commit `3594abc0`): the upload finalised at
+10:18:44.496, the deploy job started at 10:18:53, the probe found the
+artifact on attempt 1, and `deploy-pages` logged "Found 1 artifact(s)" and
+succeeded. The gap went from ~30ms to ~11 seconds.
+
+**How to apply:** a Pages deploy that fails with "Found 0 artifact(s)" or
+"No artifacts named \"github-pages\"" is NOT a content problem and NOT
+necessarily a GitHub outage. Check the run log for the upload line first —
+if it says "Artifact github-pages has been successfully uploaded!", the
+upload worked and the lookup was the problem. Do not regenerate the post
+and do not hunt for a Jekyll bug.
+
+**Two traps that look identical and are not:** the concurrent-rerun trap
+above produces the same error message by a different route — the "Delete a
+stale Pages artifact" step deleting an artifact a concurrent attempt had
+just uploaded. The two are told apart by the attempt number: 9 of the 10
+failures on 2026-11-22..25 were on attempt 1, where no concurrent attempt
+could have interfered. A failure on attempt 1 is the race; a failure after
+a rerun is the concurrency trap.
+
+**A note on validating workflow changes:** GitHub rejects an invalid
+workflow file at parse time, and the run fails with no jobs at all and a
+single annotation on the run page. A job-level `url:` key is one such
+rejection ("Unexpected value 'url'"), even though the surrounding YAML
+parses cleanly. `actionlint` catches this locally and reproduces GitHub's
+message exactly — install it with `go install
+github.com/rhysd/actionlint/cmd/actionlint@latest` and run it against the
+workflow before publishing. Do not spend a deploy cycle discovering that
+the file does not parse.
+

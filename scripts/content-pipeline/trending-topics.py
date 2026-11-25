@@ -28,6 +28,16 @@ LOG_FILE = LOG_DIR / "trending-topics.log"
 
 HN_ALGOLIA = "https://hn.algolia.com/api/v1/search"
 
+# How far back the trending series looks for a story, in days.
+#
+# WHY (2026-11-25): the candidate list is ordered by points, not by date.
+# An unbounded query is a list of all-time top AI-agent stories, and once
+# the source-URL dedupe started working every one of them was already in
+# the archive — so the series went silent instead of repeating itself.
+# A week keeps the series saying something true: the story is recent,
+# and "trending" means trending.
+TRENDING_WINDOW_DAYS = 7
+
 COMMENTARY_TEMPLATES = [
     """The story here is what happens {headline_topic} meets the mainstream. The reaction reveals more than the news itself.
 
@@ -94,12 +104,28 @@ def fetch_top_story(covered_urls=None):
     caught a fraction of them. The stable key is the source URL, so that is
     what is matched on here, and the next uncovered story in the results
     is taken instead.
+
+    WHY the window is limited to the last 7 days (2026-11-25): the
+    candidate list is ordered by points, not by date, so an unbounded
+    query is a list of all-time top AI-agent stories. Once the dedupe
+    started working, every one of those old stories was already covered
+    and the series had nothing to say — it went silent rather than
+    repeating itself, which is honest but empty. Bounding the query to a
+    week makes the series publish a story people can still read about,
+    and keeps "trending" true.
+
+    When every story in the window is already covered, this returns None
+    and the caller publishes nothing. That is the intended outcome: a
+    second post on a story the archive already has is duplicate content,
+    and the SEO audit reports it as such.
     """
+    window_days = TRENDING_WINDOW_DAYS
+    cutoff = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - window_days * 86400
     params = {
         "query": "AI agent",
         "tags": "story",
-        "numericFilters": "points>30",
-        "hitsPerPage": 30,
+        "numericFilters": f"points>30,created_at_i>{cutoff}",
+        "hitsPerPage": 50,
     }
     url = HN_ALGOLIA + "?" + urllib.parse.urlencode(params)
     try:

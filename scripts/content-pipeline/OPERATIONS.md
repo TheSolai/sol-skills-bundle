@@ -882,6 +882,64 @@ The hardened prompt also helps on its own. A fresh generation after the
 prompt change came in at **787 words**, inside the brief, with no condensing
 needed at all.
 
+## The Monday Deep Dive has never written anything (found 2026-11-23)
+
+`deep-dive.py` is the Monday long-form series. It contains **no LLM call at
+all** — zero references to minimax or MiniMax, and the only helper it imports is
+`text_utils.clamp_title`. What it does is interpolate a topic string into a
+hardcoded body and publish it.
+
+The comment at `deep-dive.py:74` — "Build a structured template — content will
+be filled by LLM (with fallback)" — describes a step that does not exist.
+There is no fill step and no fallback branch: the template *is* the post.
+
+The topic is not trending either. The docstring promises "Picks a trending AI
+topic from the past week" and "Weekly long-form analysis (1500-2500 words)",
+but `deep-dive.py:67` picks
+`TOPICS[today.timetuple().tm_yday % len(TOPICS)]` from a static bank of ten and
+never fetches HN at all (the `urllib.request` import is unused for stories).
+The published body is **575-587 words**, not 1500-2500.
+
+The result: **every Monday Deep Dive ever published is the same template** with
+only the topic string changed. All six are byte-identical after substituting
+the topic:
+
+```
+2026-10-05-memory-and-context-how-agents-actually-work.md           (575)
+2026-10-12-ai-regulation-that-actually-works-and-what-doesn't.md    (579)
+2026-10-26-multimodal-models-and-the-end-of-text-only-ai.md           (579)
+2026-11-09-compute-concentration-the-new-bottleneck-for-ai.md         (575)
+2026-11-16-frontier-model-scaling-laws-and-what-happens-when.md      (587)
+2026-11-23-the-economics-of-ai-bubbles-busts-and-breakthrough.md      (579)
+```
+
+They are all live, and they are six near-duplicates of each other on a site
+whose own SEO audit checks for duplicate content.
+
+To detect them:
+
+```
+grep -l "This week's deep dive takes a comprehensive look at" _posts/*.md
+```
+
+The template also ships a typo — "sort the wheat **from from** the chaff" at
+`deep-dive.py:140` — which is live on all six pages.
+
+The working implementation already exists in the sibling script:
+`weekend-deep-dive.py` (Saturday) calls MiniMax, grounds the piece in real HN
+comments and dev.to articles, and enforces the 600-800 word band with a
+condense/trim/abort ladder. `deep-dive.py` should port that path rather than
+grow a second one.
+
+Unlike the other generators, `deep-dive.py` has no `existing_post_is_degraded()`
+check either (`quick-hits.py`, `run-daily.py`, `sols-take.py` and
+`weekend-deep-dive.py` all have one), so a degraded Monday post cannot be
+regenerated in place.
+
+Two of the eight Mondays since the series began — 2026-10-19 and 2026-11-02 —
+have no post and no logged run at all. Nothing was written and nothing was
+logged, so those gaps are invisible in the logs.
+
 ## A generator's word budget is a prompt instruction, not a constraint
 
 `run-daily.py` used to ask for 400-600 words and not enforce it — there was
@@ -2942,6 +3000,93 @@ a normal day and were template filler. A series that publishes filler on a
 bad day is harder to detect than one that publishes nothing, and nothing in
 the pipeline notices either.
 
+## The SEO audit passed green on a day with four missing posts (found 2026-11-21)
+
+`seo-health.py` is the one job that *could* have caught a hole in a daily
+series, and it audits only what is already published. Its 14 checks validate
+front matter, OG images, canonicals, duplicates, infrastructure, nav, CSS
+inclusion, internal links, generator metadata, the live sitemap and feed, and
+that the newest post is deployed. **Not one of them asks whether a series
+published on a given day.** So on 2026-11-21 it reported
+
+```
+✅ SEO Health: All checks passed!
+```
+
+on a site where **four posts for 2026-11-20 do not exist**: the three regional
+posts (uk/eu/us) and the Friday Quick Hits post. The live sitemap goes from
+2026-11-19 straight to 2026-11-21 in the regional series, and
+`https://thesolai.github.io/blog/2026/11/20/quick-hits-friday/` returns 404.
+
+### One cause, two schedulers, and one plist key
+
+The Mac booted at **12:22:21 on 2026-11-20** (`sysctl -n kern.boottime`), so
+every slot up to 12:22 was already in the past when the machine came up. What
+happened next split along `RunAtLoad`:
+
+| agent | slot | RunAtLoad | 2026-11-20 |
+|---|---|---|---|
+| `ai.sol.quick-hits` | 07:05 Mon–Fri | `true` | ran at boot → **0 posts** |
+| `ai.sol.daily-content` | 07:10 | `true` | ran at boot → **0 posts** |
+| `ai.sol.sols-take` | 08:00 | `false` | **never ran** |
+| `ai.sol.seo-health` | 10:00 | `false` | **never ran** |
+
+The two agents with `RunAtLoad: true` fired at boot and dated their output from
+the run time, so the log reads `Sol AI Daily Content Pipeline — 2026-11-20` and
+the day is present. The two with `RunAtLoad: false` got **no catch-up for the
+slot they had already missed** and lost the day outright. `sols-take`'s Nov 20
+gap was backfilled later on 2026-11-21 and its URL now returns 200; the
+`seo-health` gap was superseded by the next morning's audit, which re-checks
+current state.
+
+**Both schedulers for `seo-health` missed Nov 20** — the launchd agent
+`ai.sol.seo-health` (10:00, stdout to `scripts/content-pipeline/logs/sol-seo-health.log`)
+and the Mavis cron task (stdout to the repo-root `logs/sol-seo.log`). The union
+of the two logs is missing 2026-11-01, -02, -03 and -20.
+
+### Quick Hits still cannot tell a dead fetch from an empty one
+
+The fix that landed for `run-daily.py` on 2026-11-21 — retry the GET, and exit
+non-zero when nothing could be fetched — **was not applied to
+`quick-hits.py`**. On Nov 20 it fetched nothing because DNS was down:
+
+```
+[quick-hits] Running for Friday, November 20, 2026
+[hn] Failed to fetch HN stories: <urlopen error [Errno 8] nodename nor servname provided, or not known>
+[quick-hits] Fetched 0 HN AI stories
+[devto] Failed to fetch dev.to articles: <urlopen error [Errno 8] nodename nor servname provided, or not known>
+[quick-hits] Fetched 0 dev.to articles
+[quick-hits] 435 source URLs already covered
+[quick-hits] No stories fetched — skipping.
+[quick-hits] Failed to generate content: None
+```
+
+`quick-hits.py:477` collapses "the fetch failed" and "there is nothing to write"
+into the same `return None`, so the run is recorded as a clean skip and exits
+**0**. A scheduler reading that exit code has no way to know the day was lost.
+
+### The lost day cannot be recreated for two of the three series
+
+- `quick-hits.py` **can** be backfilled: `--date` is documented for exactly this
+  ("backfill a missed day") and `main()` allows an explicit date on any
+  weekday, so `python3 quick-hits.py --date 2026-11-20` is a supported path.
+- `run-daily.py` **cannot**. It has no `--date` flag — `TODAY` comes from
+  `datetime.datetime.now()` at module level — and `backfill_repair.py` only
+  rewrites *existing* truncated posts. The regional cause is fixed, but the
+  2026-11-20 trio has no recreation path and the site keeps the hole.
+- `seo-health.py` needs no backfill; the next run re-audits current state.
+
+### The general lesson
+
+**An audit that only inspects published content cannot report a missing day.**
+The pipeline now has three ways to lose a post — the machine was off, the
+network was down, the token plan was exhausted — and the one tool that runs
+every day to look for problems is structurally blind to all three, because
+absence is not a defect it can see. A series-coverage check (the kind the
+OPERATIONS.md entry on counting by prefix describes) belongs in the daily
+audit, and a fetch that fails must exit non-zero in *every* script that fetches,
+not only in the one that was fixed first.
+
 ## Counting words the wrong way reports 29 false over-budget posts (found 2026-11-22)
 
 The regional posts have a 400-600 word budget, and `run-daily.py` enforces it
@@ -3195,3 +3340,74 @@ re-run of the 08:00 cron after the 07:10 launchd job is a clean no-op for
 all three regions — it does not need the weekday to agree. See "One SSL
 timeout cost a whole day of regional posts" for the run lock that keeps the
 two schedulers from both writing.
+
+## A green Pages run can have published nothing at all (found 2026-11-25)
+
+**The rule:** `gh run list` reporting a run as `success` proves the
+*workflow* succeeded, not that anything was *deployed*. A
+`workflow_dispatch` run on this repo has `build` gated behind
+`if: github.event_name == 'push'`, so a manual dispatch **skips the build
+job entirely** and reports success having uploaded zero artifacts and
+published zero bytes.
+
+Observed 2026-11-25 (runs `45575580576` and `45576751538`): both were
+`conclusion: success`, `artifacts: 0`, and the `build` job's conclusion was
+`skipped`. The live site was still serving the 07:11 tree while these
+"successes" sat at the top of `gh run list` looking exactly like a fix.
+
+**How to tell a real deploy from an empty one — check all three:**
+
+```
+gh run view <run-id> --json jobs -q '.jobs[] | select(.name=="build") | .conclusion'
+gh api repos/TheSolAI/thesolai.github.io/actions/runs/<run-id>/artifacts --jq '.total_count'
+gh api repos/TheSolAI/thesolai.github.io/actions/runs/<run-id>/jobs --jq '.jobs[] | select(.name=="build") | .steps[] | "\(.name)=\(.conclusion)"'
+```
+
+A real deploy is `build=success` **and** `artifacts >= 1` **and** a
+`deploy-pages` step with `conclusion=success`. A dispatch run shows
+`build=skipped` and `artifacts=0`. **Only the push event deploys.**
+
+**The general lesson:** a green run is not a published site. The two
+independent facts — *the run succeeded* and *the bytes are live* — must be
+verified separately, and the second one is the only one a reader of the
+blog can observe. When a deploy looks broken, check whether the run
+actually had a `build` job before concluding anything about it.
+
+## Concurrent re-runs of the same Pages run delete each other's artifact (found 2026-11-25)
+
+**The rule:** `gh run rerun <id> --failed` is not safe to run twice against
+the same run while a sibling agent session is doing the same. Each attempt
+runs the workflow's "Delete a stale Pages artifact from an earlier attempt"
+step, which deletes **every** artifact named `github-pages` in that run —
+including one a *concurrent* attempt has just uploaded. The surviving
+attempt then fails in `deploy-pages@v4` with:
+
+```
+##[error]Fetching artifact metadata failed. ...
+##[error]Error: No artifacts named "github-pages" were found for this workflow run.
+```
+
+which reads exactly like the transient GitHub API flake it resembles, so
+the instinct is to rerun again — which starts the cycle over.
+
+Observed 2026-11-25: run `45574874578` was taken to attempt 6 and
+`45572559196` to attempt 4 in ~20 minutes, with several attempts in flight
+at once from two sessions (the 08:00 Sol's Take cron and the daily AI
+news job). The site only recovered once the attempts stopped overlapping.
+
+**How to apply:** before any rerun, confirm no attempt is in flight:
+
+```
+gh run list --workflow="Build and Deploy" --limit 5 --json databaseId,status,attempt -q '.[] | select(.status=="in_progress" or .status=="queued")'
+```
+
+Then rerun **once** and wait. If it fails again, read the failure before
+rerunning a second time — if the error is "No artifacts named
+github-pages", look at whether another attempt ran concurrently rather than
+assuming GitHub is down.
+
+**A separate trap in the same morning:** `future: true` is set in
+`_config.yml`, so a post dated an hour ahead of the current time (the
+Sol's Take post carries `date: 2026-11-25 09:00:00 +0000`) **will** be
+built and published — it is not a future-date exclusion. Do not treat a
+post's 09:00 date as the reason it 404s.

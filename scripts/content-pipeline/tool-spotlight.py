@@ -143,11 +143,62 @@ TOOLS = [
 ]
 
 
-def pick_tool() -> dict:
-    """Pick tool using ISO week number for variety."""
-    iso_cal = TODAY.isocalendar()
-    idx = (iso_cal.week * iso_cal.year) % len(TOOLS)
-    return TOOLS[idx]
+def _tool_slug(name: str) -> str:
+    """The slug a tool's spotlight post is filed under.
+
+    Shared by the picker and the post writer so the two can never drift:
+    if they disagreed, a published post would not be counted and the
+    rotation would quietly go blind to its own history.
+    """
+    return name.lower().replace(" ", "-")
+
+
+def spotlight_counts(posts_dir=None) -> dict:
+    """How many published spotlights each tool already has.
+
+    Counting what is actually on disk rather than keeping a counter in
+    memory means a missed week cannot strand a tool: the next run sees
+    the real history and picks up whatever was skipped.
+    """
+    counts = {t["name"]: 0 for t in TOOLS}
+    if posts_dir is None:
+        posts_dir = SITE_DIR / "_posts"
+    posts_dir = Path(posts_dir)
+    if not posts_dir.is_dir():
+        return counts
+    slugs = {t["name"]: _tool_slug(t["name"]) for t in TOOLS}
+    for post in posts_dir.glob("*tool-spotlight*.md"):
+        for name, slug in slugs.items():
+            if post.stem.endswith(slug):
+                counts[name] += 1
+                break
+    return counts
+
+
+def pick_tool(posts_dir=None) -> dict:
+    """Pick the tool that has been reviewed least often.
+
+    WHY (2026-11-27 fix)
+    ---------------------
+    The old index was `(iso_week * iso_year) % len(TOOLS)`. The ISO year
+    is 2026 for most of the year, and 2026 is even, so the product was
+    always even and the index could only ever land on 0, 2, 4 or 6.
+    OpenClaw, Cursor, dev.to API and GitHub Actions were mathematically
+    unreachable — 16 published spotlights and not one of them had ever
+    been reviewed, while the four that were reachable took 16 turns
+    between them.
+
+    Choosing the least-reviewed tool fixes the coverage and is
+    self-correcting. Ties break on the order of TOOLS, so the four tools
+    that have never been covered come first.
+    """
+    counts = spotlight_counts(posts_dir)
+    best = min(TOOLS, key=lambda t: counts[t["name"]])
+    print(
+        "[tool-spotlight] coverage: "
+        + ", ".join(f"{n}={counts[n]}" for n in sorted(counts))
+    )
+    return best
 
 
 # Search terms per tool, in priority order. The first term that matches an
@@ -259,7 +310,7 @@ I've used {tool['name']} as part of running this site and managing Sol's workflo
 
 
 def create_post(body: str, tool: dict) -> Path:
-    slug = f"{DATE_STR}-tool-spotlight-{tool['name'].lower().replace(' ', '-')}"
+    slug = f"{DATE_STR}-tool-spotlight-{_tool_slug(tool['name'])}"
     filename = f"{slug}.md"
     post_path = SITE_DIR / "_posts" / filename
 

@@ -47,14 +47,55 @@ now prevents 123-word stub posts from ever reaching production.
    verbatim excerpts to the model, and forbids attributing any opinion
    it cannot see. dev.to summaries are passed too, so articles are
    described by what they actually say.
+
+── Fix applied 2026-11-28 ─────────────────────────────────────────────────
+5. The 2026-11-28 episode published NOTHING, and the cause was a length
+   correction, not a content failure.
+   The model wrote 1237 words, the condense pass over-cut it to 392, and
+   392 is under the 400-word floor — so the code treated the result as
+   fatal, aborted, and the site lost its Saturday episode. The same draft
+   was one mechanical trim away from being fine, and the trim fallback
+   that exists for exactly this situation was never reached.
+   → An over-cut is now retried with an instruction to KEEP more of the
+   original, and the trim fallback always trims from a body that is still
+   over the ceiling — never from the over-cut stub.
+
+6. The research was too shallow to write from, so the piece had nothing
+   real to ground it in.
+   The four highest-scoring HN matches for the topic all had ZERO
+   comments (the Algolia items API returns no children for them), so
+   `attach_comments` attached nothing and the writer had no quotable
+   material at all. The dev.to fetch found 0 relevant articles too: it
+   pulled 30 per tag and filtered locally, and the topic-relevant piece
+   was further back than that.
+   → The query set is broader (each topic has `hn_extra_queries`), the
+   results are filtered through an AI-context term so a broadened query
+   cannot pull in a story about mushrooms hallucinating, stories WITH
+   comments are preferred, and the dev.to batch is 100 per tag instead
+   of 30. Today's topic went from 0 quotable comments to 18.
+
+7. The quote verifier was checking almost nothing, and let a misquote ship.
+   Two separate holes in `find_unsupported_quotes`:
+   (a) The pattern only matched STRAIGHT quotes ("). The model writes
+   typographic quotes (" ") most of the time, so a finished piece's
+   quotes were invisible to the check — every quote in the 2026-11-28
+   episode went unverified.
+   (b) Quotes under 8 words were skipped as "too short to check". The
+   piece quoted HN user ebcode as saying "all output from LLMs ARE
+   hallucinations"; the comment reads "IS hallucinations". Six words,
+   so it was never compared against anything.
+   → The pattern now matches both quote styles, as PAIRS so it cannot
+   span from one quoted phrase to the next, and a short quote is checked
+   against its WHOLE span instead of being skipped.
 """
 
 import sys, os, json, datetime, urllib.request, urllib.error, urllib.parse, time, re, html
+import contextlib, fcntl
 from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, "/Users/amre/Projects/sol-skills-bundle/scripts/content-pipeline")
 from devto_key import load_devto_key
-from _minimax_helper import minimax_generate, load_minimax_key, strip_thinking
+from _minimax_helper import minimax_generate, load_minimax_key, strip_thinking, looks_contaminated
 from text_utils import (
     budget_words,
     classify_blocks,
@@ -87,6 +128,13 @@ SAT_STR = TODAY.strftime("%A, %B %d, %Y")
 MIN_WORDS = 400          # below this the draft is a stub, not an essay
 MAX_WORDS = 850          # hard ceiling; drafts above this are regenerated
 
+# Lock file for the run. This series is scheduled twice (a launchd agent and
+# the app-internal cron task), and without a lock the second run picks a
+# DIFFERENT topic — the rotation walks forward from the last published post —
+# and overwrites today's file. A silent content swap is worse than a double
+# post, so the lock is what makes a second scheduler safe.
+LOCK_FILE = Path("/tmp/sol-weekend-deep-dive.lock")
+
 
 def _yaml(value: str) -> str:
     """Quote a string for use as a YAML double-quoted scalar.
@@ -117,6 +165,8 @@ TOPICS = [
         "tags": ["ai", "analysis", "llm", "truth", "sol"],
         "description": "Deep dive into why LLMs generate plausible falsehoods, what 'hallucination' gets wrong, and what the real problem is.",
         "hn_queries": ["LLM hallucination", "AI makes up facts", "hallucination is not the right word"],
+        "hn_extra_queries": ["AI hallucination", "LLM hallucination", "hallucination"],
+        "ai_context": ["ai", "llm", "gpt", "chatbot", "machine learning", "neural", "openai", "anthropic", "claude", "gemini", "llama", "qwen", "mistral", "model", "algorithm", "chat"],
         "hn_keywords": ["hallucinat", "made up", "fabricat", "confabulat", "inaccurate", "wrong answer", "lying", "truth"],
         "devto_tags": ["ai", "machinelearning"],
         "keywords": ["hallucinat", "made up", "fabricat", "false claim", "accuracy", "confabulat"],
@@ -126,6 +176,7 @@ TOPICS = [
         "tags": ["ai", "infrastructure", "cost", "analysis", "sol"],
         "description": "Water, power, carbon, money. What nobody tells you about what it actually costs to run AI.",
         "hn_queries": ["AI energy consumption power", "data center water carbon AI", "AI inference cost"],
+        "hn_extra_queries": ["GPU cost", "AI data center energy", "LLM serving cost", "AI compute cost"],
         "hn_keywords": ["energy", "power", "carbon", "water", "electricity", "gpu", "data center", "datacenter", "cost", "expensive", "inference"],
         "devto_tags": ["ai", "devops"],
         "keywords": ["energy", "power", "carbon", "water", "electricity", "cost", "data center", "datacenter", "gpu"],
@@ -135,6 +186,7 @@ TOPICS = [
         "tags": ["ai", "prompt-engineering", "analysis", "sol"],
         "description": "It's pattern-matching with a stochastic parrot. Here's what that actually means for how you use AI.",
         "hn_queries": ["prompt engineering", "prompting LLM system message", "prompting is overhyped"],
+        "hn_extra_queries": ["prompting LLM", "system prompt", "prompting technique", "prompt engineering tips"],
         "hn_keywords": ["prompt", "prompting", "context window", "system message", "instruction"],
         "devto_tags": ["ai", "promptengineering"],
         "keywords": ["prompt", "prompting", "context window", "system message", "instruction"],
@@ -144,6 +196,7 @@ TOPICS = [
         "tags": ["ai", "agents", "analysis", "hype", "sol"],
         "description": "Autonomous agents are the hottest thing in AI. Most of them don't work. Let's talk about why people keep buying them anyway.",
         "hn_queries": ["AI agents autonomous", "AI agent framework hype", "agentic AI production"],
+        "hn_extra_queries": ["AI agent", "agentic workflow", "LLM agent", "AI agent reliability"],
         "hn_keywords": ["agent", "agentic", "autonomous", "tool use", "orchestrat"],
         "devto_tags": ["ai", "automation"],
         "keywords": ["agent", "agentic", "autonomous", "tool use", "workflow", "orchestrat"],
@@ -153,6 +206,7 @@ TOPICS = [
         "tags": ["ai", "learning", "education", "analysis", "sol"],
         "description": "Amre learned Python using AI. That experience changes how you think about education. Here's why.",
         "hn_queries": ["learning to code AI", "AI tutor", "vibe coding learn", "AI and education"],
+        "hn_extra_queries": ["learning to code with AI", "AI tutor programming", "vibe coding", "AI and learning"],
         "hn_keywords": ["learn", "learning", "teach", "tutor", "education", "student", "beginner", "course", "textbook"],
         "devto_tags": ["ai", "beginners"],
         "keywords": ["learn", "learning", "teach", "beginner", "education", "student", "tutor", "practice"],
@@ -162,6 +216,7 @@ TOPICS = [
         "tags": ["ai", "open-source", "analysis", "llm", "sol"],
         "description": "Who controls the models matters. Here's a practical look at what you give up with each approach.",
         "hn_queries": ["open source model weights", "open weight LLM license", "self hosting LLM"],
+        "hn_extra_queries": ["open weights model", "open source LLM", "self-hosting model", "Llama vs GPT"],
         "hn_keywords": ["open source", "open-source", "open weight", "open-weight", "self-host", "self host", "local model", "llama", "gemma", "mistral", "qwen"],
         "devto_tags": ["ai", "opensource"],
         "keywords": ["open source", "open weight", "open-source", "closed", "license", "self-host", "self host"],
@@ -171,6 +226,7 @@ TOPICS = [
         "tags": ["ai", "coding", "analysis", "claude", "sol"],
         "description": "AI catches different things than humans do. Neither is sufficient alone. Here's the real picture.",
         "hn_queries": ["AI code review", "AI reviewer pull request", "LLM code review bugs"],
+        "hn_extra_queries": ["AI code review", "LLM reviewer", "AI pull request review", "AI review quality"],
         "hn_keywords": ["review", "reviewer", "pull request", "diff", "lint", "merge", "bug"],
         "devto_tags": ["codereview", "codequality", "testing"],
         "keywords": ["code review", "pull request", "reviewer", "review", "diff", "lint", "merge"],
@@ -180,6 +236,7 @@ TOPICS = [
         "tags": ["ai", "data", "training", "analysis", "sol"],
         "description": "LLMs trained on LLM-generated data. What happens when the well runs dry and all the water is recycled?",
         "hn_queries": ["synthetic data training models", "model collapse", "training data contamination"],
+        "hn_extra_queries": ["synthetic data LLM training", "model collapse", "AI generated data", "LLM training data"],
         "hn_keywords": ["synthetic", "training data", "generated data", "model collapse", "contamination", "dataset", "scrape"],
         "devto_tags": ["ai", "datascience"],
         "keywords": ["synthetic data", "generated data", "training data", "model collapse", "contamination", "scrape"],
@@ -189,6 +246,16 @@ TOPICS = [
 
 # ── Research: Hacker News via Algolia ────────────────────────────────────
 HN_ALGOLIA = "https://hn.algolia.com/api/v1/search"
+
+# Terms that mark a story as being about AI/ML rather than merely about the
+# topic's vocabulary. The topic keyword list alone is not enough once the
+# query set is broadened — "Mushroom behind 'tiny people' hallucinations
+# identified" matches every hallucination keyword and is about mushrooms.
+DEFAULT_AI_CONTEXT = [
+    "ai", "llm", "gpt", "chatbot", "machine learning", "neural", "openai",
+    "anthropic", "claude", "gemini", "llama", "qwen", "mistral", "model",
+    "algorithm", "chat",
+]
 
 
 def _http_json(url: str, timeout: int = 20, headers: dict | None = None):
@@ -212,7 +279,8 @@ def fetch_hn_stories(topic: dict, limit: int = 4, days: int = 120) -> list:
     point (and carry the community signal to be worth citing).
     """
     cutoff = int((TODAY - datetime.timedelta(days=days)).timestamp())
-    queries = topic.get("hn_queries") or [topic.get("hn_query", topic["topic"])]
+    queries = list(topic.get("hn_queries") or [topic.get("hn_query", topic["topic"])])
+    queries += list(topic.get("hn_extra_queries") or [])
 
     merged = {}
     for query in queries:
@@ -220,7 +288,7 @@ def fetch_hn_stories(topic: dict, limit: int = 4, days: int = 120) -> list:
             "query": query,
             "tags": "story",
             "numericFilters": f"created_at_i>{cutoff}",
-            "hitsPerPage": "20",
+            "hitsPerPage": "40",
         }
         url = HN_ALGOLIA + "?" + urllib.parse.urlencode(params)
         try:
@@ -259,6 +327,20 @@ def fetch_hn_stories(topic: dict, limit: int = 4, days: int = 120) -> list:
         if kept:
             merged = kept
 
+    # The broader query set pulls in stories about the SUBJECT that are not
+    # about AI — "Mushroom behind 'tiny people' hallucinations identified"
+    # matches every keyword for the hallucination topic and has nothing to do
+    # with models. Require an AI term as well, so the piece stays on subject.
+    ai_context = [c.lower() for c in (topic.get("ai_context") or DEFAULT_AI_CONTEXT)]
+    if ai_context:
+        kept = {}
+        for oid, h in merged.items():
+            blob = f"{h['title']} {h['url']}".lower()
+            if any(c in blob for c in ai_context):
+                kept[oid] = h
+        if kept:
+            merged = kept
+
     # Rank by community signal, not raw Algolia relevance order.
     def score(h):
         pts = h.get("score") or 0
@@ -266,7 +348,18 @@ def fetch_hn_stories(topic: dict, limit: int = 4, days: int = 120) -> list:
         return pts + min(com, 40)
 
     stories = sorted(merged.values(), key=score, reverse=True)
-    return stories[:limit]
+
+    # A story with no comments carries no quotable material, and the writer
+    # is only allowed to quote what it was shown. On 2026-11-28 the four
+    # highest-scoring matches all had ZERO comments, so the piece had nothing
+    # real to ground it in. Prefer stories people actually argued about, and
+    # only fall back to silent ones if nothing else is available.
+    with_comments = [h for h in stories if h.get("comments")]
+    without_comments = [h for h in stories if not h.get("comments")]
+    if len(with_comments) >= limit:
+        return with_comments[:limit]
+    picked = with_comments + without_comments[: limit - len(with_comments)]
+    return picked[:limit]
 
 
 # ── Research: actual Hacker News comment text ─────────────────────────────
@@ -376,7 +469,11 @@ def fetch_devto_articles(topic: dict, limit: int = 4) -> list:
     seen = set()
     candidates = []
     for tag in topic.get("devto_tags", ["ai"]):
-        for a in _devto_by_tag(tag):
+        # 100 per tag, not 30. The keyword filter runs locally over the whole
+        # batch, so a deeper batch is the only way to find a topic-relevant
+        # article at all: on 2026-11-28 the hallucination topic found ZERO
+        # relevant articles in the 30 most recent, and one in the first 100.
+        for a in _devto_by_tag(tag, per_page=100):
             aid = a.get("id")
             if aid in seen:
                 continue
@@ -572,19 +669,52 @@ def find_unsupported_quotes(body: str, hn_stories: list, devto_articles: list) -
         return []
 
     unsupported = []
-    for m in re.finditer(r'[""]([^""]{40,})[""]', _strip_front_matter(body)):
-        q = _norm_text(m.group(1))
+    # The quote characters are written as explicit escapes on purpose, and
+    # the two styles are matched as PAIRS rather than as one flat character
+    # class.
+    #
+    # The model writes typographic quotes (" ") as often as straight ones,
+    # and the original pattern only matched the straight ones — so every
+    # typographically-quoted passage in a finished piece was invisible to
+    # this check. The 2026-11-28 episode was published with every one of its
+    # quotes unchecked for exactly that reason.
+    #
+    # Matching pairs (straight-opens-straight, curly-opens-curly) also
+    # stops the pattern from spanning from the closing quote of one quoted
+    # phrase to the opening quote of the next, which a flat class allowed
+    # and which produced quoted "passages" that were really the prose
+    # between two unrelated quotes.
+    quote_re = re.compile(
+        r'"([^"“”]{40,})"'      # straight-quoted
+        r'|“([^“”"]{40,})”'  # typographic-quoted
+    )
+    for m in quote_re.finditer(_strip_front_matter(body)):
+        q = _norm_text(m.group(1) or m.group(2) or "")
         if not q:
             continue
         words = q.split()
-        if len(words) < 8:
+        if len(words) < 3:
             continue
-        supported = any(
-            " ".join(words[i:i + 8]) in corpus
-            for i in range(len(words) - 7)
-        )
+        # A short quote is checked against the WHOLE quoted span, and a long
+        # one against any 8-word window of it.
+        #
+        # The window used to be applied to both, with quotes under 8 words
+        # skipped entirely as "too short to check". That was a blind spot,
+        # and it shipped a misquote: on 2026-11-28 the piece quoted HN user
+        # ebcode as saying "all output from LLMs ARE hallucinations" when
+        # the comment reads "all output from LLMs IS hallucinations". Six
+        # words, so the verifier never looked at it. A quote that short is
+        # exactly the kind worth checking — the model paraphrases short
+        # quotes most often, because there is least context to copy.
+        if len(words) < 8:
+            supported = " ".join(words) in corpus
+        else:
+            supported = any(
+                " ".join(words[i:i + 8]) in corpus
+                for i in range(len(words) - 7)
+            )
         if not supported:
-            unsupported.append(m.group(1).strip()[:140])
+            unsupported.append((m.group(1) or m.group(2) or "").strip()[:140])
     return unsupported
 
 
@@ -700,7 +830,8 @@ def _strict_prompt(topic: dict, hn_stories: list, devto_articles: list) -> str:
     return _build_prompt(topic, hn_stories, devto_articles, strict=True)
 
 
-def _condense_prompt(topic: dict, body: str, attempt: int = 1) -> str:
+def _condense_prompt(topic: dict, body: str, attempt: int = 1,
+                     over_cut: bool = False) -> str:
     """Ask the model to cut an over-long draft back to the word budget.
 
     Used when a draft comes in over `MAX_WORDS`. Editing the existing draft
@@ -710,20 +841,47 @@ def _condense_prompt(topic: dict, body: str, attempt: int = 1) -> str:
     `attempt` escalates the pressure. A first pass alone is not reliable — on
     2026-11-07 a real condense of a 1050-word draft came back at 919 words,
     still over the ceiling, so a first pass is not allowed to be the last word.
+
+    `over_cut` handles the opposite failure: the model cut too much and
+    returned a stub (2026-11-28 — a condense of a 1237-word draft came back at
+    392 words, under the 400 floor). Telling it to "cut deeper" then makes
+    things worse, so this mode asks it to KEEP more of the original instead.
     """
     wc = len(body.split())
     target = 700 if attempt == 1 else 620
-    escalation = (
-        "" if attempt == 1 else
-        "\nYour previous attempt to cut this draft was STILL too long. You "
-        "must cut deeper this time — cutting a single section is not enough. "
-        "Remove whole paragraphs and sections, not just clauses and phrases.\n"
-    )
+    if over_cut:
+        escalation = (
+            "\nYour previous attempt cut this draft too far and it came back "
+            "well under the minimum length for this column. You must KEEP "
+            "more of the original wording this time. Restore the sentences "
+            "and sections you dropped and cut only the least essential ones "
+            f"— you need roughly {target} words, not a sketch.\n"
+        )
+    elif attempt > 1:
+        escalation = (
+            "\nYour previous attempt to cut this draft was STILL too long. You "
+            "must cut deeper this time — cutting a single section is not enough. "
+            "Remove whole paragraphs and sections, not just clauses and phrases.\n"
+        )
+    else:
+        escalation = ""
+
+    if over_cut:
+        length_instruction = (
+            f"Rewrite it to AROUND {target} words — between {target - 40} and "
+            f"{target + 40} words — by cutting the least essential material "
+            "while keeping the argument intact."
+        )
+    else:
+        length_instruction = (
+            f"Rewrite it to UNDER {target} words — target {target - 20} to "
+            f"{target} words — by CUTTING, not by summarizing loosely. A "
+            "rewrite that is still over 800 words will be rejected."
+        )
+
     return f"""The draft below is {wc} words. That is over the limit for this column.
 {escalation}
-Rewrite it to UNDER {target} words — target {target - 20} to {target} words — by
-CUTTING, not by summarizing loosely. A rewrite that is still over 800 words
-will be rejected.
+{length_instruction}
 
 Preserve:
 - The argument and the position it takes
@@ -758,6 +916,14 @@ def _enforce_max_words(body: str | None, topic: dict, hn_stories: list,
     ceiling, a deterministic sentence-boundary trim is the last resort, so a
     length overrun can never cost the site a whole episode.
 
+    The condense can fail in BOTH directions, and both are recoverable. On
+    2026-11-28 a condense of a 1237-word draft came back at 392 words —
+    under the 400 floor — and the old code treated that as fatal and
+    published nothing at all. The same episode was one mechanical trim away
+    from being fine. So an over-cut is now retried with an instruction to
+    KEEP more of the original, and the trim fallback always trims from a
+    body that is over the ceiling (never from the over-cut stub).
+
     Returns the corrected body, or None if it cannot be brought inside the
     budget, so the caller aborts instead of publishing a runaway draft.
     """
@@ -768,28 +934,37 @@ def _enforce_max_words(body: str | None, topic: dict, hn_stories: list,
         return body
 
     condensed = body
+    over_cut = False
     for attempt in (1, 2, 3):
         print(f"[deep-dive] Draft is {len(condensed.split())} words, over the "
               f"{MAX_WORDS}-word ceiling. Condensing (attempt {attempt}/3)...")
-        condensed = llm_generate(
-            _condense_prompt(topic, condensed, attempt=attempt),
+        candidate = llm_generate(
+            _condense_prompt(topic, condensed, attempt=attempt, over_cut=over_cut),
             "You are Sol AI. You are a researcher and writer. You edit ruthlessly. "
             "You never invent a quotation and never add a citation that was not "
             "already in the draft.",
             max_tokens=2500,
         )
-        if not condensed:
+        if not candidate:
             print("[deep-dive] ⚠️  Condensing failed; falling back to a mechanical trim.")
             break
 
-        cwc = len(condensed.split())
-        if cwc <= MAX_WORDS:
-            if cwc < MIN_WORDS:
-                print(f"[deep-dive] ❌ Condensed draft is only {cwc} words. Aborting without publishing.")
-                return None
+        cwc = len(candidate.split())
+        if MIN_WORDS <= cwc <= MAX_WORDS:
             print(f"[deep-dive] ✅ Condensed {wc} → {cwc} words.")
-            return condensed
+            return candidate
+        if cwc < MIN_WORDS:
+            # Over-cut. The draft lost too much, so retry from the ORIGINAL
+            # body with an instruction to keep more of it — asking a stub to
+            # be cut further would only make it worse.
+            print(f"[deep-dive] ⚠️  Condensed draft is only {cwc} words — over-cut. "
+                  f"Retrying from the original {wc}-word draft.")
+            condensed = body
+            over_cut = True
+            continue
         print(f"[deep-dive] ⚠️  Still {cwc} words after condensing.")
+        condensed = candidate
+        over_cut = False
 
     # Last resort: cut at sentence boundaries. This keeps the piece alive even
     # when the model refuses to shorten it.
@@ -804,7 +979,12 @@ def _enforce_max_words(body: str | None, topic: dict, hn_stories: list,
     # Its budget excludes the title line and the section headings, so it is
     # asked for a lower limit than MAX_WORDS: the ceiling here counts the
     # whole body, headings included.
-    source = condensed or body
+    #
+    # The source is whichever draft is still OVER the ceiling. If the last
+    # condense over-cut (returned a stub under the floor), trimming that stub
+    # would leave it under the floor and abort anyway — so the trim falls
+    # back to the original body, which is by definition long enough to trim.
+    source = condensed if len((condensed or "").split()) > MAX_WORDS else body
     overhead = _heading_overhead(source)
     trimmed = trim_to_word_budget(source, limit=MAX_WORDS - overhead, floor=MIN_WORDS)
     t_wc = len(trimmed.split())
@@ -969,7 +1149,80 @@ def generate_verified_body(topic: dict, hn_stories: list, devto_articles: list) 
     return body
 
 
+def existing_post_is_degraded(path: Path) -> bool:
+    """True when today's post is unusable and worth regenerating.
+
+    A real, well-formed post is NOT degraded — it must not be rewritten,
+    because the rotation would hand the next run a different topic.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if "More coming tomorrow" in text:
+        return True
+    # A post carrying the model's own notes is just as broken as a template
+    # one, and is worth regenerating.
+    if looks_contaminated(text):
+        return True
+    # A stub that never got a body is not a published post.
+    body = text.split("---", 2)[-1]
+    return len(body.split()) < MIN_WORDS
+
+
+@contextlib.contextmanager
+def run_lock():
+    """Serialise runs so two schedulers cannot both write today's post.
+
+    Same proven shape as `sols-take.py`: an exclusive, non-blocking flock on
+    a fixed path. A scheduler that loses the race exits cleanly instead of
+    racing the winner to the same file.
+    """
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("[deep-dive] Another run holds the lock — skipping")
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def main():
+    # This series is a Saturday episode. The launchd agent carries
+    # RunAtLoad, so a reboot on any other day would otherwise publish a
+    # "weekend deep dive" on a Wednesday. `deep-dive.py` has the same guard
+    # for its Monday slot.
+    if TODAY.weekday() != 5:
+        print(
+            f"[deep-dive] Weekend Deep Dive only runs on Saturday "
+            f"(today is weekday {TODAY.weekday()})"
+        )
+        sys.exit(0)
+
+    with run_lock() as acquired:
+        if not acquired:
+            sys.exit(0)
+
+        # The second scheduler must be a no-op. Without this guard the
+        # rotation hands out a fresh topic and the same day's file is
+        # overwritten with different content under the same URL.
+        post_path = SITE_DIR / "_posts" / f"{DATE_STR}-weekend-deep-dive.md"
+        if post_path.exists() and not existing_post_is_degraded(post_path):
+            print(f"[deep-dive] Already published: {post_path.name} — skipping")
+            return
+
+        _run()
+
+
+def _run():
     topic = pick_topic()
     print(f"[deep-dive] Deep diving: {topic['topic']} ({SAT_STR})")
 
